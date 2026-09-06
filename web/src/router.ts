@@ -6,7 +6,8 @@ export type Route =
   | { page: "login" }
   | { page: "admin-nodes" }
   | { page: "admin-ping-targets" }
-  | { page: "admin-disabled"; path: string }
+  | { page: "admin-theme" }
+  | { page: "admin-settings" }
   | { page: "not-found" };
 
 const NAVIGATION_EVENT = "monitor:navigate";
@@ -16,7 +17,8 @@ export function matchRoute(pathname: string): Route {
   if (pathname === "/login") return { page: "login" };
   if (pathname === "/admin/nodes") return { page: "admin-nodes" };
   if (pathname === "/admin/ping-targets") return { page: "admin-ping-targets" };
-  if (/^\/admin\/(theme|settings)$/.test(pathname)) return { page: "admin-disabled", path: pathname };
+  if (pathname === "/admin/theme") return { page: "admin-theme" };
+  if (pathname === "/admin/settings") return { page: "admin-settings" };
   const node = /^\/nodes\/([0-9a-f]{32})$/.exec(pathname);
   return node ? { page: "node", nodeId: node[1] } : { page: "not-found" };
 }

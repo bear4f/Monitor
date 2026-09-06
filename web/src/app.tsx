@@ -8,7 +8,7 @@ const AdminEntry = lazy(() => import("./admin-entry").then((module) => ({ defaul
 export function App() {
   const route = useRoute();
   if (route.page === "login") return <Suspense fallback={<DetailLoading />}><LoginPage /></Suspense>;
-  if (route.page === "admin-nodes" || route.page === "admin-ping-targets" || route.page === "admin-disabled") return <Suspense fallback={<DetailLoading />}><AdminEntry page={route.page} /></Suspense>;
+  if (route.page === "admin-nodes" || route.page === "admin-ping-targets" || route.page === "admin-theme" || route.page === "admin-settings") return <Suspense fallback={<DetailLoading />}><AdminEntry page={route.page} /></Suspense>;
   return <PublicApp route={route} />;
 }
 

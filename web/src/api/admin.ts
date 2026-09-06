@@ -56,6 +56,16 @@ export interface PingTarget {
   enabled: boolean;
   sort_order: number;
 }
+export interface AdminSettings {
+  site_name: string;
+  site_timezone: string;
+  theme_default: ThemePreference;
+  history_retention_days: number;
+  agent_report_interval_seconds: number;
+  ping_interval_seconds: number;
+  offline_after_seconds: number;
+  default_traffic_reset_day: number;
+}
 
 export function readCookie(name: string): string | null {
   if (typeof document === "undefined") return null;
@@ -72,9 +82,19 @@ export class AdminApiError extends Error {
     public status: number,
     message: string,
     public retryAfter: number | null = null,
+    public code: string | null = null,
   ) {
     super(message);
   }
+}
+
+export function parseApiError(value: unknown): { code: string; message: string } | null {
+  if (!value || typeof value !== "object" || !("error" in value)) return null;
+  const error = value.error;
+  if (!error || typeof error !== "object" || !("code" in error) || !("message" in error)) return null;
+  return typeof error.code === "string" && typeof error.message === "string"
+    ? { code: error.code, message: error.message }
+    : null;
 }
 
 async function request<T>(
@@ -86,7 +106,7 @@ async function request<T>(
   headers.set("Accept", "application/json");
   if (mutation) {
     const token = csrfToken();
-    if (!token) throw new AdminApiError(403, "missing csrf token");
+    if (!token) throw new AdminApiError(403, "missing csrf token", null, "csrf");
     headers.set("X-CSRF-Token", token);
   }
   if (init.body && !headers.has("Content-Type"))
@@ -104,28 +124,16 @@ async function request<T>(
   } catch {
     /* empty */
   }
-  if (!response.ok)
+  if (!response.ok) {
+    const parsed = parseApiError(payload);
     throw new AdminApiError(
       response.status,
-      errorMessage(payload),
-      response.status === 429
-        ? Number(response.headers.get("Retry-After")) || null
-        : null,
+      parsed?.message ?? "请求失败",
+      response.status === 429 ? Number(response.headers.get("Retry-After")) || null : null,
+      parsed?.code ?? null,
     );
+  }
   return payload as T;
-}
-function errorMessage(payload: unknown): string {
-  if (
-    !payload ||
-    typeof payload !== "object" ||
-    !("error" in payload) ||
-    !payload.error ||
-    typeof payload.error !== "object" ||
-    !("message" in payload.error) ||
-    typeof payload.error.message !== "string"
-  )
-    return "请求失败";
-  return payload.error.message;
 }
 
 export const authMe = async () =>
@@ -191,6 +199,25 @@ export const updatePingTarget = async (
   );
 export const deletePingTarget = (id: number) =>
   request<void>(`/api/admin/ping-targets/${id}`, { method: "DELETE" }, true);
+export const getSettings = async () =>
+  parseAdminSettings(await request<unknown>("/api/admin/settings"));
+export const updateSettings = async (body: Record<string, unknown>) =>
+  parseAdminSettings(
+    await request<unknown>(
+      "/api/admin/settings",
+      { method: "PATCH", body: JSON.stringify(body) },
+      true,
+    ),
+  );
+export const changePassword = (current_password: string, new_password: string) =>
+  request<void>(
+    "/api/admin/password",
+    {
+      method: "PATCH",
+      body: JSON.stringify({ current_password, new_password }),
+    },
+    true,
+  );
 
 function isSafeInt(value: unknown, positive = false): value is number {
   return (
@@ -328,6 +355,56 @@ export function canEnablePingTarget(
 export function pingTargetMutationMessage(status: number): string | null {
   if (status === 400) return "目标配置无效，请检查名称、目标地址和 IP 协议";
   if (status === 409) return "最多只能启用 6 个延迟监控目标";
+  return null;
+}
+
+function isBoundedInteger(value: unknown, min: number, max: number): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
+}
+export function parseAdminSettings(value: unknown): AdminSettings {
+  const item = object(value);
+  const siteName = typeof item.site_name === "string" ? item.site_name.trim() : "";
+  const timezone = typeof item.site_timezone === "string" ? item.site_timezone.trim() : "";
+  if (
+    siteName.length < 1 || siteName.length > 64 ||
+    timezone.length < 1 || timezone.length > 64 ||
+    !(["light", "dark", "system"] as string[]).includes(String(item.theme_default)) ||
+    !isBoundedInteger(item.history_retention_days, 1, 30) ||
+    !isBoundedInteger(item.agent_report_interval_seconds, 2, 60) ||
+    !isBoundedInteger(item.ping_interval_seconds, 10, 300) ||
+    !isBoundedInteger(item.offline_after_seconds, 5, 600) ||
+    !isBoundedInteger(item.default_traffic_reset_day, 1, 31) ||
+    item.offline_after_seconds <= item.agent_report_interval_seconds
+  ) throw new Error("invalid admin settings");
+  return {
+    site_name: siteName,
+    site_timezone: timezone,
+    theme_default: item.theme_default as ThemePreference,
+    history_retention_days: item.history_retention_days,
+    agent_report_interval_seconds: item.agent_report_interval_seconds,
+    ping_interval_seconds: item.ping_interval_seconds,
+    offline_after_seconds: item.offline_after_seconds,
+    default_traffic_reset_day: item.default_traffic_reset_day,
+  };
+}
+export function buildSettingsPatch(original: AdminSettings, form: AdminSettings): Record<string, unknown> {
+  const patch: Record<string, unknown> = {};
+  (Object.keys(original) as (keyof AdminSettings)[]).forEach((key) => {
+    const value = typeof form[key] === "string" ? form[key].trim() : form[key];
+    if (value !== original[key]) patch[key] = value;
+  });
+  return patch;
+}
+export function parseBoundedInteger(value: string, min: number, max: number): number | null {
+  if (!/^\d+$/.test(value)) return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= min && number <= max ? number : null;
+}
+export function passwordByteLength(value: string): number { return new TextEncoder().encode(value).length; }
+export function passwordFormError(current: string, next: string, confirm: string): string | null {
+  if (passwordByteLength(current) < 1 || passwordByteLength(current) > 1024 || passwordByteLength(next) < 1 || passwordByteLength(next) > 1024) return "密码长度需为 1–1024 字节";
+  if (next !== confirm) return "两次输入的新密码不一致";
+  if (current === next) return "新密码不能与当前密码相同";
   return null;
 }
 export function parsePingTargets(value: unknown): { targets: PingTarget[] } {

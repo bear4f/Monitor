@@ -22,9 +22,45 @@ import {
   targetSortOrder,
   validatePingTargetHost,
   trafficUnitBytes,
+  AdminSettings,
+  buildSettingsPatch,
+  parseAdminSettings,
+  parseApiError,
+  parseBoundedInteger,
+  passwordByteLength,
+  passwordFormError,
 } from "../api/admin";
 
 describe("admin pure helpers", () => {
+  const settings: AdminSettings = {
+    site_name: "Monitor",
+    site_timezone: "UTC",
+    theme_default: "system",
+    history_retention_days: 7,
+    agent_report_interval_seconds: 10,
+    ping_interval_seconds: 30,
+    offline_after_seconds: 60,
+    default_traffic_reset_day: 1,
+  };
+  it("parses and patches settings strictly", () => {
+    expect(parseAdminSettings(settings)).toEqual(settings);
+    expect(() => parseAdminSettings({ ...settings, offline_after_seconds: 10 })).toThrow();
+    expect(() => parseAdminSettings({ ...settings, theme_default: "sepia" })).toThrow();
+    expect(buildSettingsPatch(settings, settings)).toEqual({});
+    expect(buildSettingsPatch(settings, { ...settings, site_name: " New " })).toEqual({ site_name: "New" });
+    expect(buildSettingsPatch(settings, { ...settings, ping_interval_seconds: 45 })).toEqual({ ping_interval_seconds: 45 });
+    expect(parseBoundedInteger("10", 2, 60)).toBe(10);
+    expect(parseBoundedInteger("", 2, 60)).toBeNull();
+    expect(parseBoundedInteger("61", 2, 60)).toBeNull();
+  });
+  it("preserves API error codes and password byte rules", () => {
+    expect(parseApiError({ error: { code: "invalid_credentials", message: "bad" } })).toEqual({ code: "invalid_credentials", message: "bad" });
+    expect(parseApiError({ error: { code: 1, message: "bad" } })).toBeNull();
+    expect(passwordByteLength("密码")).toBe(6);
+    expect(passwordFormError("old", "new", "different")).toContain("不一致");
+    expect(passwordFormError("same", "same", "same")).toContain("相同");
+    expect(passwordFormError("old", "new", "new")).toBeNull();
+  });
   const target = {
     id: 1,
     name: "电信 v4",
