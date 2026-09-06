@@ -48,7 +48,7 @@ impl PingEngine {
     pub fn ping_round(&mut self, targets: &[AgentPingTarget]) -> Vec<PingReport> {
         #[cfg(target_os = "linux")]
         {
-            return self.ping_round_linux(targets);
+            self.ping_round_linux(targets)
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -417,7 +417,7 @@ fn ordered_results(targets: &[AgentPingTarget], probes: &[OutstandingProbe]) -> 
         .collect()
 }
 
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(not(target_os = "linux"))]
 fn unavailable_results(targets: &[AgentPingTarget]) -> Vec<PingReport> {
     targets
         .iter()
