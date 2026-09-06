@@ -481,12 +481,14 @@ pub(super) fn create_ping_target(
             operation: "select next ping target sort order",
             source,
         })?;
-    transaction
+    let inserted = transaction
         .execute(
             "INSERT INTO ping_targets (
-                name, host, ip_family, enabled, sort_order, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                id, name, host, ip_family, enabled, sort_order, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+             ON CONFLICT(id) DO NOTHING",
             params![
+                target.id,
                 target.name,
                 target.host,
                 target.ip_family,
@@ -499,11 +501,14 @@ pub(super) fn create_ping_target(
             operation: "insert ping target",
             source,
         })?;
+    if inserted == 0 {
+        return Ok(CreatePingTargetResult::IdCollision);
+    }
     if enabled_ping_target_count(&transaction)? > 6 {
         return Ok(CreatePingTargetResult::Conflict);
     }
     let created = PingTargetRow {
-        id: transaction.last_insert_rowid(),
+        id: target.id,
         name: target.name.clone(),
         host: target.host.clone(),
         ip_family: target.ip_family,

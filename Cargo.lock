@@ -505,6 +505,7 @@ dependencies = [
  "libc",
  "monitor-common",
  "serde_json",
+ "socket2",
  "ureq",
 ]
 

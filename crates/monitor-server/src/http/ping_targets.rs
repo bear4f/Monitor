@@ -24,6 +24,8 @@ use super::{
 };
 
 const JSON_BODY_LIMIT: usize = 8 * 1_024;
+const RANDOM_ID_ATTEMPTS: usize = 8;
+const JS_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,23 +110,36 @@ pub(super) async fn create(
     authenticate_session(&state.database, request.headers()).await?;
     validate_csrf(request.headers())?;
     let request: CreatePingTargetRequest = parse_json(request, JSON_BODY_LIMIT).await?;
-    let target = NewPingTargetRow {
-        name: valid_name(request.name)?,
-        host: valid_host(request.host, request.ip_family)?,
-        ip_family: valid_ip_family(request.ip_family)?,
-        enabled: request.enabled,
-    };
+    let name = valid_name(request.name)?;
+    let host = valid_host(request.host, request.ip_family)?;
+    let ip_family = valid_ip_family(request.ip_family)?;
 
     let _mutation_guard = state.ping_target_mutation_lock.lock().await;
-    let result = state
-        .database
-        .create_ping_target(target, unix_timestamp().map_err(|_| ApiError::internal())?)
-        .await
-        .map_err(ApiError::database)?;
-    let result = match result {
-        CreatePingTargetResult::Conflict => return Err(ApiError::conflict()),
-        CreatePingTargetResult::Created(result) => result,
-    };
+    let now = unix_timestamp().map_err(|_| ApiError::internal())?;
+    let mut result = None;
+    for _ in 0..RANDOM_ID_ATTEMPTS {
+        let target = NewPingTargetRow {
+            id: random_target_id().map_err(|_| ApiError::internal())?,
+            name: name.clone(),
+            host: host.clone(),
+            ip_family,
+            enabled: request.enabled,
+        };
+        match state
+            .database
+            .create_ping_target(target, now)
+            .await
+            .map_err(ApiError::database)?
+        {
+            CreatePingTargetResult::IdCollision => continue,
+            CreatePingTargetResult::Conflict => return Err(ApiError::conflict()),
+            CreatePingTargetResult::Created(created) => {
+                result = Some(created);
+                break;
+            }
+        }
+    }
+    let result = result.ok_or_else(ApiError::internal)?;
     publish_enabled_targets(&state, result.enabled_targets).await;
     Ok(json_response(
         StatusCode::CREATED,
@@ -270,6 +285,13 @@ fn valid_id(value: &str) -> Result<i64, ApiError> {
         .ok()
         .filter(|id| *id > 0)
         .ok_or_else(ApiError::not_found)
+}
+
+fn random_target_id() -> Result<i64, getrandom::Error> {
+    let mut bytes = [0_u8; 8];
+    getrandom::fill(&mut bytes)?;
+    let candidate = u64::from_le_bytes(bytes) & JS_SAFE_INTEGER_MAX;
+    Ok(candidate.max(1) as i64)
 }
 
 async fn publish_enabled_targets(state: &AppState, rows: Vec<EnabledPingTargetRow>) {
@@ -614,6 +636,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_random_id_collision_rolls_back_cleanly() {
+        let context = TestContext::new().await;
+        let (_, created) = create_target(&context, "Existing", "existing.example", 4, true).await;
+        let id = created["target"]["id"].as_i64().unwrap();
+        let result = context
+            .state
+            .database
+            .create_ping_target(
+                NewPingTargetRow {
+                    id,
+                    name: "Collision".to_owned(),
+                    host: "collision.example".to_owned(),
+                    ip_family: 4,
+                    enabled: true,
+                },
+                unix_timestamp().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result, CreatePingTargetResult::IdCollision);
+        let targets = context.state.database.list_ping_targets().await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, id);
+        assert_eq!(targets[0].sort_order, 0);
+        context.finish().await;
+    }
+
+    #[tokio::test]
     async fn patch_reorders_validates_final_pair_and_preserves_history_on_disable() {
         let context = TestContext::new().await;
         let mut ids = Vec::new();
@@ -896,6 +946,28 @@ mod tests {
                 .targets
                 .iter()
                 .all(|t| t.id != first_id)
+        );
+        let (_, replacement) =
+            create_target(&context, "Replacement", "replacement.example", 4, true).await;
+        let replacement_id = replacement["target"]["id"].as_i64().unwrap();
+        assert_ne!(replacement_id, first_id);
+        let targets = context.state.database.list_ping_targets().await.unwrap();
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.sort_order)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(
+            context
+                .state
+                .agent_config
+                .read()
+                .await
+                .targets
+                .iter()
+                .any(|target| target.id == replacement_id)
         );
         context.finish().await;
     }

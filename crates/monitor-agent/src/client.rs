@@ -17,6 +17,7 @@ pub enum FailureKind {
 #[derive(Debug)]
 pub struct ClientError {
     kind: FailureKind,
+    status_code: Option<u16>,
     message: String,
 }
 
@@ -25,16 +26,22 @@ impl ClientError {
         self.kind
     }
 
-    fn authentication() -> Self {
+    pub fn status_code(&self) -> Option<u16> {
+        self.status_code
+    }
+
+    fn authentication(status_code: Option<u16>) -> Self {
         Self {
             kind: FailureKind::Authentication,
+            status_code,
             message: "agent authentication rejected".to_owned(),
         }
     }
 
-    fn protocol(message: impl Into<String>) -> Self {
+    fn protocol(status_code: Option<u16>, message: impl Into<String>) -> Self {
         Self {
             kind: FailureKind::Protocol,
+            status_code,
             message: message.into(),
         }
     }
@@ -42,6 +49,7 @@ impl ClientError {
     fn transient(message: impl Into<String>) -> Self {
         Self {
             kind: FailureKind::Transient,
+            status_code: None,
             message: message.into(),
         }
     }
@@ -89,9 +97,10 @@ impl MonitorClient {
         let status = response.status().as_u16();
         if status != 200 {
             classify_status(status)?;
-            return Err(ClientError::protocol(format!(
-                "unexpected config response status {status}"
-            )));
+            return Err(ClientError::protocol(
+                Some(status),
+                format!("unexpected config response status {status}"),
+            ));
         }
         let body = response
             .body_mut()
@@ -99,15 +108,17 @@ impl MonitorClient {
             .limit(CONFIG_BODY_LIMIT)
             .read_to_string()
             .map_err(|error| ClientError::transient(format!("failed to read config: {error}")))?;
-        let config: AgentConfigPayload = serde_json::from_str(&body)
-            .map_err(|error| ClientError::protocol(format!("invalid agent config: {error}")))?;
+        let config: AgentConfigPayload = serde_json::from_str(&body).map_err(|error| {
+            ClientError::protocol(None, format!("invalid agent config: {error}"))
+        })?;
         validate_config(&config)?;
         Ok(config)
     }
 
     pub fn post_report(&self, report: &AgentReport) -> Result<(), ClientError> {
-        let body = serde_json::to_vec(report)
-            .map_err(|error| ClientError::protocol(format!("failed to encode report: {error}")))?;
+        let body = serde_json::to_vec(report).map_err(|error| {
+            ClientError::protocol(None, format!("failed to encode report: {error}"))
+        })?;
         let response = self
             .agent
             .post(&self.report_url)
@@ -121,9 +132,10 @@ impl MonitorClient {
             Ok(())
         } else {
             classify_status(status)?;
-            Err(ClientError::protocol(format!(
-                "unexpected report response status {status}"
-            )))
+            Err(ClientError::protocol(
+                Some(status),
+                format!("unexpected report response status {status}"),
+            ))
         }
     }
 }
@@ -131,19 +143,24 @@ impl MonitorClient {
 fn classify_status(status: u16) -> Result<(), ClientError> {
     match status {
         200..=299 => Ok(()),
-        401 => Err(ClientError::authentication()),
-        500..=599 => Err(ClientError::transient(format!(
-            "server temporarily unavailable ({status})"
-        ))),
-        400 | 413 | 415 => Err(ClientError::protocol(format!(
-            "agent protocol rejected ({status})"
-        ))),
-        _ if (400..=499).contains(&status) => Err(ClientError::protocol(format!(
-            "unexpected client response status {status}"
-        ))),
-        _ => Err(ClientError::protocol(format!(
-            "unexpected server response status {status}"
-        ))),
+        401 => Err(ClientError::authentication(Some(status))),
+        500..=599 => Err(ClientError {
+            kind: FailureKind::Transient,
+            status_code: Some(status),
+            message: format!("server temporarily unavailable ({status})"),
+        }),
+        400 | 413 | 415 => Err(ClientError::protocol(
+            Some(status),
+            format!("agent protocol rejected ({status})"),
+        )),
+        _ if (400..=499).contains(&status) => Err(ClientError::protocol(
+            Some(status),
+            format!("unexpected client response status {status}"),
+        )),
+        _ => Err(ClientError::protocol(
+            Some(status),
+            format!("unexpected server response status {status}"),
+        )),
     }
 }
 
@@ -162,7 +179,7 @@ fn validate_config(config: &AgentConfigPayload) -> Result<(), ClientError> {
         || !(10..=300).contains(&config.ping_interval_seconds)
         || config.targets.len() > 6
     {
-        return Err(ClientError::protocol("invalid agent config values"));
+        return Err(ClientError::protocol(None, "invalid agent config values"));
     }
     let mut ids = Vec::with_capacity(config.targets.len());
     for target in &config.targets {
@@ -178,7 +195,7 @@ fn validate_config(config: &AgentConfigPayload) -> Result<(), ClientError> {
                 .bytes()
                 .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
         {
-            return Err(ClientError::protocol("invalid agent target config"));
+            return Err(ClientError::protocol(None, "invalid agent target config"));
         }
         ids.push(target.id);
     }
@@ -358,10 +375,9 @@ mod tests {
             (404, FailureKind::Protocol),
             (503, FailureKind::Transient),
         ] {
-            assert_eq!(
-                classify_status(status).expect_err("error status").kind(),
-                expected
-            );
+            let error = classify_status(status).expect_err("error status");
+            assert_eq!(error.kind(), expected);
+            assert_eq!(error.status_code(), Some(status));
         }
     }
 

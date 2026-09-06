@@ -59,6 +59,7 @@ pub struct PingTargetRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewPingTargetRow {
+    pub id: i64,
     pub name: String,
     pub host: String,
     pub ip_family: i64,
@@ -82,6 +83,7 @@ pub struct PingTargetMutationRow {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreatePingTargetResult {
+    IdCollision,
     Conflict,
     Created(PingTargetMutationRow),
 }
