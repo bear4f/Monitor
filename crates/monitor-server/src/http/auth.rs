@@ -83,6 +83,14 @@ pub(super) async fn login(
 
     let LoginRequest { password } = parse_json(request).await?;
     validate_password(&password).map_err(|_| ApiError::invalid_request())?;
+    let _hash_permit = state
+        .auth_hash_gate
+        .acquire()
+        .await
+        .map_err(|_| ApiError::internal())?;
+    if let Some(retry_after) = state.login_limiter.retry_after(peer.ip()) {
+        return Err(ApiError::rate_limited(retry_after));
+    }
     let Some(password_hash) = state
         .database
         .load_admin_password_hash()
@@ -185,6 +193,11 @@ pub(super) async fn change_password(
         return Err(ApiError::invalid_request());
     }
 
+    let hash_permit = state
+        .auth_hash_gate
+        .acquire()
+        .await
+        .map_err(|_| ApiError::internal())?;
     let Some(current_hash) = state
         .database
         .load_admin_password_hash()
@@ -203,6 +216,7 @@ pub(super) async fn change_password(
     let new_hash = hash_password(new_password)
         .await
         .map_err(|_| ApiError::internal())?;
+    drop(hash_permit);
     let updated = state
         .database
         .change_admin_password(
@@ -1032,9 +1046,86 @@ mod tests {
         server.finish().await;
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_login_burst_rechecks_limit_after_hash_gate() {
+        let server = TestServer::start(Some(OLD_PASSWORD)).await;
+        let gate = server
+            .state
+            .auth_hash_gate
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("acquire test hash gate");
+        let responses = {
+            let burst = async {
+                tokio::join!(
+                    server.login("wrong password"),
+                    server.login("wrong password"),
+                    server.login("wrong password"),
+                    server.login("wrong password"),
+                    server.login("wrong password"),
+                    server.login("wrong password"),
+                    server.login("wrong password"),
+                    server.login("wrong password"),
+                    server.login("wrong password"),
+                    server.login("wrong password"),
+                    server.login("wrong password"),
+                    server.login("wrong password"),
+                )
+            };
+            tokio::pin!(burst);
+            tokio::select! {
+                _ = &mut burst => panic!("login burst completed while the hash gate was held"),
+                () = async {
+                    for _ in 0..100 {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+            drop(gate);
+            burst.await
+        };
+        let responses = [
+            responses.0,
+            responses.1,
+            responses.2,
+            responses.3,
+            responses.4,
+            responses.5,
+            responses.6,
+            responses.7,
+            responses.8,
+            responses.9,
+            responses.10,
+            responses.11,
+        ];
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.status == 401)
+                .count(),
+            4
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.status == 429)
+                .count(),
+            8
+        );
+        assert!(responses.iter().all(|response| {
+            matches!(
+                response.error_code().as_str(),
+                "invalid_credentials" | "rate_limited"
+            )
+        }));
+
+        server.finish().await;
+    }
+
     fn send_http_request(address: SocketAddr, request: &str) -> std::io::Result<String> {
         let mut stream = TcpStream::connect(address)?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+        stream.set_read_timeout(Some(Duration::from_secs(30)))?;
         stream.write_all(request.as_bytes())?;
         let mut response = Vec::new();
         stream.read_to_end(&mut response)?;
