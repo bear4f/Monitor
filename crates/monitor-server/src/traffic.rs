@@ -471,6 +471,59 @@ mod tests {
     }
 
     #[test]
+    fn raw_counters_past_the_js_safe_range_still_produce_exact_deltas() {
+        // Raw counters are i64 all the way to SQLite, but everything the browser
+        // reads is accumulated from deltas and must stay JS-safe.
+        let traffic = state();
+        let baseline = JS_SAFE_INTEGER_MAX + 100;
+        traffic
+            .update(1, sample(baseline, baseline, "boot-a"))
+            .expect("baseline past the JS safe range");
+        let established = traffic.get(1).unwrap();
+        assert_eq!(established.last_rx_counter_bytes, Some(baseline));
+        assert_eq!(
+            (established.rx_total_bytes, established.tx_total_bytes),
+            (0, 0),
+            "the first sample must never invent traffic"
+        );
+
+        traffic
+            .update(1, sample(baseline + 1_000, baseline + 250, "boot-a"))
+            .expect("same-boot monotonic delta past the JS safe range");
+        let current = traffic.get(1).unwrap();
+        assert_eq!(
+            (current.rx_total_bytes, current.tx_total_bytes),
+            (1_000, 250)
+        );
+        assert_eq!(
+            (current.today_rx_bytes, current.cycle_rx_bytes),
+            (1_000, 1_000)
+        );
+        assert_eq!(current.last_rx_counter_bytes, Some(baseline + 1_000));
+        for accumulated in [
+            current.rx_total_bytes,
+            current.tx_total_bytes,
+            current.today_rx_bytes,
+            current.today_tx_bytes,
+            current.cycle_rx_bytes,
+            current.cycle_tx_bytes,
+        ] {
+            assert!(accumulated <= JS_SAFE_INTEGER_MAX);
+        }
+
+        // A reboot resets the interface counter; the delta is the new counter,
+        // not the difference against the huge previous baseline.
+        traffic
+            .update(1, sample(4_096, 2_048, "boot-b"))
+            .expect("boot change after a huge counter");
+        let rebooted = traffic.get(1).unwrap();
+        assert_eq!(
+            (rebooted.rx_total_bytes, rebooted.tx_total_bytes),
+            (1_000 + 4_096, 250 + 2_048)
+        );
+    }
+
+    #[test]
     fn safe_integer_overflow_leaves_entire_state_unchanged() {
         let traffic = TrafficState::from_recovery(vec![TrafficRecoveryRow {
             node_id: 1,

@@ -534,8 +534,8 @@ fn parse_net_dev(input: &str, interface: Option<&str>) -> Result<NetworkCounters
             None => "no non-loopback interface in /proc/net/dev",
         }));
     }
-    safe_i64(total.rx, "RX counter")?;
-    safe_i64(total.tx, "TX counter")?;
+    counter_i64(total.rx, "RX counter")?;
+    counter_i64(total.tx, "TX counter")?;
     Ok(total)
 }
 
@@ -577,6 +577,15 @@ fn kb_to_bytes(value: u64) -> Result<u64, CollectorError> {
     value
         .checked_mul(1024)
         .ok_or_else(|| CollectorError::parse("kilobyte conversion overflow"))
+}
+
+/// Raw interface counters only ever travel Agent -> Rust server -> SQLite, all
+/// of which are `i64`; the browser sees derived totals instead, so the JSON
+/// safe-integer bound would retire a long-lived host for no reason.
+#[cfg(any(target_os = "linux", test))]
+fn counter_i64(value: u64, field: &str) -> Result<i64, CollectorError> {
+    i64::try_from(value)
+        .map_err(|_| CollectorError::parse(format!("{field} exceeds the signed 64-bit range")))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -678,8 +687,8 @@ mod linux {
             swap_used,
             disk_total,
             disk_used,
-            rx_bytes: safe_i64(counters.rx, "RX counter")?,
-            tx_bytes: safe_i64(counters.tx, "TX counter")?,
+            rx_bytes: counter_i64(counters.rx, "RX counter")?,
+            tx_bytes: counter_i64(counters.tx, "TX counter")?,
             rx_rate,
             tx_rate,
             uptime_seconds,
@@ -899,6 +908,45 @@ mod tests {
         assert_eq!(
             parse_net_dev(input, None).expect("fallback aggregate"),
             NetworkCounters { rx: 4000, tx: 6000 }
+        );
+    }
+
+    #[test]
+    fn raw_counters_accept_the_full_i64_range_but_reject_beyond_it() {
+        // Raw interface counters reach an i64 server field and an i64 SQLite
+        // column, never the browser, so 2^53 must not retire a long-lived host.
+        const JS_SAFE_PLUS_ONE: u64 = JS_SAFE_INTEGER_MAX + 1;
+        assert_eq!(
+            counter_i64(JS_SAFE_PLUS_ONE, "fixture").expect("past the JS safe range"),
+            JS_SAFE_PLUS_ONE as i64
+        );
+        assert_eq!(
+            counter_i64(i64::MAX as u64, "fixture").expect("largest representable counter"),
+            i64::MAX
+        );
+        assert!(counter_i64(i64::MAX as u64 + 1, "fixture").is_err());
+        assert!(counter_i64(u64::MAX, "fixture").is_err());
+        // Browser-visible values keep the narrower bound.
+        assert!(safe_i64(JS_SAFE_PLUS_ONE, "fixture").is_err());
+
+        let huge = format!(
+            "Inter-|   Receive                    |  Transmit\n\
+             face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n\
+             ens3: {JS_SAFE_PLUS_ONE}  10 0 0 0 0 0 0 {JS_SAFE_PLUS_ONE}  10 0 0 0 0 0 0\n"
+        );
+        assert_eq!(
+            parse_net_dev(&huge, Some("ens3")).expect("counter past the JS safe range"),
+            NetworkCounters {
+                rx: JS_SAFE_PLUS_ONE,
+                tx: JS_SAFE_PLUS_ONE
+            }
+        );
+
+        // The derived rate still has to stay inside the JS safe range.
+        assert!(rate(u64::MAX / 2, 0, 1.0).is_err());
+        assert_eq!(
+            rate(JS_SAFE_PLUS_ONE, JS_SAFE_PLUS_ONE - 1_000, 1.0).expect("rate"),
+            1_000
         );
     }
 

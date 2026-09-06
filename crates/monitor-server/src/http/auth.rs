@@ -16,6 +16,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
+use super::agent::source_ip;
 use crate::{
     app::AppState,
     auth::{
@@ -77,7 +78,10 @@ pub(super) async fn login(
     request: Request,
 ) -> Result<Response, ApiError> {
     validate_origin(request.headers())?;
-    if let Some(retry_after) = state.login_limiter.retry_after(peer.ip()) {
+    // The limiter must key on the client, not on the reverse proxy that fronts
+    // the default loopback listener; `source_ip` owns that frozen contract.
+    let source = source_ip(peer.ip(), request.headers())?;
+    if let Some(retry_after) = state.login_limiter.retry_after(source) {
         return Err(ApiError::rate_limited(retry_after));
     }
 
@@ -88,7 +92,7 @@ pub(super) async fn login(
         .acquire()
         .await
         .map_err(|_| ApiError::internal())?;
-    if let Some(retry_after) = state.login_limiter.retry_after(peer.ip()) {
+    if let Some(retry_after) = state.login_limiter.retry_after(source) {
         return Err(ApiError::rate_limited(retry_after));
     }
     let Some(password_hash) = state
@@ -101,14 +105,14 @@ pub(super) async fn login(
             .await
             .map_err(|_| ApiError::internal())?;
         tracing::warn!("admin password is not configured");
-        return Err(login_failure(&state, peer.ip()));
+        return Err(login_failure(&state, source));
     };
 
     let password_valid = verify_password(password, password_hash.clone())
         .await
         .map_err(|_| ApiError::internal())?;
     if !password_valid {
-        return Err(login_failure(&state, peer.ip()));
+        return Err(login_failure(&state, source));
     }
     let session_token = random_token().map_err(|_| ApiError::internal())?;
     let csrf_token = random_token().map_err(|_| ApiError::internal())?;
@@ -129,7 +133,7 @@ pub(super) async fn login(
     if !session_created {
         return Err(ApiError::invalid_credentials());
     }
-    state.login_limiter.clear(peer.ip());
+    state.login_limiter.clear(source);
 
     let mut response = json_response(
         StatusCode::OK,
@@ -333,10 +337,17 @@ pub(super) async fn parse_json<T: DeserializeOwned>(
 fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let mut found = None;
     for value in headers.get_all(COOKIE) {
-        let value = value.to_str().ok()?;
+        // An unrelated malformed header or segment must not hide a valid
+        // session or CSRF cookie, so skip it instead of abandoning the search.
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
         for cookie in value.split(';') {
-            let (cookie_name, cookie_value) = cookie.trim().split_once('=')?;
+            let Some((cookie_name, cookie_value)) = cookie.trim().split_once('=') else {
+                continue;
+            };
             if cookie_name == name {
+                // A duplicated target cookie stays ambiguous and is rejected.
                 if found.is_some() {
                     return None;
                 }
@@ -639,6 +650,18 @@ mod tests {
                 "POST",
                 "/api/auth/login",
                 &[ORIGIN_HEADER, JSON_HEADER],
+                &body,
+            )
+            .await
+        }
+
+        /// Logs in the way a reverse proxy fronting the loopback listener does.
+        async fn login_from(&self, client: &str, password: &str) -> TestResponse {
+            let body = serde_json::json!({ "password": password }).to_string();
+            self.request(
+                "POST",
+                "/api/auth/login",
+                &[ORIGIN_HEADER, JSON_HEADER, ("X-Real-IP", client)],
                 &body,
             )
             .await
@@ -1133,6 +1156,120 @@ mod tests {
         }));
 
         server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn login_limiter_keys_on_the_proxied_client_not_the_reverse_proxy() {
+        // Every request reaches the loopback listener from the proxy, so keying
+        // on the socket peer would let one client lock out every other one.
+        let server = TestServer::start(Some(OLD_PASSWORD)).await;
+        const NOISY: &str = "198.51.100.10";
+        const QUIET: &str = "198.51.100.20";
+
+        for _ in 0..4 {
+            assert_eq!(server.login_from(NOISY, "wrong password").await.status, 401);
+        }
+        let limited = server.login_from(NOISY, "wrong password").await;
+        assert_eq!(limited.status, 429);
+        assert_eq!(limited.error_code(), "rate_limited");
+
+        // The blocked client stays blocked even with the correct password.
+        assert_eq!(server.login_from(NOISY, OLD_PASSWORD).await.status, 429);
+        // A different client behind the same proxy is untouched.
+        assert_eq!(server.login_from(QUIET, OLD_PASSWORD).await.status, 200);
+        // ... and so is a client that sends no proxy header at all.
+        assert_eq!(server.login(OLD_PASSWORD).await.status, 200);
+
+        server.finish().await;
+    }
+
+    #[tokio::test]
+    async fn login_rejects_duplicate_and_malformed_proxy_headers() {
+        let server = TestServer::start(Some(OLD_PASSWORD)).await;
+        let body = serde_json::json!({ "password": OLD_PASSWORD }).to_string();
+
+        let malformed = server
+            .request(
+                "POST",
+                "/api/auth/login",
+                &[ORIGIN_HEADER, JSON_HEADER, ("X-Real-IP", "not-an-ip")],
+                &body,
+            )
+            .await;
+        assert_eq!(malformed.status, 400);
+        assert_eq!(malformed.error_code(), "invalid_request");
+
+        let duplicated = server
+            .request(
+                "POST",
+                "/api/auth/login",
+                &[
+                    ORIGIN_HEADER,
+                    JSON_HEADER,
+                    ("X-Real-IP", "198.51.100.1"),
+                    ("X-Real-IP", "198.51.100.2"),
+                ],
+                &body,
+            )
+            .await;
+        assert_eq!(duplicated.status, 400);
+        assert_eq!(duplicated.error_code(), "invalid_request");
+
+        // A rejected proxy header must not consume a limiter attempt either.
+        assert_eq!(server.login(OLD_PASSWORD).await.status, 200);
+        server.finish().await;
+    }
+
+    #[test]
+    fn cookie_lookup_skips_unrelated_malformed_segments() {
+        let session = "a".repeat(64);
+        let valid = format!("{SESSION_COOKIE}={session}");
+
+        for header in [
+            valid.clone(),
+            format!("bare; {valid}"),
+            format!("{valid}; bare"),
+            format!("foo=bar; {valid}"),
+            format!("bare; foo=bar; {valid}; trailing"),
+            format!("=leading-equals; {valid}"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(COOKIE, HeaderValue::from_str(&header).expect("cookie"));
+            assert_eq!(
+                cookie_value(&headers, SESSION_COOKIE).as_deref(),
+                Some(session.as_str()),
+                "header: {header}"
+            );
+        }
+
+        // A malformed value in one header must not hide the cookie in another.
+        let mut split = HeaderMap::new();
+        split.append(COOKIE, HeaderValue::from_static("bare"));
+        split.append(COOKIE, HeaderValue::from_str(&valid).expect("cookie"));
+        assert_eq!(
+            cookie_value(&split, SESSION_COOKIE).as_deref(),
+            Some(session.as_str())
+        );
+    }
+
+    #[test]
+    fn cookie_lookup_rejects_duplicates_and_reports_absence() {
+        let mut duplicated = HeaderMap::new();
+        duplicated.insert(
+            COOKIE,
+            HeaderValue::from_static("__Host-monitor_session=a; __Host-monitor_session=b"),
+        );
+        assert_eq!(cookie_value(&duplicated, SESSION_COOKIE), None);
+
+        let mut across_headers = HeaderMap::new();
+        across_headers.append(COOKIE, HeaderValue::from_static("__Host-monitor_session=a"));
+        across_headers.append(COOKIE, HeaderValue::from_static("__Host-monitor_session=b"));
+        assert_eq!(cookie_value(&across_headers, SESSION_COOKIE), None);
+
+        let mut absent = HeaderMap::new();
+        absent.insert(COOKIE, HeaderValue::from_static("foo=bar; bare"));
+        assert_eq!(cookie_value(&absent, SESSION_COOKIE), None);
+        assert_eq!(cookie_value(&HeaderMap::new(), SESSION_COOKIE), None);
     }
 
     fn send_http_request(address: SocketAddr, request: &str) -> std::io::Result<String> {

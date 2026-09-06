@@ -64,6 +64,7 @@ pub fn run(run_config: RunConfig) -> Result<(), RuntimeError> {
     let mut report_backoff = Backoff::new();
     let mut config_backoff = Backoff::new();
     let mut report_waiting = false;
+    let mut collector_waiting = false;
 
     loop {
         let now = Instant::now();
@@ -111,7 +112,32 @@ pub fn run(run_config: RunConfig) -> Result<(), RuntimeError> {
 
         let now = Instant::now();
         if now >= next_report {
-            let mut report = collector.collect_report()?;
+            let mut report = match collector.collect_report() {
+                Ok(report) => {
+                    if collector_waiting {
+                        eprintln!("monitor-agent: metric collection recovered");
+                        collector_waiting = false;
+                    }
+                    report
+                }
+                // A runtime collection failure must not end the process, and a
+                // partial or fabricated report is worse than none: skip this
+                // cycle and let the node fall offline until the host recovers.
+                Err(error) => {
+                    if !collector_waiting {
+                        eprintln!(
+                            "monitor-agent: metric collection failed; skipping report: {error}"
+                        );
+                        collector_waiting = true;
+                    }
+                    next_report = advance_deadline(
+                        next_report,
+                        Duration::from_secs(config.report_interval_seconds as u64),
+                        Instant::now(),
+                    );
+                    continue;
+                }
+            };
             let included_ping = attach_pending_ping(&mut report, &mut pending_ping);
             match client.post_report(&report) {
                 Ok(()) => {
@@ -346,6 +372,24 @@ mod tests {
             advance_deadline(start, Duration::from_secs(20), now),
             start + Duration::from_secs(20)
         );
+    }
+
+    #[test]
+    fn a_skipped_collection_reschedules_into_the_future_without_spinning() {
+        // A collector failure skips the cycle and reuses `advance_deadline`; if
+        // that ever returned a past deadline the agent would busy-loop instead
+        // of sleeping, which is the failure mode the skip path must not create.
+        let now = Instant::now();
+        for interval_seconds in [2_u64, 15, 60] {
+            let interval = Duration::from_secs(interval_seconds);
+            for missed in [0_u64, 1, 5, 1_000] {
+                let overdue = now - Duration::from_secs(missed * interval_seconds);
+                assert!(
+                    advance_deadline(overdue, interval, now) > now,
+                    "interval {interval_seconds}s, {missed} missed cycles"
+                );
+            }
+        }
     }
 
     #[test]

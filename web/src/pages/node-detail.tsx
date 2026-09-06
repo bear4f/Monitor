@@ -1,7 +1,7 @@
 import "uplot/dist/uPlot.min.css";
 import "./node-detail.css";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { PublicNode, RenewalCycle } from "../api/public";
 import { PingChart } from "../components/ping-chart";
 import { ResourceChart } from "../components/resource-chart";
@@ -44,12 +44,19 @@ export function NodeDetailPage({ nodeId, snapshotState }: { nodeId: string; snap
   const resourceHistory = useResourceHistory(nodeId, range, enabled && tab === "resources", mockMode);
   const pingHistory = usePingHistory(nodeId, range, enabled && tab === "latency", mockMode);
   const [cutPeak, setCutPeak] = useState(false);
+  // The snapshot store emits a new state object every poll, so the aligned data
+  // must stay referentially stable until the history itself changes; otherwise
+  // every chart runs setData and redraws on each tick.
+  const data = resourceHistory.history;
+  const cpuData = useMemo(() => (data ? chartData(data, "cpu") : null), [data]);
+  const memoryData = useMemo(() => (data ? chartData(data, "memory") : null), [data]);
+  const networkData = useMemo(() => (data ? chartData(data, "network") : null), [data]);
+  const diskData = useMemo(() => (data ? chartData(data, "disk") : null), [data]);
 
   if (!snapshot) return <DetailSkeleton />;
   if (!node || resourceHistory.notFound || pingHistory.notFound) return <DetailNotFound />;
 
   const metrics = node.metrics;
-  const data = resourceHistory.history;
   return (
     <main className="public-container node-detail-main">
       {snapshotState.stale && <div className="snapshot-notice" role="status">数据更新暂时中断，正在显示最近状态</div>}
@@ -110,7 +117,7 @@ export function NodeDetailPage({ nodeId, snapshotState }: { nodeId: string; snap
           title="CPU"
           nodeName={node.name}
           range={range}
-          data={data ? chartData(data, "cpu") : null}
+          data={cpuData}
           loading={resourceHistory.loading}
           error={resourceHistory.error}
           onRetry={resourceHistory.retry}
@@ -120,7 +127,7 @@ export function NodeDetailPage({ nodeId, snapshotState }: { nodeId: string; snap
           title={`内存 · ${metrics ? formatBytes(metrics.memory_total) : "—"}`}
           nodeName={node.name}
           range={range}
-          data={data ? chartData(data, "memory") : null}
+          data={memoryData}
           total={metrics?.memory_total}
           loading={resourceHistory.loading}
           error={resourceHistory.error}
@@ -131,7 +138,7 @@ export function NodeDetailPage({ nodeId, snapshotState }: { nodeId: string; snap
           title="网络速率"
           nodeName={node.name}
           range={range}
-          data={data ? chartData(data, "network") : null}
+          data={networkData}
           loading={resourceHistory.loading}
           error={resourceHistory.error}
           onRetry={resourceHistory.retry}
@@ -141,7 +148,7 @@ export function NodeDetailPage({ nodeId, snapshotState }: { nodeId: string; snap
           title={`硬盘 · ${metrics ? formatBytes(metrics.disk_total) : "—"}`}
           nodeName={node.name}
           range={range}
-          data={data ? chartData(data, "disk") : null}
+          data={diskData}
           total={metrics?.disk_total}
           loading={resourceHistory.loading}
           error={resourceHistory.error}

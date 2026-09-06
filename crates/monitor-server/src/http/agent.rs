@@ -185,7 +185,10 @@ fn reject_oversized_content_length(headers: &HeaderMap) -> Result<(), ApiError> 
     Ok(())
 }
 
-fn source_ip(peer: IpAddr, headers: &HeaderMap) -> Result<IpAddr, ApiError> {
+/// Resolves the client address behind the frozen reverse-proxy contract: a
+/// non-loopback direct peer always wins, and only a loopback peer may present a
+/// single valid `X-Real-IP`. Shared with the login limiter so both paths agree.
+pub(super) fn source_ip(peer: IpAddr, headers: &HeaderMap) -> Result<IpAddr, ApiError> {
     if !peer.is_loopback() {
         return Ok(peer);
     }
@@ -222,8 +225,8 @@ fn validate_report(report: &AgentReport, config: &AgentConfig) -> Result<(), Api
         || !valid_used_total(report.memory.used, report.memory.total)
         || !valid_used_total(report.memory.swap_used, report.memory.swap_total)
         || !valid_used_total(report.disk.used, report.disk.total)
-        || !valid_safe_integer(report.network.rx_bytes)
-        || !valid_safe_integer(report.network.tx_bytes)
+        || !valid_counter(report.network.rx_bytes)
+        || !valid_counter(report.network.tx_bytes)
         || !valid_safe_integer(report.network.rx_rate)
         || !valid_safe_integer(report.network.tx_rate)
         || !valid_safe_integer(report.uptime_seconds)
@@ -269,6 +272,13 @@ fn valid_nonnegative_float(value: f64) -> bool {
 
 fn valid_safe_integer(value: i64) -> bool {
     (0..=JS_SAFE_INTEGER_MAX).contains(&value)
+}
+
+/// Raw interface counters stay in `i64` all the way to SQLite and are never
+/// serialized into the public snapshot, so only non-negativity is required.
+/// Everything derived from them for the browser keeps the JS-safe bound.
+fn valid_counter(value: i64) -> bool {
+    value >= 0
 }
 
 fn valid_used_total(used: i64, total: i64) -> bool {
@@ -608,6 +618,9 @@ mod tests {
             with_nested_value("cpu", "load_1", json!(-0.1)),
             with_nested_value("memory", "used", json!(2_000)),
             with_nested_value("network", "rx_bytes", json!(-1)),
+            with_nested_value("network", "tx_bytes", json!(-1)),
+            with_nested_value("network", "rx_rate", json!(9_007_199_254_740_992_i64)),
+            with_nested_value("network", "tx_rate", json!(9_007_199_254_740_992_i64)),
             with_value("uptime_seconds", json!(9_007_199_254_740_992_i64)),
         ];
         let mut duplicate_ping = valid_report();
@@ -705,6 +718,58 @@ mod tests {
             context.persisted_first_seen.unwrap()
         );
         assert!(snapshot.live_since_start);
+        context.finish().await;
+    }
+
+    #[tokio::test]
+    async fn raw_network_counters_beyond_the_js_safe_range_are_accepted() {
+        // Raw interface counters only travel Agent -> server -> SQLite, all i64,
+        // and never reach the browser, so a long-lived host must not be locked
+        // out at 2^53 while every browser-visible value stays JS-safe.
+        let context = TestContext::new().await;
+        const BEYOND_JS_SAFE: i64 = 9_007_199_254_740_991 + 100;
+
+        let mut huge = valid_report();
+        huge["network"]["rx_bytes"] = json!(BEYOND_JS_SAFE);
+        huge["network"]["tx_bytes"] = json!(i64::MAX);
+        assert_eq!(
+            response(
+                report(
+                    State(context.state.clone()),
+                    ConnectInfo(loopback_peer()),
+                    context.report_request(&huge.to_string()),
+                )
+                .await,
+            )
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let snapshot = context.state.snapshots.read().await[&context.node_id].clone();
+        assert_eq!(snapshot.rx_counter_bytes, BEYOND_JS_SAFE);
+        assert_eq!(snapshot.tx_counter_bytes, i64::MAX);
+
+        // A same-boot monotonic step from that baseline yields the real delta,
+        // and the browser-visible total stays inside the JS-safe range.
+        let mut stepped = valid_report();
+        stepped["network"]["rx_bytes"] = json!(BEYOND_JS_SAFE + 1_000);
+        stepped["network"]["tx_bytes"] = json!(i64::MAX);
+        assert_eq!(
+            response(
+                report(
+                    State(context.state.clone()),
+                    ConnectInfo(loopback_peer()),
+                    context.report_request(&stepped.to_string()),
+                )
+                .await,
+            )
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let traffic = context.state.traffic.read_current();
+        let node = traffic[&context.node_id];
+        assert_eq!(node.rx_total_bytes, 1_000);
+        assert_eq!(node.tx_total_bytes, 0);
+        assert!(node.rx_total_bytes <= crate::traffic::JS_SAFE_INTEGER_MAX);
         context.finish().await;
     }
 

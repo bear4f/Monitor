@@ -43,6 +43,21 @@ describe("resource history contract", () => {
     expect(chartData(fixture, "disk")[1][1]).toBeNull();
   });
 
+  it("allocates a fresh aligned-data wrapper on every call, so callers must memoize it", () => {
+    // The wrapper identity is what uPlot compares. Calling chartData() inline in
+    // a render hands every 2-second snapshot tick a brand new identity and forces
+    // a full setData redraw of unchanged history, so node-detail memoizes it.
+    for (const kind of ["cpu", "memory", "network", "disk"] as const) {
+      const first = chartData(fixture, kind);
+      const second = chartData(fixture, kind);
+      expect(first).not.toBe(second);
+      expect(first).toEqual(second);
+      for (let index = 0; index < first.length; index += 1) {
+        expect(first[index]).toBe(second[index]);
+      }
+    }
+  });
+
   it("maps network upload to tx and download to rx", () => {
     const network = chartData(fixture, "network");
     expect(network[1]).toBe(fixture.series.tx_rate);
