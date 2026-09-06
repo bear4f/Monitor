@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use serde::Serialize;
+pub use monitor_common::AgentPingTarget;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 
 use crate::auth::LoginLimiter;
@@ -20,14 +20,6 @@ pub struct AgentConfig {
     pub report_interval_seconds: i64,
     pub ping_interval_seconds: i64,
     pub targets: Vec<AgentPingTarget>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AgentPingTarget {
-    pub id: i64,
-    pub name: String,
-    pub host: String,
-    pub ip_family: i64,
 }
 
 #[derive(Clone)]

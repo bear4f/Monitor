@@ -5,7 +5,7 @@ use axum::{
     http::{HeaderMap, HeaderName, StatusCode, header::AUTHORIZATION},
     response::Response,
 };
-use serde::{Deserialize, Serialize};
+use monitor_common::{AgentConfigPayload, AgentReport};
 
 use crate::{
     app::{AgentConfig, AppState},
@@ -22,85 +22,6 @@ const JSON_BODY_LIMIT: usize = 32 * 1_024;
 const JS_SAFE_INTEGER_MAX: i64 = 9_007_199_254_740_991;
 const X_REAL_IP: HeaderName = HeaderName::from_static("x-real-ip");
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AgentReport {
-    protocol_version: i64,
-    agent_version: String,
-    boot_id: String,
-    hostname: String,
-    os: OsReport,
-    cpu: CpuReport,
-    memory: MemoryReport,
-    disk: DiskReport,
-    network: NetworkReport,
-    uptime_seconds: i64,
-    process_count: i64,
-    pings: Vec<PingReport>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OsReport {
-    name: String,
-    version: String,
-    kernel: String,
-    architecture: String,
-    virtualization: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CpuReport {
-    model: String,
-    cores: i64,
-    usage: f64,
-    load_1: f64,
-    load_5: f64,
-    load_15: f64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MemoryReport {
-    total: i64,
-    used: i64,
-    swap_total: i64,
-    swap_used: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DiskReport {
-    total: i64,
-    used: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkReport {
-    rx_bytes: i64,
-    tx_bytes: i64,
-    rx_rate: i64,
-    tx_rate: i64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PingReport {
-    target_id: i64,
-    success: bool,
-    latency_ms: Option<f64>,
-}
-
-#[derive(Serialize)]
-struct AgentConfigResponse {
-    protocol_version: i64,
-    report_interval_seconds: i64,
-    ping_interval_seconds: i64,
-    targets: Vec<crate::app::AgentPingTarget>,
-}
-
 #[derive(Clone, Copy)]
 struct AgentIdentity {
     node_id: i64,
@@ -113,7 +34,7 @@ pub(super) async fn config(
 ) -> Result<Response, ApiError> {
     authenticate_agent(&state, request.headers()).await?;
     let config = state.agent_config.read().await;
-    let response = AgentConfigResponse {
+    let response = AgentConfigPayload {
         protocol_version: 1,
         report_interval_seconds: config.report_interval_seconds,
         ping_interval_seconds: config.ping_interval_seconds,
@@ -206,7 +127,7 @@ pub(super) async fn report(
                 latency_ms: ping.latency_ms,
             }),
         );
-        let snapshot = report.into_snapshot(first_seen_at, received_at, source_ip);
+        let snapshot = report_into_snapshot(report, first_seen_at, received_at, source_ip);
         snapshots.insert(identity.node_id, snapshot);
         update.wake_checkpoint
     };
@@ -354,40 +275,43 @@ fn valid_used_total(used: i64, total: i64) -> bool {
     valid_safe_integer(total) && valid_safe_integer(used) && used <= total
 }
 
-impl AgentReport {
-    fn into_snapshot(self, first_seen_at: i64, last_seen_at: i64, last_ip: IpAddr) -> NodeSnapshot {
-        NodeSnapshot {
-            live_since_start: true,
-            first_seen_at,
-            last_seen_at,
-            last_ip,
-            hostname: self.hostname.trim().to_owned(),
-            os_name: self.os.name.trim().to_owned(),
-            os_version: self.os.version.trim().to_owned(),
-            kernel: self.os.kernel.trim().to_owned(),
-            architecture: self.os.architecture.trim().to_owned(),
-            virtualization: self.os.virtualization.trim().to_owned(),
-            agent_version: self.agent_version.trim().to_owned(),
-            cpu_model: self.cpu.model.trim().to_owned(),
-            cpu_cores: self.cpu.cores,
-            cpu_usage: self.cpu.usage,
-            load_1: self.cpu.load_1,
-            load_5: self.cpu.load_5,
-            load_15: self.cpu.load_15,
-            memory_total: self.memory.total,
-            memory_used: self.memory.used,
-            swap_total: self.memory.swap_total,
-            swap_used: self.memory.swap_used,
-            disk_total: self.disk.total,
-            disk_used: self.disk.used,
-            rx_counter_bytes: self.network.rx_bytes,
-            tx_counter_bytes: self.network.tx_bytes,
-            rx_rate_bytes_per_sec: self.network.rx_rate,
-            tx_rate_bytes_per_sec: self.network.tx_rate,
-            uptime_seconds: self.uptime_seconds,
-            process_count: self.process_count,
-            boot_id: self.boot_id.trim().to_owned(),
-        }
+fn report_into_snapshot(
+    report: AgentReport,
+    first_seen_at: i64,
+    last_seen_at: i64,
+    last_ip: IpAddr,
+) -> NodeSnapshot {
+    NodeSnapshot {
+        live_since_start: true,
+        first_seen_at,
+        last_seen_at,
+        last_ip,
+        hostname: report.hostname.trim().to_owned(),
+        os_name: report.os.name.trim().to_owned(),
+        os_version: report.os.version.trim().to_owned(),
+        kernel: report.os.kernel.trim().to_owned(),
+        architecture: report.os.architecture.trim().to_owned(),
+        virtualization: report.os.virtualization.trim().to_owned(),
+        agent_version: report.agent_version.trim().to_owned(),
+        cpu_model: report.cpu.model.trim().to_owned(),
+        cpu_cores: report.cpu.cores,
+        cpu_usage: report.cpu.usage,
+        load_1: report.cpu.load_1,
+        load_5: report.cpu.load_5,
+        load_15: report.cpu.load_15,
+        memory_total: report.memory.total,
+        memory_used: report.memory.used,
+        swap_total: report.memory.swap_total,
+        swap_used: report.memory.swap_used,
+        disk_total: report.disk.total,
+        disk_used: report.disk.used,
+        rx_counter_bytes: report.network.rx_bytes,
+        tx_counter_bytes: report.network.tx_bytes,
+        rx_rate_bytes_per_sec: report.network.rx_rate,
+        tx_rate_bytes_per_sec: report.network.tx_rate,
+        uptime_seconds: report.uptime_seconds,
+        process_count: report.process_count,
+        boot_id: report.boot_id.trim().to_owned(),
     }
 }
 
