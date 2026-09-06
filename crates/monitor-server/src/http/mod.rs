@@ -1,3 +1,4 @@
+mod agent;
 mod auth;
 mod nodes;
 
@@ -13,6 +14,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/auth/me", get(auth::me))
+        .route("/api/agent/config", get(agent::config))
+        .route("/api/agent/report", post(agent::report))
         .route("/api/admin/password", patch(auth::change_password))
         .route("/api/admin/nodes", get(nodes::list).post(nodes::create))
         .route(

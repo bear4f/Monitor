@@ -167,10 +167,16 @@ pub(super) async fn list(
         .database
         .list_admin_nodes(day_start, now)
         .await
-        .map_err(ApiError::database)?
+        .map_err(ApiError::database)?;
+    let snapshots = state.snapshots.read().await;
+    let nodes = nodes
         .into_iter()
-        .map(|row| admin_node_response(row, now, offline_after_seconds))
+        .map(|row| {
+            let snapshot = snapshots.get(&row.node.id);
+            admin_node_response(row, snapshot, now, offline_after_seconds)
+        })
         .collect();
+    drop(snapshots);
     Ok(json_response(StatusCode::OK, AdminNodesResponse { nodes }))
 }
 
@@ -189,7 +195,7 @@ pub(super) async fn create(
     let now = unix_timestamp().map_err(|_| ApiError::internal())?;
     let new_node = NewNodeRow { public_id, ..node };
 
-    let _mutation_guard = state.node_mutation_lock.lock().await;
+    let _lifecycle_guard = state.node_lifecycle_gate.write().await;
     let created = state
         .database
         .create_node(new_node, token_hash, now)
@@ -227,7 +233,7 @@ pub(super) async fn patch(
     }
     let request: PatchNodeRequest = parse_json(request, JSON_BODY_LIMIT).await?;
     let patch = validate_patch(request)?;
-    let _mutation_guard = state.node_mutation_lock.lock().await;
+    let _lifecycle_guard = state.node_lifecycle_gate.write().await;
     let result = state
         .database
         .update_node(
@@ -268,7 +274,7 @@ pub(super) async fn delete(
     if !valid_public_id(&public_id) {
         return Err(ApiError::not_found());
     }
-    let _mutation_guard = state.node_mutation_lock.lock().await;
+    let _lifecycle_guard = state.node_lifecycle_gate.write().await;
     let deleted = state
         .database
         .delete_node(
@@ -287,6 +293,7 @@ pub(super) async fn delete(
         }
     }
     drop(metadata);
+    state.snapshots.write().await.remove(&deleted.node_id);
     Ok(no_content_response())
 }
 
@@ -302,7 +309,7 @@ pub(super) async fn rotate_token(
     }
     let token = random_token().map_err(|_| ApiError::internal())?;
     let new_hash = sha256(&token);
-    let _mutation_guard = state.node_mutation_lock.lock().await;
+    let _lifecycle_guard = state.node_lifecycle_gate.write().await;
     let rotated = state
         .database
         .rotate_node_token(
@@ -525,18 +532,24 @@ fn day_start_utc(now: i64, timezone: &str) -> Result<i64, ApiError> {
         })
 }
 
-fn admin_node_response(row: AdminNodeRow, now: i64, offline_after: i64) -> AdminNodeResponse {
-    let online = row
-        .last_seen_at
-        .is_some_and(|last_seen| now.saturating_sub(last_seen) <= offline_after);
+fn admin_node_response(
+    row: AdminNodeRow,
+    snapshot: Option<&crate::snapshot::NodeSnapshot>,
+    now: i64,
+    offline_after: i64,
+) -> AdminNodeResponse {
+    let last_seen_at = snapshot.map_or(row.last_seen_at, |snapshot| Some(snapshot.last_seen_at));
+    let last_ip = snapshot.map_or(row.last_ip, |snapshot| Some(snapshot.last_ip.to_string()));
+    let online =
+        last_seen_at.is_some_and(|last_seen| now.saturating_sub(last_seen) <= offline_after);
     AdminNodeResponse {
         id: row.node.public_id,
         name: row.node.name,
         region_code: row.node.region_code,
         sort_order: row.node.sort_order,
-        last_ip: row.last_ip,
+        last_ip,
         online,
-        last_seen_at: row.last_seen_at,
+        last_seen_at,
         cycle_rx: row.cycle_rx_bytes,
         cycle_tx: row.cycle_tx_bytes,
         traffic_limit: row.node.traffic_limit_bytes,

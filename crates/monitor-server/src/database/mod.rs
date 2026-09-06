@@ -11,8 +11,8 @@ use std::{
 
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use models::{
-    AdminNodeRow, DeletedNodeRow, NewNodeRow, NodeMetaRow, NodePatchRow, NodeTokenRow,
-    NodeUpdateResult, RotatedNodeTokenRow, SessionRow, SettingsRow, SqlitePragmas,
+    AdminNodeRow, DeletedNodeRow, EnabledPingTargetRow, NewNodeRow, NodeMetaRow, NodePatchRow,
+    NodeTokenRow, NodeUpdateResult, RotatedNodeTokenRow, SessionRow, SettingsRow, SqlitePragmas,
     StartupHydration, TrafficRecoveryRow, UpdateNodeResult,
 };
 use rusqlite::Connection;
@@ -42,6 +42,9 @@ pub enum DatabaseError {
     WorkerSpawn(std::io::Error),
     WorkerStopped,
     WorkerResponseDropped,
+    TooManyEnabledPingTargets {
+        count: usize,
+    },
 }
 
 impl std::fmt::Display for DatabaseError {
@@ -67,6 +70,12 @@ impl std::fmt::Display for DatabaseError {
             Self::WorkerResponseDropped => {
                 formatter.write_str("database worker dropped its response")
             }
+            Self::TooManyEnabledPingTargets { count } => {
+                write!(
+                    formatter,
+                    "database has {count} enabled ping targets; maximum is 6"
+                )
+            }
         }
     }
 }
@@ -81,7 +90,8 @@ impl std::error::Error for DatabaseError {
             Self::UnsupportedSchemaVersion { .. }
             | Self::MissingSettings
             | Self::WorkerStopped
-            | Self::WorkerResponseDropped => None,
+            | Self::WorkerResponseDropped
+            | Self::TooManyEnabledPingTargets { .. } => None,
         }
     }
 }
@@ -125,6 +135,7 @@ enum Command {
         response: oneshot::Sender<Result<usize, DatabaseError>>,
     },
     LoadNodeTokens(oneshot::Sender<Result<Vec<NodeTokenRow>, DatabaseError>>),
+    LoadEnabledPingTargets(oneshot::Sender<Result<Vec<EnabledPingTargetRow>, DatabaseError>>),
     ListAdminNodes {
         day_start_utc: i64,
         now: i64,
@@ -268,6 +279,12 @@ impl Database {
         self.request(Command::LoadNodeTokens).await
     }
 
+    pub async fn load_enabled_ping_targets(
+        &self,
+    ) -> Result<Vec<EnabledPingTargetRow>, DatabaseError> {
+        self.request(Command::LoadEnabledPingTargets).await
+    }
+
     pub async fn list_admin_nodes(
         &self,
         day_start_utc: i64,
@@ -390,12 +407,19 @@ pub async fn hydrate_startup(database: &Database) -> Result<StartupHydration, Da
     let settings = database.load_settings().await?;
     let nodes = database.load_node_metadata().await?;
     let node_tokens = database.load_node_tokens().await?;
+    let enabled_ping_targets = database.load_enabled_ping_targets().await?;
+    if enabled_ping_targets.len() > 6 {
+        return Err(DatabaseError::TooManyEnabledPingTargets {
+            count: enabled_ping_targets.len(),
+        });
+    }
     let traffic_recovery = database.load_traffic_recovery().await?;
 
     Ok(StartupHydration {
         settings,
         nodes,
         node_tokens,
+        enabled_ping_targets,
         traffic_recovery,
     })
 }
@@ -482,6 +506,9 @@ fn database_worker(
             }
             Command::LoadNodeTokens(response) => {
                 let _ = response.send(persistence::load_node_tokens(&connection));
+            }
+            Command::LoadEnabledPingTargets(response) => {
+                let _ = response.send(persistence::load_enabled_ping_targets(&connection));
             }
             Command::ListAdminNodes {
                 day_start_utc,

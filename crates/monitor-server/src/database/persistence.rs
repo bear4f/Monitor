@@ -5,9 +5,9 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, types::T
 use super::{
     DatabaseError,
     models::{
-        AdminNodeRow, DeletedNodeRow, NewNodeRow, NodeMetaRow, NodePatchRow, NodeTokenRow,
-        NodeUpdateResult, RotatedNodeTokenRow, SessionRow, SettingsRow, SqlitePragmas,
-        TrafficRecoveryRow, UpdateNodeResult,
+        AdminNodeRow, DeletedNodeRow, EnabledPingTargetRow, NewNodeRow, NodeMetaRow, NodePatchRow,
+        NodeTokenRow, NodeUpdateResult, RotatedNodeTokenRow, SessionRow, SettingsRow,
+        SqlitePragmas, TrafficRecoveryRow, UpdateNodeResult,
     },
 };
 
@@ -343,6 +343,38 @@ pub(super) fn load_node_tokens(
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|source| DatabaseError::Sql {
             operation: "read startup node tokens",
+            source,
+        })
+}
+
+pub(super) fn load_enabled_ping_targets(
+    connection: &Connection,
+) -> Result<Vec<EnabledPingTargetRow>, DatabaseError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT id, name, host, ip_family
+             FROM ping_targets WHERE enabled = 1 ORDER BY sort_order, id",
+        )
+        .map_err(|source| DatabaseError::Sql {
+            operation: "prepare enabled ping target query",
+            source,
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(EnabledPingTargetRow {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                host: row.get(2)?,
+                ip_family: row.get(3)?,
+            })
+        })
+        .map_err(|source| DatabaseError::Sql {
+            operation: "query enabled ping targets",
+            source,
+        })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "read enabled ping targets",
             source,
         })
 }

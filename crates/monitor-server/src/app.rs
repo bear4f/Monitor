@@ -1,15 +1,33 @@
 use std::{collections::HashMap, sync::Arc};
 
+use serde::Serialize;
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
 use crate::auth::LoginLimiter;
 use crate::database::{
     Database, DatabaseError, NodeMetaRow, SettingsRow, StartupHydration, TrafficRecoveryRow,
 };
+use crate::snapshot::SnapshotStore;
 
 pub type SettingsCache = Arc<RwLock<SettingsRow>>;
 pub type NodeMetaCache = Arc<RwLock<HashMap<i64, NodeMetaRow>>>;
 pub type NodeTokenCache = Arc<RwLock<HashMap<[u8; 32], i64>>>;
+pub type AgentConfigCache = Arc<RwLock<AgentConfig>>;
+
+#[derive(Debug, Clone)]
+pub struct AgentConfig {
+    pub report_interval_seconds: i64,
+    pub ping_interval_seconds: i64,
+    pub targets: Vec<AgentPingTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentPingTarget {
+    pub id: i64,
+    pub name: String,
+    pub host: String,
+    pub ip_family: i64,
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -20,7 +38,9 @@ pub struct AppState {
     settings_mutation_lock: Arc<Mutex<()>>,
     pub node_metadata: NodeMetaCache,
     pub(crate) node_tokens: NodeTokenCache,
-    pub(crate) node_mutation_lock: Arc<Mutex<()>>,
+    pub(crate) node_lifecycle_gate: Arc<RwLock<()>>,
+    pub(crate) snapshots: SnapshotStore,
+    pub(crate) agent_config: AgentConfigCache,
     pub traffic_recovery: Arc<[TrafficRecoveryRow]>,
 }
 
@@ -36,6 +56,20 @@ impl AppState {
             .into_iter()
             .map(|token| (token.token_hash, token.node_id))
             .collect();
+        let agent_config = AgentConfig {
+            report_interval_seconds: hydration.settings.agent_report_interval_seconds,
+            ping_interval_seconds: hydration.settings.ping_interval_seconds,
+            targets: hydration
+                .enabled_ping_targets
+                .into_iter()
+                .map(|target| AgentPingTarget {
+                    id: target.id,
+                    name: target.name,
+                    host: target.host,
+                    ip_family: target.ip_family,
+                })
+                .collect(),
+        };
 
         Self {
             database,
@@ -45,7 +79,9 @@ impl AppState {
             settings_mutation_lock: Arc::new(Mutex::new(())),
             node_metadata: Arc::new(RwLock::new(node_metadata)),
             node_tokens: Arc::new(RwLock::new(node_tokens)),
-            node_mutation_lock: Arc::new(Mutex::new(())),
+            node_lifecycle_gate: Arc::new(RwLock::new(())),
+            snapshots: Arc::new(RwLock::new(HashMap::new())),
+            agent_config: Arc::new(RwLock::new(agent_config)),
             traffic_recovery: hydration.traffic_recovery.into(),
         }
     }

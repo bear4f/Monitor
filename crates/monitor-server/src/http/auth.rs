@@ -424,7 +424,7 @@ impl ApiError {
         )
     }
 
-    fn unauthorized() -> Self {
+    pub(super) fn unauthorized() -> Self {
         Self::new(StatusCode::UNAUTHORIZED, "unauthorized", "unauthorized")
     }
 
@@ -444,7 +444,7 @@ impl ApiError {
         )
     }
 
-    fn payload_too_large(body_limit: usize) -> Self {
+    pub(super) fn payload_too_large(body_limit: usize) -> Self {
         let message = match body_limit {
             4_096 => "request body exceeds 4096 bytes",
             8_192 => "request body exceeds 8192 bytes",
@@ -453,7 +453,7 @@ impl ApiError {
         Self::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", message)
     }
 
-    fn unsupported_media_type() -> Self {
+    pub(super) fn unsupported_media_type() -> Self {
         Self::new(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "unsupported_media_type",

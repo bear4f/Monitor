@@ -34,6 +34,14 @@ pub struct NodeTokenRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnabledPingTargetRow {
+    pub id: i64,
+    pub name: String,
+    pub host: String,
+    pub ip_family: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewNodeRow {
     pub public_id: String,
     pub name: String,
@@ -132,5 +140,6 @@ pub struct StartupHydration {
     pub settings: SettingsRow,
     pub nodes: Vec<NodeMetaRow>,
     pub node_tokens: Vec<NodeTokenRow>,
+    pub enabled_ping_targets: Vec<EnabledPingTargetRow>,
     pub traffic_recovery: Vec<TrafficRecoveryRow>,
 }
