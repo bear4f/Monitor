@@ -16,7 +16,9 @@ import {
   parsePingTarget,
   parsePingTargets,
   parsePingTargetResponse,
+  pingTargetMutationMessage,
   buildPingTargetPatch,
+  canEnablePingTarget,
   targetSortOrder,
   validatePingTargetHost,
   trafficUnitBytes,
@@ -36,6 +38,7 @@ describe("admin pure helpers", () => {
     expect(parsePingTargets({ targets: [target] }).targets).toHaveLength(1);
     expect(parsePingTargetResponse({ target }).target.id).toBe(1);
     expect(() => parsePingTarget({ ...target, id: -1 })).toThrow();
+    expect(() => parsePingTarget({ ...target, id: 0 })).toThrow();
     expect(() => parsePingTarget({ ...target, name: "" })).toThrow();
     expect(() => parsePingTarget({ ...target, host: 4 })).toThrow();
     expect(() => parsePingTarget({ ...target, ip_family: 5 })).toThrow();
@@ -43,6 +46,16 @@ describe("admin pure helpers", () => {
     expect(() => parsePingTarget({ ...target, sort_order: -1 })).toThrow();
     expect(() => parsePingTargets({ targets: {} })).toThrow();
     expect(() => parsePingTargetResponse({ target: null })).toThrow();
+  });
+  it("enforces the six-enabled target limit without blocking enabled edits", () => {
+    expect(canEnablePingTarget(5, false)).toBe(true);
+    expect(canEnablePingTarget(6, false)).toBe(false);
+    expect(canEnablePingTarget(6, true)).toBe(true);
+  });
+  it("maps target mutation errors to form-safe messages", () => {
+    expect(pingTargetMutationMessage(400)).toBe("目标配置无效，请检查名称、目标地址和 IP 协议");
+    expect(pingTargetMutationMessage(409)).toBe("最多只能启用 6 个延迟监控目标");
+    expect(pingTargetMutationMessage(503)).toBeNull();
   });
   it("validates target host UX without rejecting IPv6", () => {
     expect(validatePingTargetHost("203.0.113.1")).toBe(true);

@@ -305,7 +305,7 @@ export function parseRotateTokenResponse(value: unknown): {
 export function parsePingTarget(value: unknown): PingTarget {
   const item = object(value);
   if (
-    !isSafeInt(item.id) ||
+    !isSafeInt(item.id, true) ||
     typeof item.name !== "string" ||
     item.name.length < 1 ||
     item.name.length > 64 ||
@@ -318,6 +318,17 @@ export function parsePingTarget(value: unknown): PingTarget {
   )
     throw new Error("invalid ping target");
   return item as unknown as PingTarget;
+}
+export function canEnablePingTarget(
+  enabledCount: number,
+  originalEnabled: boolean,
+): boolean {
+  return originalEnabled || enabledCount < 6;
+}
+export function pingTargetMutationMessage(status: number): string | null {
+  if (status === 400) return "目标配置无效，请检查名称、目标地址和 IP 协议";
+  if (status === 409) return "最多只能启用 6 个延迟监控目标";
+  return null;
 }
 export function parsePingTargets(value: unknown): { targets: PingTarget[] } {
   const item = object(value);

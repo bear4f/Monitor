@@ -2,11 +2,13 @@ import { GripVertical, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import {
+  AdminApiError,
   buildPingTargetPatch,
+  canEnablePingTarget,
   createPingTarget,
   deletePingTarget,
   listPingTargets,
-  parsePingTarget,
+  pingTargetMutationMessage,
   PingTarget,
   targetSortOrder,
   updatePingTarget,
@@ -29,7 +31,7 @@ export function AdminPingTargetsPage() {
   const load = async () => {
     setLoading(true);
     try {
-      setTargets((await listPingTargets()).targets.map(parsePingTarget));
+      setTargets((await listPingTargets()).targets);
       setError(null);
     } catch (e) {
       setError(handleAdminError(e));
@@ -41,14 +43,29 @@ export function AdminPingTargetsPage() {
     void load();
   }, []);
 
-  const mutation = async (work: () => Promise<unknown>) => {
+  const [dialogError, setDialogError] = useState<string | null>(null);
+  const mutation = async (
+    work: () => Promise<unknown>,
+    localError?: (message: string) => void,
+  ) => {
     setBusy(true);
     try {
       await work();
       await load();
       setDialog(null);
+      setDialogError(null);
     } catch (e) {
-      setError(handleAdminError(e));
+      const message = handleAdminError(e);
+      if (
+        localError &&
+        !(e instanceof AdminApiError && (e.status === 401 || e.status === 403))
+      )
+        localError(
+          e instanceof AdminApiError
+            ? pingTargetMutationMessage(e.status) ?? message
+            : message,
+        );
+      else setError(message);
     } finally {
       setBusy(false);
     }
@@ -69,6 +86,7 @@ export function AdminPingTargetsPage() {
           type="button"
           onClick={() => {
             setSelected(null);
+            setDialogError(null);
             setDialog("create");
           }}
           icon={<Plus size={17} aria-hidden="true" />}
@@ -124,6 +142,7 @@ export function AdminPingTargetsPage() {
                   }}
                   onEdit={() => {
                     setSelected(target);
+                    setDialogError(null);
                     setDialog("edit");
                   }}
                   onDelete={() => {
@@ -142,10 +161,10 @@ export function AdminPingTargetsPage() {
           title="添加目标"
           busy={busy}
           defaultEnabled={enabledCount < 6}
+          enabledCount={enabledCount}
+          serverError={dialogError}
           onClose={() => setDialog(null)}
-          onSubmit={(body) =>
-            void mutation(() => createPingTarget(body))
-          }
+          onSubmit={(body) => mutation(() => createPingTarget(body), setDialogError)}
         />
       )}
       {dialog === "edit" && selected && (
@@ -153,13 +172,14 @@ export function AdminPingTargetsPage() {
           title="编辑目标"
           target={selected}
           busy={busy}
+          serverError={dialogError}
           onClose={() => setDialog(null)}
-          onSubmit={(body) => {
+          onSubmit={async (body) => {
             if (Object.keys(body).length === 0) {
               setDialog(null);
               return;
             }
-            void mutation(() => updatePingTarget(selected.id, body));
+            await mutation(() => updatePingTarget(selected.id, body), setDialogError);
           }}
           enabledCount={enabledCount}
         />
@@ -251,6 +271,7 @@ function TargetDialog({
   busy,
   defaultEnabled = true,
   enabledCount = 0,
+  serverError,
   onClose,
   onSubmit,
 }: {
@@ -260,14 +281,15 @@ function TargetDialog({
   defaultEnabled?: boolean;
   enabledCount?: number;
   onClose: () => void;
-  onSubmit: (body: Record<string, unknown>) => void;
+  onSubmit: (body: Record<string, unknown>) => Promise<void>;
+  serverError?: string | null;
 }) {
   const [name, setName] = useState(target?.name ?? "");
   const [host, setHost] = useState(target?.host ?? "");
   const [family, setFamily] = useState<4 | 6>(target?.ip_family ?? 4);
   const [enabled, setEnabled] = useState(target?.enabled ?? defaultEnabled);
   const [formError, setFormError] = useState<string | null>(null);
-  const submit = (event: FormEvent) => {
+  const submit = async (event: FormEvent) => {
     event.preventDefault();
     const normalizedName = name.trim();
     const normalizedHost = host.trim();
@@ -279,16 +301,16 @@ function TargetDialog({
       setFormError("目标地址格式无效");
       return;
     }
-    if (!target && enabled && enabledCount >= 6) {
+    if (!target && enabled && !canEnablePingTarget(enabledCount, false)) {
       setFormError("最多只能启用 6 个延迟监控目标");
       return;
     }
-    if (target && !target.enabled && enabled && enabledCount >= 6) {
+    if (target && enabled && !canEnablePingTarget(enabledCount, target.enabled)) {
       setFormError("最多只能启用 6 个延迟监控目标");
       return;
     }
     const form = { name: normalizedName, host: normalizedHost, ip_family: family, enabled };
-    onSubmit(target ? buildPingTargetPatch(target, form) : form);
+    await onSubmit(target ? buildPingTargetPatch(target, form) : form);
   };
   return (
     <Dialog title={title} onClose={onClose}>
@@ -297,7 +319,7 @@ function TargetDialog({
         <label>目标地址<input value={host} onChange={(event) => setHost(event.target.value)} placeholder="hostname / IP" /></label>
         <label>IP 协议<select value={family} onChange={(event) => setFamily(Number(event.target.value) as 4 | 6)}><option value={4}>IPv4</option><option value={6}>IPv6</option></select></label>
         <label className="checkbox-label"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />启用</label>
-        {formError && <div className="form-error" role="alert">{formError}</div>}
+        {(formError || serverError) && <div className="form-error" role="alert">{formError ?? serverError}</div>}
         <div className="dialog-actions"><Button type="button" onClick={onClose}>取消</Button><Button type="submit" disabled={busy}>{busy ? "保存中…" : "保存"}</Button></div>
       </form>
     </Dialog>
