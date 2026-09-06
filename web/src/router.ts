@@ -5,6 +5,7 @@ export type Route =
   | { page: "node"; nodeId: string }
   | { page: "login" }
   | { page: "admin-nodes" }
+  | { page: "admin-ping-targets" }
   | { page: "admin-disabled"; path: string }
   | { page: "not-found" };
 
@@ -14,6 +15,7 @@ export function matchRoute(pathname: string): Route {
   if (pathname === "/") return { page: "overview" };
   if (pathname === "/login") return { page: "login" };
   if (pathname === "/admin/nodes") return { page: "admin-nodes" };
+  if (pathname === "/admin/ping-targets") return { page: "admin-ping-targets" };
   if (/^\/admin\/(ping-targets|theme|settings)$/.test(pathname)) return { page: "admin-disabled", path: pathname };
   const node = /^\/nodes\/([0-9a-f]{32})$/.exec(pathname);
   return node ? { page: "node", nodeId: node[1] } : { page: "not-found" };

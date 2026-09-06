@@ -13,10 +13,54 @@ import {
   parseMoneyToMicros,
   parseNodeConfig,
   parseRotateTokenResponse,
+  parsePingTarget,
+  parsePingTargets,
+  parsePingTargetResponse,
+  buildPingTargetPatch,
+  targetSortOrder,
+  validatePingTargetHost,
   trafficUnitBytes,
 } from "../api/admin";
 
 describe("admin pure helpers", () => {
+  const target = {
+    id: 1,
+    name: "电信 v4",
+    host: "203.0.113.1",
+    ip_family: 4 as const,
+    enabled: true,
+    sort_order: 0,
+  };
+  it("parses ping target responses strictly", () => {
+    expect(parsePingTarget(target)).toEqual(target);
+    expect(parsePingTargets({ targets: [target] }).targets).toHaveLength(1);
+    expect(parsePingTargetResponse({ target }).target.id).toBe(1);
+    expect(() => parsePingTarget({ ...target, id: -1 })).toThrow();
+    expect(() => parsePingTarget({ ...target, name: "" })).toThrow();
+    expect(() => parsePingTarget({ ...target, host: 4 })).toThrow();
+    expect(() => parsePingTarget({ ...target, ip_family: 5 })).toThrow();
+    expect(() => parsePingTarget({ ...target, enabled: "yes" })).toThrow();
+    expect(() => parsePingTarget({ ...target, sort_order: -1 })).toThrow();
+    expect(() => parsePingTargets({ targets: {} })).toThrow();
+    expect(() => parsePingTargetResponse({ target: null })).toThrow();
+  });
+  it("validates target host UX without rejecting IPv6", () => {
+    expect(validatePingTargetHost("203.0.113.1")).toBe(true);
+    expect(validatePingTargetHost("example.com")).toBe(true);
+    expect(validatePingTargetHost("2001:db8::1")).toBe(true);
+    for (const value of ["", "https://example.com", "example.com/path", "example.com?q=x", "bad host"]) {
+      expect(validatePingTargetHost(value)).toBe(false);
+    }
+  });
+  it("builds non-destructive target patches and clamps sorting", () => {
+    expect(buildPingTargetPatch(target, { name: target.name, host: target.host, ip_family: 4, enabled: true })).toEqual({});
+    expect(buildPingTargetPatch(target, { name: "new", host: target.host, ip_family: 4, enabled: true })).toEqual({ name: "new" });
+    expect(buildPingTargetPatch(target, { name: target.name, host: "::1", ip_family: 6, enabled: false })).toEqual({ host: "::1", ip_family: 6, enabled: false });
+    expect(targetSortOrder(0, -1, 3)).toBeNull();
+    expect(targetSortOrder(2, 1, 3)).toBeNull();
+    expect(targetSortOrder(1, -1, 3)).toBe(0);
+    expect(targetSortOrder(1, 1, 3)).toBe(2);
+  });
   it("parses decimal prices exactly", () => {
     expect(parseMoneyToMicros("39.90")).toBe(39_900_000);
     expect(parseMoneyToMicros("399.123456")).toBe(399_123_456);

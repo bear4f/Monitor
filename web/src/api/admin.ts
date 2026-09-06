@@ -48,6 +48,14 @@ export interface NodeConfig {
   renewal_cycle: RenewalCycle | null;
   expires_at: number | null;
 }
+export interface PingTarget {
+  id: number;
+  name: string;
+  host: string;
+  ip_family: 4 | 6;
+  enabled: boolean;
+  sort_order: number;
+}
 
 export function readCookie(name: string): string | null {
   if (typeof document === "undefined") return null;
@@ -160,6 +168,29 @@ export const rotateToken = async (id: string) =>
       true,
     ),
   );
+export const listPingTargets = async () =>
+  parsePingTargets(await request<unknown>("/api/admin/ping-targets"));
+export const createPingTarget = async (body: Record<string, unknown>) =>
+  parsePingTargetResponse(
+    await request<unknown>(
+      "/api/admin/ping-targets",
+      { method: "POST", body: JSON.stringify(body) },
+      true,
+    ),
+  );
+export const updatePingTarget = async (
+  id: number,
+  body: Record<string, unknown>,
+) =>
+  parsePingTargetResponse(
+    await request<unknown>(
+      `/api/admin/ping-targets/${id}`,
+      { method: "PATCH", body: JSON.stringify(body) },
+      true,
+    ),
+  );
+export const deletePingTarget = (id: number) =>
+  request<void>(`/api/admin/ping-targets/${id}`, { method: "DELETE" }, true);
 
 function isSafeInt(value: unknown, positive = false): value is number {
   return (
@@ -269,6 +300,64 @@ export function parseRotateTokenResponse(value: unknown): {
   )
     throw new Error("invalid rotate response");
   return { agent_token: item.agent_token };
+}
+
+export function parsePingTarget(value: unknown): PingTarget {
+  const item = object(value);
+  if (
+    !isSafeInt(item.id) ||
+    typeof item.name !== "string" ||
+    item.name.length < 1 ||
+    item.name.length > 64 ||
+    typeof item.host !== "string" ||
+    item.host.length < 1 ||
+    item.host.length > 253 ||
+    (item.ip_family !== 4 && item.ip_family !== 6) ||
+    typeof item.enabled !== "boolean" ||
+    !isSafeInt(item.sort_order)
+  )
+    throw new Error("invalid ping target");
+  return item as unknown as PingTarget;
+}
+export function parsePingTargets(value: unknown): { targets: PingTarget[] } {
+  const item = object(value);
+  if (!Array.isArray(item.targets)) throw new Error("invalid targets response");
+  return { targets: item.targets.map(parsePingTarget) };
+}
+export function parsePingTargetResponse(value: unknown): { target: PingTarget } {
+  const item = object(value);
+  return { target: parsePingTarget(item.target) };
+}
+export function validatePingTargetHost(value: string): boolean {
+  const host = value.trim();
+  return (
+    host.length > 0 &&
+    host.length <= 253 &&
+    !/\s/.test(host) &&
+    !/^https?:\/\//i.test(host) &&
+    !/[\/?#]/.test(host)
+  );
+}
+export function buildPingTargetPatch(
+  original: PingTarget,
+  form: Pick<PingTarget, "name" | "host" | "ip_family" | "enabled">,
+): Record<string, unknown> {
+  const patch: Record<string, unknown> = {};
+  const name = form.name.trim();
+  const host = form.host.trim();
+  if (name !== original.name) patch.name = name;
+  if (host !== original.host) patch.host = host;
+  if (form.ip_family !== original.ip_family) patch.ip_family = form.ip_family;
+  if (form.enabled !== original.enabled) patch.enabled = form.enabled;
+  return patch;
+}
+export function targetSortOrder(
+  current: number,
+  delta: number,
+  length: number,
+): number | null {
+  const next = current + delta;
+  return next >= 0 && next < length ? next : null;
 }
 
 export function parseMoneyToMicros(input: string): number | null {

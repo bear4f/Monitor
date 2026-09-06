@@ -24,6 +24,7 @@ export function useAdminSession() {
 export function handleAdminError(error: unknown): string {
   if (error instanceof AdminApiError && error.status === 401) { setUnauthenticated(); navigate("/login"); return "会话已过期"; }
   if (error instanceof AdminApiError && error.status === 403) return "会话验证失败，请重新登录";
+  if (error instanceof AdminApiError && error.status === 409) return "最多只能启用 6 个延迟监控目标";
   if (error instanceof AdminApiError && error.status === 429) return "登录尝试过于频繁，请稍后再试";
   return error instanceof Error ? error.message : "暂时无法完成请求";
 }

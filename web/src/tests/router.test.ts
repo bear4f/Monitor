@@ -11,5 +11,6 @@ it("matches the overview and strict public node detail routes", () => {
   expect(matchRoute("/nodes/0123456789ABCDEF0123456789ABCDEF")).toEqual({ page: "not-found" });
   expect(matchRoute("/login")).toEqual({ page: "login" });
   expect(matchRoute("/admin/nodes")).toEqual({ page: "admin-nodes" });
+  expect(matchRoute("/admin/ping-targets")).toEqual({ page: "admin-ping-targets" });
   expect(matchRoute("/admin/settings")).toEqual({ page: "admin-disabled", path: "/admin/settings" });
 });
