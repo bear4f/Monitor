@@ -1,0 +1,29 @@
+# Provision monitor-agent as a system account with no home and a nologin shell.
+# Install /etc/monitor-agent.env as root:root with mode 0600.
+[Unit]
+Description=Monitor Linux Agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=monitor-agent
+Group=monitor-agent
+EnvironmentFile=/etc/monitor-agent.env
+ExecStart=/usr/local/bin/monitor-agent
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadOnlyPaths=/proc /sys /etc
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

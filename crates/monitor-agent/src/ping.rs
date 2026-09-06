@@ -616,4 +616,24 @@ mod tests {
                 .all(|result| !result.success && result.latency_ms.is_none())
         );
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux loopback and CAP_NET_RAW"]
+    fn linux_raw_ipv4_loopback_smoke() {
+        let result = PingEngine::new().ping_round(&[target(1, "127.0.0.1", 4)]);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].success);
+        assert!(result[0].latency_ms.is_some_and(|latency| latency >= 0.0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux IPv6 loopback and CAP_NET_RAW"]
+    fn linux_raw_ipv6_loopback_smoke() {
+        let result = PingEngine::new().ping_round(&[target(1, "::1", 6)]);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].success);
+        assert!(result[0].latency_ms.is_some_and(|latency| latency >= 0.0));
+    }
 }

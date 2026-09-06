@@ -41,12 +41,21 @@ impl Error for CliError {}
 
 pub fn usage() -> &'static str {
     "Usage: monitor-agent --server <http(s)://host[:port]> --token <64-lowercase-hex>\n\
+     Environment fallback: MONITOR_SERVER, MONITOR_TOKEN\n\
      Options:\n  --help       Show this help\n  --version    Show version"
 }
 
 pub fn parse<I>(args: I) -> Result<Action, CliError>
 where
     I: IntoIterator<Item = String>,
+{
+    parse_with_env(args, |name| std::env::var(name).ok())
+}
+
+fn parse_with_env<I, F>(args: I, environment: F) -> Result<Action, CliError>
+where
+    I: IntoIterator<Item = String>,
+    F: Fn(&str) -> Option<String>,
 {
     let mut args = args.into_iter();
     let _program = args.next();
@@ -93,10 +102,14 @@ where
         }
     }
 
+    let server = server.or_else(|| environment("MONITOR_SERVER"));
+    let token = token.or_else(|| environment("MONITOR_TOKEN"));
     let server = normalize_server_url(
-        &server.ok_or_else(|| CliError("missing required --server".to_owned()))?,
+        &server
+            .ok_or_else(|| CliError("missing required --server or MONITOR_SERVER".to_owned()))?,
     )?;
-    let token = token.ok_or_else(|| CliError("missing required --token".to_owned()))?;
+    let token =
+        token.ok_or_else(|| CliError("missing required --token or MONITOR_TOKEN".to_owned()))?;
     if !valid_token(&token) {
         return Err(CliError(
             "--token must be exactly 64 lowercase hexadecimal characters".to_owned(),
@@ -171,15 +184,16 @@ mod tests {
             .collect()
     }
 
+    fn parse_without_environment(values: &[&str]) -> Result<Action, CliError> {
+        parse_with_env(arguments(values), |_| None)
+    }
+
     #[test]
     fn parses_and_normalizes_required_arguments() {
-        let Action::Run(config) = parse(arguments(&[
-            "--token",
-            TOKEN,
-            "--server",
-            "https://[::1]:8443/",
-        ]))
-        .expect("valid CLI") else {
+        let Action::Run(config) =
+            parse_without_environment(&["--token", TOKEN, "--server", "https://[::1]:8443/"])
+                .expect("valid CLI")
+        else {
             panic!("expected run action");
         };
         assert_eq!(config.server, "https://[::1]:8443");
@@ -189,9 +203,12 @@ mod tests {
 
     #[test]
     fn accepts_help_and_version() {
-        assert!(matches!(parse(arguments(&["--help"])), Ok(Action::Help)));
         assert!(matches!(
-            parse(arguments(&["--version"])),
+            parse_without_environment(&["--help"]),
+            Ok(Action::Help)
+        ));
+        assert!(matches!(
+            parse_without_environment(&["--version"]),
             Ok(Action::Version)
         ));
     }
@@ -211,7 +228,10 @@ mod tests {
             vec!["--server", "https://example.test", "--token", "ABC"],
             vec!["--wat"],
         ] {
-            assert!(parse(arguments(&values)).is_err(), "accepted {values:?}");
+            assert!(
+                parse_without_environment(&values).is_err(),
+                "accepted {values:?}"
+            );
         }
     }
 
@@ -236,5 +256,50 @@ mod tests {
         ] {
             assert!(normalize_server_url(url).is_ok(), "rejected {url}");
         }
+    }
+
+    #[test]
+    fn environment_supplies_missing_server_and_token() {
+        let Action::Run(config) = parse_with_env(arguments(&[]), |name| match name {
+            "MONITOR_SERVER" => Some("https://monitor.example.test/".to_owned()),
+            "MONITOR_TOKEN" => Some(TOKEN.to_owned()),
+            _ => None,
+        })
+        .expect("valid environment fallback") else {
+            panic!("expected run action");
+        };
+        assert_eq!(config.server, "https://monitor.example.test");
+        assert_eq!(config.token.expose(), TOKEN);
+        assert_eq!(format!("{:?}", config.token), "SecretToken([redacted])");
+    }
+
+    #[test]
+    fn explicit_cli_values_override_environment() {
+        let cli_token = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let Action::Run(config) = parse_with_env(
+            arguments(&["--server", "https://cli.example.test", "--token", cli_token]),
+            |name| match name {
+                "MONITOR_SERVER" => Some("https://environment.example.test".to_owned()),
+                "MONITOR_TOKEN" => Some(TOKEN.to_owned()),
+                _ => None,
+            },
+        )
+        .expect("CLI overrides environment") else {
+            panic!("expected run action");
+        };
+        assert_eq!(config.server, "https://cli.example.test");
+        assert_eq!(config.token.expose(), cli_token);
+    }
+
+    #[test]
+    fn invalid_environment_token_is_rejected_without_echoing_it() {
+        let invalid = "NOT-A-VALID-TOKEN";
+        let error = parse_with_env(arguments(&[]), |name| match name {
+            "MONITOR_SERVER" => Some("https://monitor.example.test".to_owned()),
+            "MONITOR_TOKEN" => Some(invalid.to_owned()),
+            _ => None,
+        })
+        .expect_err("invalid environment token");
+        assert!(!error.to_string().contains(invalid));
     }
 }
