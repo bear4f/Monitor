@@ -26,7 +26,7 @@ async fn main() {
     match config.command {
         ServerCommand::Serve => {
             if let Err(error) = run(config).await {
-                eprintln!("startup error: {error}");
+                eprintln!("server error: {error}");
                 std::process::exit(1);
             }
         }

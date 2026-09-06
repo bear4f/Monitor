@@ -131,12 +131,18 @@ impl std::error::Error for PublicSnapshotError {
 }
 
 pub async fn generate_now(state: &AppState) -> Result<(), PublicSnapshotError> {
+    let _generation_guard = state.public_snapshot_generation_gate.lock().await;
     let generated_at = unix_timestamp().map_err(|_| PublicSnapshotError::Clock)?;
-    generate(state, generated_at).await
+    generate_locked(state, generated_at).await
 }
 
+#[cfg(test)]
 pub async fn generate(state: &AppState, generated_at: i64) -> Result<(), PublicSnapshotError> {
     let _generation_guard = state.public_snapshot_generation_gate.lock().await;
+    generate_locked(state, generated_at).await
+}
+
+async fn generate_locked(state: &AppState, generated_at: i64) -> Result<(), PublicSnapshotError> {
     let settings = state.settings.read().await.clone();
     let nodes: Vec<_> = state.node_metadata.read().await.values().cloned().collect();
     let snapshots = state.snapshots.read().await.clone();

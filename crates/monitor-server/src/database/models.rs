@@ -286,6 +286,26 @@ pub struct SqlitePragmas {
     pub page_size: i64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaintenanceCleanupResult {
+    pub expired_sessions: usize,
+    pub traffic_daily: usize,
+    pub traffic_cycles: usize,
+}
+
+impl MaintenanceCleanupResult {
+    pub fn total(self) -> usize {
+        self.expired_sessions + self.traffic_daily + self.traffic_cycles
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalCheckpointResult {
+    pub busy: i64,
+    pub log_frames: i64,
+    pub checkpointed_frames: i64,
+}
+
 #[derive(Debug)]
 pub struct StartupHydration {
     pub settings: SettingsRow,

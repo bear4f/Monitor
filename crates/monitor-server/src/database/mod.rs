@@ -13,12 +13,13 @@ use std::{
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use models::{
     AdminNodeRow, CreatePingTargetResult, DeletedNodeRow, DeletedPingTargetRow,
-    EnabledPingTargetRow, NewNodeRow, NewPingTargetRow, NodeLastStateRow, NodeMetaRow,
-    NodePatchRow, NodeTokenRow, NodeUpdateResult, PingHistoryPoint, PingHistoryWriteRow,
-    PingTargetMutationRow, PingTargetPatchRow, PingTargetRow, ResourceHistoryPoint,
-    ResourceHistoryWriteRow, RotatedNodeTokenRow, SessionRow, SettingsRow, SqlitePragmas,
-    StartupHydration, TrafficCheckpointRow, TrafficCycleCheckpointRow, TrafficDayCheckpointRow,
-    TrafficRecoveryRow, UpdateNodeResult, UpdatePingTargetResult,
+    EnabledPingTargetRow, MaintenanceCleanupResult, NewNodeRow, NewPingTargetRow, NodeLastStateRow,
+    NodeMetaRow, NodePatchRow, NodeTokenRow, NodeUpdateResult, PingHistoryPoint,
+    PingHistoryWriteRow, PingTargetMutationRow, PingTargetPatchRow, PingTargetRow,
+    ResourceHistoryPoint, ResourceHistoryWriteRow, RotatedNodeTokenRow, SessionRow, SettingsRow,
+    SqlitePragmas, StartupHydration, TrafficCheckpointRow, TrafficCycleCheckpointRow,
+    TrafficDayCheckpointRow, TrafficRecoveryRow, UpdateNodeResult, UpdatePingTargetResult,
+    WalCheckpointResult,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -234,6 +235,13 @@ enum Command {
         limit: usize,
         response: oneshot::Sender<Result<usize, DatabaseError>>,
     },
+    CleanupMaintenanceBatch {
+        now: i64,
+        previous_day_start_utc: i64,
+        limit: usize,
+        response: oneshot::Sender<Result<MaintenanceCleanupResult, DatabaseError>>,
+    },
+    PassiveWalCheckpoint(oneshot::Sender<Result<WalCheckpointResult, DatabaseError>>),
     ReadPragmas(oneshot::Sender<Result<SqlitePragmas, DatabaseError>>),
     ReadSchemaVersion(oneshot::Sender<Result<i64, DatabaseError>>),
     Shutdown(oneshot::Sender<()>),
@@ -562,6 +570,25 @@ impl Database {
             response,
         })
         .await
+    }
+
+    pub async fn cleanup_maintenance_batch(
+        &self,
+        now: i64,
+        previous_day_start_utc: i64,
+        limit: usize,
+    ) -> Result<MaintenanceCleanupResult, DatabaseError> {
+        self.request(|response| Command::CleanupMaintenanceBatch {
+            now,
+            previous_day_start_utc,
+            limit,
+            response,
+        })
+        .await
+    }
+
+    pub async fn passive_wal_checkpoint(&self) -> Result<WalCheckpointResult, DatabaseError> {
+        self.request(Command::PassiveWalCheckpoint).await
     }
 
     pub async fn read_pragmas(&self) -> Result<SqlitePragmas, DatabaseError> {
@@ -924,6 +951,22 @@ fn database_worker(
                     ping_cutoff,
                     limit,
                 ));
+            }
+            Command::CleanupMaintenanceBatch {
+                now,
+                previous_day_start_utc,
+                limit,
+                response,
+            } => {
+                let _ = response.send(persistence::cleanup_maintenance_batch(
+                    &mut connection,
+                    now,
+                    previous_day_start_utc,
+                    limit,
+                ));
+            }
+            Command::PassiveWalCheckpoint(response) => {
+                let _ = response.send(persistence::passive_wal_checkpoint(&connection));
             }
             Command::ReadPragmas(response) => {
                 let _ = response.send(persistence::read_pragmas(&connection));

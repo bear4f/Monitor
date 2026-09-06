@@ -611,6 +611,141 @@ fn history_node(public_id: &str) -> NewNodeRow {
     }
 }
 
+#[tokio::test]
+async fn maintenance_cleans_daily_cycles_and_expired_sessions() {
+    let path = TestDatabasePath::new("maintenance");
+    let database = Database::open(path.as_path()).expect("open database");
+    let node = database
+        .create_node(history_node(&"c".repeat(32)), [4; 32], 1)
+        .await
+        .expect("create node");
+    database.shutdown().await.expect("close for fixture");
+
+    let connection = Connection::open(path.as_path()).expect("open fixture connection");
+    for day in [1_000_i64, 3_000, 4_000] {
+        connection
+            .execute(
+                "INSERT INTO traffic_daily
+                 (node_id, day_start_utc, rx_bytes, tx_bytes, updated_at)
+                 VALUES (?1, ?2, 1, 2, ?2)",
+                params![node.id, day],
+            )
+            .expect("insert daily fixture");
+    }
+    for cycle in [100_i64, 200, 300, 400] {
+        connection
+            .execute(
+                "INSERT INTO traffic_cycles
+                 (node_id, cycle_start_utc, cycle_end_utc, rx_bytes, tx_bytes, updated_at)
+                 VALUES (?1, ?2, ?3, 1, 2, ?2)",
+                params![node.id, cycle, cycle + 50],
+            )
+            .expect("insert cycle fixture");
+    }
+    connection
+        .execute(
+            "INSERT INTO sessions (token_hash, created_at, expires_at)
+             VALUES (?1, 1, 10), (?2, 1, 30)",
+            params![vec![1_u8; 32], vec![2_u8; 32]],
+        )
+        .expect("insert session fixtures");
+    drop(connection);
+
+    let database = Database::open(path.as_path()).expect("reopen database");
+    let result = database
+        .cleanup_maintenance_batch(20, 3_000, 5_000)
+        .await
+        .expect("run maintenance cleanup");
+    assert_eq!(result.expired_sessions, 1);
+    assert_eq!(result.traffic_daily, 1);
+    assert_eq!(result.traffic_cycles, 2);
+    database.shutdown().await.expect("close database");
+
+    let connection = Connection::open(path.as_path()).expect("inspect cleanup");
+    let days = query_i64s(
+        &connection,
+        "SELECT day_start_utc FROM traffic_daily ORDER BY day_start_utc",
+    );
+    assert_eq!(days, [3_000, 4_000]);
+    let cycles = query_i64s(
+        &connection,
+        "SELECT cycle_start_utc FROM traffic_cycles ORDER BY cycle_start_utc",
+    );
+    assert_eq!(cycles, [300, 400]);
+    let expirations = query_i64s(
+        &connection,
+        "SELECT expires_at FROM sessions ORDER BY expires_at",
+    );
+    assert_eq!(expirations, [30]);
+}
+
+#[tokio::test]
+async fn maintenance_cleanup_respects_combined_batch_limit() {
+    let path = TestDatabasePath::new("maintenance-limit");
+    Database::open(path.as_path())
+        .expect("open database")
+        .shutdown()
+        .await
+        .expect("close database");
+    let mut connection = Connection::open(path.as_path()).expect("open fixture connection");
+    let transaction = connection.transaction().expect("begin fixture");
+    for value in 0_u8..10 {
+        transaction
+            .execute(
+                "INSERT INTO sessions (token_hash, created_at, expires_at) VALUES (?1, 1, 2)",
+                [vec![value; 32]],
+            )
+            .expect("insert expired session");
+    }
+    transaction.commit().expect("commit fixture");
+    drop(connection);
+
+    let database = Database::open(path.as_path()).expect("reopen database");
+    let result = database
+        .cleanup_maintenance_batch(3, 0, 3)
+        .await
+        .expect("run bounded cleanup");
+    assert_eq!(result.total(), 3);
+    database.shutdown().await.expect("close database");
+    let connection = Connection::open(path.as_path()).expect("inspect cleanup");
+    let remaining: i64 = connection
+        .query_row("SELECT count(*) FROM sessions", [], |row| row.get(0))
+        .expect("count sessions");
+    assert_eq!(remaining, 7);
+}
+
+#[tokio::test]
+async fn passive_wal_checkpoint_succeeds_in_wal_mode() {
+    let path = TestDatabasePath::new("passive-checkpoint");
+    let database = Database::open(path.as_path()).expect("open database");
+    assert_eq!(
+        database
+            .read_pragmas()
+            .await
+            .expect("read pragmas")
+            .journal_mode,
+        "wal"
+    );
+    let checkpoint = database
+        .passive_wal_checkpoint()
+        .await
+        .expect("passive checkpoint");
+    assert!(checkpoint.busy >= 0);
+    assert!(checkpoint.log_frames >= 0);
+    assert!(checkpoint.checkpointed_frames >= 0);
+    database.shutdown().await.expect("close database");
+}
+
+fn query_i64s(connection: &Connection, sql: &str) -> Vec<i64> {
+    connection
+        .prepare(sql)
+        .expect("prepare query")
+        .query_map([], |row| row.get(0))
+        .expect("query values")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read values")
+}
+
 fn resource_history_row(
     node_id: i64,
     bucket_ts: i64,

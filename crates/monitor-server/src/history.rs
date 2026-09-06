@@ -12,7 +12,6 @@ use crate::{
 
 const MINUTE_SECONDS: i64 = 60;
 const MAX_PENDING_MINUTES: usize = 3;
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const CLEANUP_BATCH_ROWS: usize = 5_000;
 const MAX_CLEANUP_BATCHES: usize = 16;
 const PING_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -137,6 +136,15 @@ impl HistoryAccumulator {
         state.closed_before = state.closed_before.max(bucket_ts);
     }
 
+    pub fn finalize_for_shutdown(&self) {
+        let mut state = self.lock();
+        if let Some(current) = state.current.take() {
+            let bucket_ts = current.bucket_ts;
+            state.push_pending(current.finalize());
+            state.closed_before = state.closed_before.max(bucket_ts + MINUTE_SECONDS);
+        }
+    }
+
     pub fn remove_node(&self, node_id: i64) {
         let mut state = self.lock();
         if let Some(current) = &mut state.current {
@@ -218,20 +226,24 @@ impl HistoryAccumulator {
 impl HistoryState {
     fn finalize_current(&mut self, next_bucket: i64) {
         if let Some(current) = self.current.take() {
-            let batch = current.finalize();
-            if !batch.resources.is_empty() || !batch.pings.is_empty() {
-                if self.pending.len() == MAX_PENDING_MINUTES {
-                    self.pending.pop_front();
-                    tracing::warn!(
-                        limit = MAX_PENDING_MINUTES,
-                        "history persistence backlog full; oldest minute dropped"
-                    );
-                }
-                self.pending.push_back(batch);
-            }
+            self.push_pending(current.finalize());
         }
         self.closed_before = self.closed_before.max(next_bucket);
         self.current = Some(MinuteAccumulator::new(next_bucket));
+    }
+
+    fn push_pending(&mut self, batch: HistoryBatch) {
+        if batch.resources.is_empty() && batch.pings.is_empty() {
+            return;
+        }
+        if self.pending.len() == MAX_PENDING_MINUTES {
+            self.pending.pop_front();
+            tracing::warn!(
+                limit = MAX_PENDING_MINUTES,
+                "history persistence backlog full; oldest minute dropped"
+            );
+        }
+        self.pending.push_back(batch);
     }
 }
 
@@ -426,24 +438,6 @@ fn retention_cutoffs(now: i64, resource_days: i64) -> (i64, i64) {
         now - resource_days * 24 * 60 * 60,
         now - PING_RETENTION_SECONDS,
     )
-}
-
-pub async fn run_cleanup_worker(state: AppState) {
-    let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
-    interval.tick().await;
-    loop {
-        interval.tick().await;
-        let now = match unix_timestamp() {
-            Ok(now) => now,
-            Err(error) => {
-                tracing::error!(error = %error, "history cleanup clock read failed");
-                continue;
-            }
-        };
-        if let Err(error) = cleanup_at(&state, now).await {
-            tracing::error!(error = %error, "history retention cleanup failed");
-        }
-    }
 }
 
 #[cfg(test)]

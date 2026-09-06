@@ -13,6 +13,14 @@ pub fn day_start_utc(timestamp: i64, timezone: &str) -> Result<i64, jiff::Error>
         .map(|start| start.timestamp().as_second())
 }
 
+pub fn previous_day_start_utc(timestamp: i64, timezone: &str) -> Result<i64, jiff::Error> {
+    Timestamp::from_second(timestamp)?
+        .in_tz(timezone)?
+        .start_of_day()?
+        .yesterday()
+        .map(|start| start.timestamp().as_second())
+}
+
 pub fn billing_cycle(
     timestamp: i64,
     timezone: &str,
@@ -103,6 +111,23 @@ mod tests {
         assert_eq!(before_dst, second("2026-03-08T05:00:00Z"));
         assert_eq!(after_dst, second("2026-03-09T04:00:00Z"));
         assert_eq!(after_dst - before_dst, 23 * 60 * 60);
+    }
+
+    #[test]
+    fn previous_natural_day_uses_local_calendar_across_dst() {
+        assert_eq!(
+            previous_day_start_utc(second("2026-09-06T18:00:00Z"), "Asia/Shanghai")
+                .expect("previous Shanghai day"),
+            second("2026-09-05T16:00:00Z")
+        );
+
+        let current = day_start_utc(second("2026-03-09T16:00:00Z"), "America/New_York")
+            .expect("current New York day");
+        let previous = previous_day_start_utc(second("2026-03-09T16:00:00Z"), "America/New_York")
+            .expect("previous New York day");
+        assert_eq!(current, second("2026-03-09T04:00:00Z"));
+        assert_eq!(previous, second("2026-03-08T05:00:00Z"));
+        assert_eq!(current - previous, 23 * 60 * 60);
     }
 
     #[test]

@@ -6,11 +6,12 @@ use super::{
     DatabaseError,
     models::{
         AdminNodeRow, CreatePingTargetResult, DeletedNodeRow, DeletedPingTargetRow,
-        EnabledPingTargetRow, NewNodeRow, NewPingTargetRow, NodeLastStateRow, NodeMetaRow,
-        NodePatchRow, NodeTokenRow, NodeUpdateResult, PingHistoryPoint, PingHistoryWriteRow,
-        PingTargetMutationRow, PingTargetPatchRow, PingTargetRow, ResourceHistoryPoint,
-        ResourceHistoryWriteRow, RotatedNodeTokenRow, SessionRow, SettingsRow, SqlitePragmas,
-        TrafficCheckpointRow, TrafficRecoveryRow, UpdateNodeResult, UpdatePingTargetResult,
+        EnabledPingTargetRow, MaintenanceCleanupResult, NewNodeRow, NewPingTargetRow,
+        NodeLastStateRow, NodeMetaRow, NodePatchRow, NodeTokenRow, NodeUpdateResult,
+        PingHistoryPoint, PingHistoryWriteRow, PingTargetMutationRow, PingTargetPatchRow,
+        PingTargetRow, ResourceHistoryPoint, ResourceHistoryWriteRow, RotatedNodeTokenRow,
+        SessionRow, SettingsRow, SqlitePragmas, TrafficCheckpointRow, TrafficRecoveryRow,
+        UpdateNodeResult, UpdatePingTargetResult, WalCheckpointResult,
     },
 };
 
@@ -1782,6 +1783,96 @@ pub(super) fn cleanup_history_batch(
         source,
     })?;
     Ok(deleted_resources + deleted_pings)
+}
+
+pub(super) fn cleanup_maintenance_batch(
+    connection: &mut Connection,
+    now: i64,
+    previous_day_start_utc: i64,
+    limit: usize,
+) -> Result<MaintenanceCleanupResult, DatabaseError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "begin maintenance cleanup transaction",
+            source,
+        })?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let expired_sessions = transaction
+        .execute(
+            "DELETE FROM sessions WHERE token_hash IN (
+                SELECT token_hash FROM sessions
+                WHERE expires_at <= ?1
+                ORDER BY expires_at, token_hash
+                LIMIT ?2
+             )",
+            params![now, limit],
+        )
+        .map_err(|source| DatabaseError::Sql {
+            operation: "clean expired session batch",
+            source,
+        })?;
+    let remaining = limit.saturating_sub(expired_sessions as i64);
+    let traffic_daily = transaction
+        .execute(
+            "DELETE FROM traffic_daily WHERE (node_id, day_start_utc) IN (
+                SELECT node_id, day_start_utc FROM traffic_daily
+                WHERE day_start_utc < ?1
+                ORDER BY node_id, day_start_utc
+                LIMIT ?2
+             )",
+            params![previous_day_start_utc, remaining],
+        )
+        .map_err(|source| DatabaseError::Sql {
+            operation: "clean daily traffic batch",
+            source,
+        })?;
+    let remaining = remaining.saturating_sub(traffic_daily as i64);
+    let traffic_cycles = transaction
+        .execute(
+            "DELETE FROM traffic_cycles WHERE (node_id, cycle_start_utc) IN (
+                SELECT old.node_id, old.cycle_start_utc
+                FROM traffic_cycles AS old
+                WHERE 2 <= (
+                    SELECT count(*) FROM traffic_cycles AS newer
+                    WHERE newer.node_id = old.node_id
+                      AND newer.cycle_start_utc > old.cycle_start_utc
+                )
+                ORDER BY old.node_id, old.cycle_start_utc
+                LIMIT ?1
+             )",
+            [remaining],
+        )
+        .map_err(|source| DatabaseError::Sql {
+            operation: "clean billing cycle batch",
+            source,
+        })?;
+    transaction.commit().map_err(|source| DatabaseError::Sql {
+        operation: "commit maintenance cleanup transaction",
+        source,
+    })?;
+    Ok(MaintenanceCleanupResult {
+        expired_sessions,
+        traffic_daily,
+        traffic_cycles,
+    })
+}
+
+pub(super) fn passive_wal_checkpoint(
+    connection: &Connection,
+) -> Result<WalCheckpointResult, DatabaseError> {
+    connection
+        .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+            Ok(WalCheckpointResult {
+                busy: row.get(0)?,
+                log_frames: row.get(1)?,
+                checkpointed_frames: row.get(2)?,
+            })
+        })
+        .map_err(|source| DatabaseError::Sql {
+            operation: "run passive WAL checkpoint",
+            source,
+        })
 }
 
 pub(super) fn read_pragmas(connection: &Connection) -> Result<SqlitePragmas, DatabaseError> {
