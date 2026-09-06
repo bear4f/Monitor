@@ -9,6 +9,7 @@ use crate::database::{
 
 pub type SettingsCache = Arc<RwLock<SettingsRow>>;
 pub type NodeMetaCache = Arc<RwLock<HashMap<i64, NodeMetaRow>>>;
+pub type NodeTokenCache = Arc<RwLock<HashMap<[u8; 32], i64>>>;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -18,6 +19,8 @@ pub struct AppState {
     pub settings: SettingsCache,
     settings_mutation_lock: Arc<Mutex<()>>,
     pub node_metadata: NodeMetaCache,
+    pub(crate) node_tokens: NodeTokenCache,
+    pub(crate) node_mutation_lock: Arc<Mutex<()>>,
     pub traffic_recovery: Arc<[TrafficRecoveryRow]>,
 }
 
@@ -28,6 +31,11 @@ impl AppState {
             .into_iter()
             .map(|node| (node.id, node))
             .collect();
+        let node_tokens = hydration
+            .node_tokens
+            .into_iter()
+            .map(|token| (token.token_hash, token.node_id))
+            .collect();
 
         Self {
             database,
@@ -36,6 +44,8 @@ impl AppState {
             settings: Arc::new(RwLock::new(hydration.settings)),
             settings_mutation_lock: Arc::new(Mutex::new(())),
             node_metadata: Arc::new(RwLock::new(node_metadata)),
+            node_tokens: Arc::new(RwLock::new(node_tokens)),
+            node_mutation_lock: Arc::new(Mutex::new(())),
             traffic_recovery: hydration.traffic_recovery.into(),
         }
     }

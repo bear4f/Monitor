@@ -28,6 +28,78 @@ pub struct NodeMetaRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeTokenRow {
+    pub node_id: i64,
+    pub token_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewNodeRow {
+    pub public_id: String,
+    pub name: String,
+    pub region_code: String,
+    pub traffic_limit_bytes: Option<i64>,
+    pub traffic_reset_day: i64,
+    pub price_micros: Option<i64>,
+    pub currency: Option<String>,
+    pub renewal_cycle: Option<String>,
+    pub expires_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodePatchRow {
+    pub name: Option<String>,
+    pub region_code: Option<String>,
+    pub traffic_limit_bytes: Option<Option<i64>>,
+    pub traffic_reset_day: Option<i64>,
+    pub price_micros: Option<Option<i64>>,
+    pub currency: Option<Option<String>>,
+    pub renewal_cycle: Option<Option<String>>,
+    pub expires_at: Option<Option<i64>>,
+    pub sort_order: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeUpdateResult {
+    pub node: NodeMetaRow,
+    pub reordered_nodes: Vec<(i64, i64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdateNodeResult {
+    NotFound,
+    InvalidSortOrder,
+    InvalidConfiguration,
+    Updated(Box<NodeUpdateResult>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedNodeRow {
+    pub node_id: i64,
+    pub token_hash: [u8; 32],
+    pub reordered_nodes: Vec<(i64, i64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotatedNodeTokenRow {
+    pub node_id: i64,
+    pub old_token_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminNodeRow {
+    pub node: NodeMetaRow,
+    pub last_ip: Option<String>,
+    pub last_seen_at: Option<i64>,
+    pub total_rx_bytes: i64,
+    pub total_tx_bytes: i64,
+    pub today_rx_bytes: i64,
+    pub today_tx_bytes: i64,
+    pub cycle_rx_bytes: i64,
+    pub cycle_tx_bytes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrafficRecoveryRow {
     pub node_id: i64,
     pub rx_total_bytes: i64,
@@ -59,5 +131,6 @@ pub struct SqlitePragmas {
 pub struct StartupHydration {
     pub settings: SettingsRow,
     pub nodes: Vec<NodeMetaRow>,
+    pub node_tokens: Vec<NodeTokenRow>,
     pub traffic_recovery: Vec<TrafficRecoveryRow>,
 }

@@ -11,7 +11,9 @@ use std::{
 
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use models::{
-    NodeMetaRow, SessionRow, SettingsRow, SqlitePragmas, StartupHydration, TrafficRecoveryRow,
+    AdminNodeRow, DeletedNodeRow, NewNodeRow, NodeMetaRow, NodePatchRow, NodeTokenRow,
+    NodeUpdateResult, RotatedNodeTokenRow, SessionRow, SettingsRow, SqlitePragmas,
+    StartupHydration, TrafficRecoveryRow, UpdateNodeResult,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -121,6 +123,35 @@ enum Command {
     DeleteExpiredSessions {
         now: i64,
         response: oneshot::Sender<Result<usize, DatabaseError>>,
+    },
+    LoadNodeTokens(oneshot::Sender<Result<Vec<NodeTokenRow>, DatabaseError>>),
+    ListAdminNodes {
+        day_start_utc: i64,
+        now: i64,
+        response: oneshot::Sender<Result<Vec<AdminNodeRow>, DatabaseError>>,
+    },
+    CreateNode {
+        node: NewNodeRow,
+        token_hash: [u8; 32],
+        now: i64,
+        response: oneshot::Sender<Result<NodeMetaRow, DatabaseError>>,
+    },
+    UpdateNode {
+        public_id: String,
+        patch: NodePatchRow,
+        now: i64,
+        response: oneshot::Sender<Result<UpdateNodeResult, DatabaseError>>,
+    },
+    DeleteNode {
+        public_id: String,
+        now: i64,
+        response: oneshot::Sender<Result<Option<DeletedNodeRow>, DatabaseError>>,
+    },
+    RotateNodeToken {
+        public_id: String,
+        new_token_hash: [u8; 32],
+        now: i64,
+        response: oneshot::Sender<Result<Option<RotatedNodeTokenRow>, DatabaseError>>,
     },
     LoadSettings(oneshot::Sender<Result<SettingsRow, DatabaseError>>),
     UpsertSettings(SettingsRow, oneshot::Sender<Result<(), DatabaseError>>),
@@ -233,6 +264,81 @@ impl Database {
             .await
     }
 
+    pub async fn load_node_tokens(&self) -> Result<Vec<NodeTokenRow>, DatabaseError> {
+        self.request(Command::LoadNodeTokens).await
+    }
+
+    pub async fn list_admin_nodes(
+        &self,
+        day_start_utc: i64,
+        now: i64,
+    ) -> Result<Vec<AdminNodeRow>, DatabaseError> {
+        self.request(|response| Command::ListAdminNodes {
+            day_start_utc,
+            now,
+            response,
+        })
+        .await
+    }
+
+    pub async fn create_node(
+        &self,
+        node: NewNodeRow,
+        token_hash: [u8; 32],
+        now: i64,
+    ) -> Result<NodeMetaRow, DatabaseError> {
+        self.request(|response| Command::CreateNode {
+            node,
+            token_hash,
+            now,
+            response,
+        })
+        .await
+    }
+
+    pub async fn update_node(
+        &self,
+        public_id: String,
+        patch: NodePatchRow,
+        now: i64,
+    ) -> Result<UpdateNodeResult, DatabaseError> {
+        self.request(|response| Command::UpdateNode {
+            public_id,
+            patch,
+            now,
+            response,
+        })
+        .await
+    }
+
+    pub async fn delete_node(
+        &self,
+        public_id: String,
+        now: i64,
+    ) -> Result<Option<DeletedNodeRow>, DatabaseError> {
+        self.request(|response| Command::DeleteNode {
+            public_id,
+            now,
+            response,
+        })
+        .await
+    }
+
+    pub async fn rotate_node_token(
+        &self,
+        public_id: String,
+        new_token_hash: [u8; 32],
+        now: i64,
+    ) -> Result<Option<RotatedNodeTokenRow>, DatabaseError> {
+        self.request(|response| Command::RotateNodeToken {
+            public_id,
+            new_token_hash,
+            now,
+            response,
+        })
+        .await
+    }
+
     pub async fn upsert_settings(&self, settings: SettingsRow) -> Result<(), DatabaseError> {
         self.request(|response| Command::UpsertSettings(settings, response))
             .await
@@ -283,11 +389,13 @@ impl Database {
 pub async fn hydrate_startup(database: &Database) -> Result<StartupHydration, DatabaseError> {
     let settings = database.load_settings().await?;
     let nodes = database.load_node_metadata().await?;
+    let node_tokens = database.load_node_tokens().await?;
     let traffic_recovery = database.load_traffic_recovery().await?;
 
     Ok(StartupHydration {
         settings,
         nodes,
+        node_tokens,
         traffic_recovery,
     })
 }
@@ -371,6 +479,66 @@ fn database_worker(
             }
             Command::DeleteExpiredSessions { now, response } => {
                 let _ = response.send(persistence::delete_expired_sessions(&connection, now));
+            }
+            Command::LoadNodeTokens(response) => {
+                let _ = response.send(persistence::load_node_tokens(&connection));
+            }
+            Command::ListAdminNodes {
+                day_start_utc,
+                now,
+                response,
+            } => {
+                let _ = response.send(persistence::list_admin_nodes(
+                    &connection,
+                    day_start_utc,
+                    now,
+                ));
+            }
+            Command::CreateNode {
+                node,
+                token_hash,
+                now,
+                response,
+            } => {
+                let _ = response.send(persistence::create_node(
+                    &mut connection,
+                    &node,
+                    &token_hash,
+                    now,
+                ));
+            }
+            Command::UpdateNode {
+                public_id,
+                patch,
+                now,
+                response,
+            } => {
+                let _ = response.send(persistence::update_node(
+                    &mut connection,
+                    &public_id,
+                    &patch,
+                    now,
+                ));
+            }
+            Command::DeleteNode {
+                public_id,
+                now,
+                response,
+            } => {
+                let _ = response.send(persistence::delete_node(&mut connection, &public_id, now));
+            }
+            Command::RotateNodeToken {
+                public_id,
+                new_token_hash,
+                now,
+                response,
+            } => {
+                let _ = response.send(persistence::rotate_node_token(
+                    &mut connection,
+                    &public_id,
+                    &new_token_hash,
+                    now,
+                ));
             }
             Command::LoadSettings(response) => {
                 let _ = response.send(persistence::load_settings(&connection));

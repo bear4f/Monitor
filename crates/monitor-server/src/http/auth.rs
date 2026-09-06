@@ -66,7 +66,7 @@ struct ErrorObject {
     message: &'static str,
 }
 
-struct AuthenticatedSession {
+pub(super) struct AuthenticatedSession {
     token_hash: [u8; 32],
     expires_at: i64,
 }
@@ -81,7 +81,7 @@ pub(super) async fn login(
         return Err(ApiError::rate_limited(retry_after));
     }
 
-    let LoginRequest { password } = parse_json(request).await?;
+    let LoginRequest { password } = parse_json(request, JSON_BODY_LIMIT).await?;
     validate_password(&password).map_err(|_| ApiError::invalid_request())?;
     let _hash_permit = state
         .auth_hash_gate
@@ -186,7 +186,7 @@ pub(super) async fn change_password(
     let PasswordChangeRequest {
         current_password,
         new_password,
-    } = parse_json(request).await?;
+    } = parse_json(request, JSON_BODY_LIMIT).await?;
     validate_password(&current_password).map_err(|_| ApiError::invalid_request())?;
     validate_password(&new_password).map_err(|_| ApiError::invalid_request())?;
     if current_password == new_password {
@@ -235,7 +235,7 @@ pub(super) async fn change_password(
     Ok(response)
 }
 
-async fn authenticate_session(
+pub(super) async fn authenticate_session(
     database: &Database,
     headers: &HeaderMap,
 ) -> Result<AuthenticatedSession, ApiError> {
@@ -261,7 +261,7 @@ async fn authenticate_session(
     })
 }
 
-fn validate_csrf(headers: &HeaderMap) -> Result<(), ApiError> {
+pub(super) fn validate_csrf(headers: &HeaderMap) -> Result<(), ApiError> {
     validate_origin(headers)?;
     let cookie = cookie_value(headers, CSRF_COOKIE).ok_or_else(ApiError::csrf_failed)?;
     let header = single_header(headers, &CSRF_HEADER)
@@ -313,7 +313,10 @@ fn is_loopback_host(host: &str) -> bool {
         .is_ok_and(|address| address.is_loopback())
 }
 
-async fn parse_json<T: DeserializeOwned>(request: Request) -> Result<T, ApiError> {
+pub(super) async fn parse_json<T: DeserializeOwned>(
+    request: Request,
+    body_limit: usize,
+) -> Result<T, ApiError> {
     single_header(request.headers(), &CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
@@ -321,9 +324,9 @@ async fn parse_json<T: DeserializeOwned>(request: Request) -> Result<T, ApiError
         .filter(|value| value.eq_ignore_ascii_case("application/json"))
         .ok_or_else(ApiError::unsupported_media_type)?;
 
-    let body = to_bytes(request.into_body(), JSON_BODY_LIMIT)
+    let body = to_bytes(request.into_body(), body_limit)
         .await
-        .map_err(|_| ApiError::payload_too_large())?;
+        .map_err(|_| ApiError::payload_too_large(body_limit))?;
     serde_json::from_slice(&body).map_err(|_| ApiError::invalid_request())
 }
 
@@ -388,13 +391,13 @@ fn append_cleared_cookies(headers: &mut HeaderMap) {
     );
 }
 
-fn json_response(status: StatusCode, value: impl Serialize) -> Response {
+pub(super) fn json_response(status: StatusCode, value: impl Serialize) -> Response {
     let mut response = (status, Json(value)).into_response();
     set_no_store(response.headers_mut());
     response
 }
 
-fn no_content_response() -> Response {
+pub(super) fn no_content_response() -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::NO_CONTENT;
     set_no_store(response.headers_mut());
@@ -413,7 +416,7 @@ pub(super) struct ApiError {
 }
 
 impl ApiError {
-    fn invalid_request() -> Self {
+    pub(super) fn invalid_request() -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
             "invalid_request",
@@ -441,12 +444,13 @@ impl ApiError {
         )
     }
 
-    fn payload_too_large() -> Self {
-        Self::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "payload_too_large",
-            "request body exceeds 4096 bytes",
-        )
+    fn payload_too_large(body_limit: usize) -> Self {
+        let message = match body_limit {
+            4_096 => "request body exceeds 4096 bytes",
+            8_192 => "request body exceeds 8192 bytes",
+            _ => "request body exceeds limit",
+        };
+        Self::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", message)
     }
 
     fn unsupported_media_type() -> Self {
@@ -467,8 +471,8 @@ impl ApiError {
         error
     }
 
-    fn database(error: DatabaseError) -> Self {
-        tracing::error!(error = %error, "authentication database operation failed");
+    pub(super) fn database(error: DatabaseError) -> Self {
+        tracing::error!(error = %error, "API database operation failed");
         Self::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "service_unavailable",
@@ -476,12 +480,16 @@ impl ApiError {
         )
     }
 
-    fn internal() -> Self {
+    pub(super) fn internal() -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
             "internal server error",
         )
+    }
+
+    pub(super) fn not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "not_found", "not found")
     }
 
     const fn new(status: StatusCode, code: &'static str, message: &'static str) -> Self {
