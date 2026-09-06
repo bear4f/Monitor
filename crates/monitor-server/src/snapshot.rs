@@ -6,6 +6,7 @@ pub type SnapshotStore = Arc<RwLock<HashMap<i64, NodeSnapshot>>>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NodeSnapshot {
+    pub live_since_start: bool,
     pub first_seen_at: i64,
     pub last_seen_at: i64,
     pub last_ip: IpAddr,

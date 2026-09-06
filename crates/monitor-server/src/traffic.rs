@@ -60,6 +60,7 @@ pub struct PublicTrafficState {
     pub tx_total_bytes: i64,
     pub today_rx_bytes: i64,
     pub today_tx_bytes: i64,
+    pub day_start_utc: i64,
     pub cycle_start_utc: i64,
     pub cycle_end_utc: i64,
     pub cycle_rx_bytes: i64,
@@ -255,6 +256,7 @@ impl TrafficState {
                         tx_total_bytes: state.tx_total_bytes,
                         today_rx_bytes: state.today_rx_bytes,
                         today_tx_bytes: state.today_tx_bytes,
+                        day_start_utc: state.day_start_utc,
                         cycle_start_utc: state.cycle_start_utc,
                         cycle_end_utc: state.cycle_end_utc,
                         cycle_rx_bytes: state.cycle_rx_bytes,
@@ -1051,6 +1053,7 @@ mod tests {
             self.state.snapshots.write().await.insert(
                 self.node_id,
                 NodeSnapshot {
+                    live_since_start: true,
                     first_seen_at,
                     last_seen_at: timestamp,
                     last_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),

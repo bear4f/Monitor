@@ -12,10 +12,10 @@ use std::{
 
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use models::{
-    AdminNodeRow, DeletedNodeRow, EnabledPingTargetRow, NewNodeRow, NodeMetaRow, NodePatchRow,
-    NodeTokenRow, NodeUpdateResult, RotatedNodeTokenRow, SessionRow, SettingsRow, SqlitePragmas,
-    StartupHydration, TrafficCheckpointRow, TrafficCycleCheckpointRow, TrafficDayCheckpointRow,
-    TrafficRecoveryRow, UpdateNodeResult,
+    AdminNodeRow, DeletedNodeRow, EnabledPingTargetRow, NewNodeRow, NodeLastStateRow, NodeMetaRow,
+    NodePatchRow, NodeTokenRow, NodeUpdateResult, RotatedNodeTokenRow, SessionRow, SettingsRow,
+    SqlitePragmas, StartupHydration, TrafficCheckpointRow, TrafficCycleCheckpointRow,
+    TrafficDayCheckpointRow, TrafficRecoveryRow, UpdateNodeResult,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -146,6 +146,7 @@ enum Command {
         response: oneshot::Sender<Result<usize, DatabaseError>>,
     },
     LoadNodeTokens(oneshot::Sender<Result<Vec<NodeTokenRow>, DatabaseError>>),
+    LoadNodeLastStates(oneshot::Sender<Result<Vec<NodeLastStateRow>, DatabaseError>>),
     LoadEnabledPingTargets(oneshot::Sender<Result<Vec<EnabledPingTargetRow>, DatabaseError>>),
     ListAdminNodes {
         day_start_utc: i64,
@@ -385,6 +386,10 @@ impl Database {
         self.request(Command::LoadNodeMetadata).await
     }
 
+    pub async fn load_node_last_states(&self) -> Result<Vec<NodeLastStateRow>, DatabaseError> {
+        self.request(Command::LoadNodeLastStates).await
+    }
+
     pub async fn load_traffic_recovery(
         &self,
         day_start_utc: i64,
@@ -449,6 +454,7 @@ pub async fn hydrate_startup(database: &Database) -> Result<StartupHydration, Da
     let settings = database.load_settings().await?;
     let nodes = database.load_node_metadata().await?;
     let node_tokens = database.load_node_tokens().await?;
+    let node_last_states = database.load_node_last_states().await?;
     let enabled_ping_targets = database.load_enabled_ping_targets().await?;
     if enabled_ping_targets.len() > 6 {
         return Err(DatabaseError::TooManyEnabledPingTargets {
@@ -504,6 +510,7 @@ pub async fn hydrate_startup(database: &Database) -> Result<StartupHydration, Da
         settings,
         nodes,
         node_tokens,
+        node_last_states,
         enabled_ping_targets,
         traffic_recovery,
     })
@@ -660,6 +667,9 @@ fn database_worker(
             }
             Command::LoadNodeMetadata(response) => {
                 let _ = response.send(persistence::load_node_metadata(&connection));
+            }
+            Command::LoadNodeLastStates(response) => {
+                let _ = response.send(persistence::load_node_last_states(&connection));
             }
             Command::LoadTrafficRecovery {
                 day_start_utc,

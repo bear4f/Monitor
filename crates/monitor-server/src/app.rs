@@ -49,7 +49,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(database: Database, hydration: StartupHydration) -> Self {
-        let node_metadata = hydration
+        let node_metadata: HashMap<i64, NodeMetaRow> = hydration
             .nodes
             .into_iter()
             .map(|node| (node.id, node))
@@ -58,6 +58,18 @@ impl AppState {
             .node_tokens
             .into_iter()
             .map(|token| (token.token_hash, token.node_id))
+            .collect();
+        let snapshots = hydration
+            .node_last_states
+            .into_iter()
+            .map(|mut row| {
+                // A legacy inconsistent row falls back to its last-seen time.
+                row.snapshot.first_seen_at = node_metadata
+                    .get(&row.node_id)
+                    .and_then(|node| node.first_seen_at)
+                    .unwrap_or(row.snapshot.last_seen_at);
+                (row.node_id, row.snapshot)
+            })
             .collect();
         let agent_config = AgentConfig {
             report_interval_seconds: hydration.settings.agent_report_interval_seconds,
@@ -85,7 +97,7 @@ impl AppState {
             node_metadata: Arc::new(RwLock::new(node_metadata)),
             node_tokens: Arc::new(RwLock::new(node_tokens)),
             node_lifecycle_gate: Arc::new(RwLock::new(())),
-            snapshots: Arc::new(RwLock::new(HashMap::new())),
+            snapshots: Arc::new(RwLock::new(snapshots)),
             agent_config: Arc::new(RwLock::new(agent_config)),
             traffic,
             traffic_flush: Arc::new(Notify::new()),

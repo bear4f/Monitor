@@ -336,6 +336,7 @@ fn valid_used_total(used: i64, total: i64) -> bool {
 impl AgentReport {
     fn into_snapshot(self, first_seen_at: i64, last_seen_at: i64, last_ip: IpAddr) -> NodeSnapshot {
         NodeSnapshot {
+            live_since_start: true,
             first_seen_at,
             last_seen_at,
             last_ip,
@@ -392,6 +393,7 @@ mod tests {
         auth::encode_hex,
         database::{Database, NewNodeRow, hydrate_startup},
         http::nodes,
+        public_snapshot,
     };
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -407,10 +409,16 @@ mod tests {
         token: String,
         admin_cookie: String,
         csrf: String,
+        persisted_first_seen: Option<i64>,
+        persisted_last_seen: i64,
     }
 
     impl TestContext {
         async fn new() -> Self {
+            Self::new_with_first_seen(true).await
+        }
+
+        async fn new_with_first_seen(persist_first_seen: bool) -> Self {
             let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir()
                 .join(format!("monitor-agent-http-{}-{id}.db", std::process::id()));
@@ -463,7 +471,17 @@ mod tests {
                     )
                     .expect("insert ping target fixture");
             }
-            insert_last_state(&connection, node.id, now - 60);
+            let persisted_first_seen = persist_first_seen.then_some(now - 3_600);
+            if let Some(first_seen_at) = persisted_first_seen {
+                connection
+                    .execute(
+                        "UPDATE nodes SET first_seen_at = ?2 WHERE id = ?1",
+                        params![node.id, first_seen_at],
+                    )
+                    .expect("set persisted first-seen fixture");
+            }
+            let persisted_last_seen = now - 1;
+            insert_last_state(&connection, node.id, persisted_last_seen);
             drop(connection);
 
             let database = Database::open(&path).expect("reopen agent test database");
@@ -483,6 +501,8 @@ mod tests {
                 token: encode_hex(&TOKEN_RAW),
                 admin_cookie,
                 csrf,
+                persisted_first_seen,
+                persisted_last_seen,
             }
         }
 
@@ -734,22 +754,18 @@ mod tests {
         assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
         let snapshot = context.state.snapshots.read().await[&context.node_id].clone();
         assert!((before..=after).contains(&snapshot.last_seen_at));
-        assert!((before..=after).contains(&snapshot.first_seen_at));
+        assert_eq!(
+            snapshot.first_seen_at,
+            context.persisted_first_seen.unwrap()
+        );
+        assert!(snapshot.live_since_start);
         context.finish().await;
     }
 
     #[tokio::test]
     async fn reports_overwrite_one_snapshot_and_preserve_first_seen() {
         let context = TestContext::new().await;
-        context
-            .state
-            .node_metadata
-            .write()
-            .await
-            .get_mut(&context.node_id)
-            .expect("node metadata")
-            .first_seen_at = Some(123);
-        let first_seen_at = 123;
+        let first_seen_at = context.persisted_first_seen.unwrap();
         for index in 0..20 {
             let mut body = valid_report();
             body["hostname"] = json!(format!("host-{index}"));
@@ -773,6 +789,7 @@ mod tests {
         assert_eq!(snapshot.hostname, "host-19");
         assert_eq!(snapshot.cpu_usage, 19.0);
         assert_eq!(snapshot.first_seen_at, first_seen_at);
+        assert!(snapshot.live_since_start);
         drop(snapshots);
         context.finish().await;
     }
@@ -1003,10 +1020,40 @@ mod tests {
     #[tokio::test]
     async fn admin_list_prefers_realtime_snapshot_and_falls_back_to_persisted_state() {
         let context = TestContext::new().await;
+        let persisted = context.state.snapshots.read().await[&context.node_id].clone();
+        assert!(!persisted.live_since_start);
+        assert_eq!(
+            persisted.first_seen_at,
+            context.persisted_first_seen.unwrap()
+        );
+        assert_eq!(persisted.last_seen_at, context.persisted_last_seen);
+
+        public_snapshot::generate(&context.state, context.persisted_last_seen + 1)
+            .await
+            .expect("restart public snapshot");
+        let cached = context.state.public_snapshot.load().await;
+        let public: Value = serde_json::from_slice(&cached.body).expect("public snapshot JSON");
+        assert_eq!(public["nodes"][0]["online"], false);
+        assert_eq!(
+            public["nodes"][0]["last_seen_at"],
+            context.persisted_last_seen
+        );
+        assert_eq!(
+            public["nodes"][0]["first_seen_at"],
+            context.persisted_first_seen.unwrap()
+        );
+        assert_eq!(public["nodes"][0]["system"]["hostname"], "host");
+        assert_eq!(public["nodes"][0]["metrics"]["cpu_usage"], 1.0);
+
         let fallback =
             response(nodes::list(State(context.state.clone()), context.admin_read_request()).await);
         let fallback = response_json(fallback).await;
         assert_eq!(fallback["nodes"][0]["last_ip"], "203.0.113.10");
+        assert_eq!(
+            fallback["nodes"][0]["last_seen_at"],
+            context.persisted_last_seen
+        );
+        assert_eq!(fallback["nodes"][0]["online"], false);
 
         let mut realtime = context.report_request(&valid_report().to_string());
         realtime.headers_mut().insert(
@@ -1033,6 +1080,25 @@ mod tests {
             realtime["nodes"][0]["last_seen_at"],
             context.state.snapshots.read().await[&context.node_id].last_seen_at
         );
+        assert_eq!(realtime["nodes"][0]["online"], true);
+        let live = context.state.snapshots.read().await[&context.node_id].clone();
+        assert!(live.live_since_start);
+        public_snapshot::generate(&context.state, live.last_seen_at)
+            .await
+            .expect("live public snapshot");
+        let cached = context.state.public_snapshot.load().await;
+        let public: Value = serde_json::from_slice(&cached.body).expect("live public JSON");
+        assert_eq!(public["nodes"][0]["online"], true);
+        assert_eq!(public["nodes"][0]["system"]["hostname"], "dmit-01");
+        context.finish().await;
+    }
+
+    #[tokio::test]
+    async fn inconsistent_last_state_without_first_seen_uses_last_seen_fallback() {
+        let context = TestContext::new_with_first_seen(false).await;
+        let snapshot = context.state.snapshots.read().await[&context.node_id].clone();
+        assert!(!snapshot.live_since_start);
+        assert_eq!(snapshot.first_seen_at, context.persisted_last_seen);
         context.finish().await;
     }
 

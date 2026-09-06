@@ -33,6 +33,12 @@ pub struct NodeTokenRow {
     pub token_hash: [u8; 32],
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeLastStateRow {
+    pub node_id: i64,
+    pub snapshot: crate::snapshot::NodeSnapshot,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnabledPingTargetRow {
     pub id: i64,
@@ -183,6 +189,7 @@ pub struct StartupHydration {
     pub settings: SettingsRow,
     pub nodes: Vec<NodeMetaRow>,
     pub node_tokens: Vec<NodeTokenRow>,
+    pub node_last_states: Vec<NodeLastStateRow>,
     pub enabled_ping_targets: Vec<EnabledPingTargetRow>,
     pub traffic_recovery: Vec<TrafficRecoveryRow>,
 }

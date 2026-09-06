@@ -140,6 +140,8 @@ pub async fn generate(state: &AppState, generated_at: i64) -> Result<(), PublicS
     let nodes: Vec<_> = state.node_metadata.read().await.values().cloned().collect();
     let snapshots = state.snapshots.read().await.clone();
     let traffic = state.traffic.read_current();
+    let current_day_start_utc = time::day_start_utc(generated_at, &settings.site_timezone)
+        .map_err(PublicSnapshotError::Time)?;
 
     let mut nodes = nodes;
     nodes.sort_by_key(|node| (node.sort_order, node.id));
@@ -149,7 +151,9 @@ pub async fn generate(state: &AppState, generated_at: i64) -> Result<(), PublicS
     for node in nodes {
         let snapshot = snapshots.get(&node.id);
         let online = snapshot.is_some_and(|snapshot| {
-            generated_at.saturating_sub(snapshot.last_seen_at) <= settings.offline_after_seconds
+            snapshot.live_since_start
+                && generated_at.saturating_sub(snapshot.last_seen_at)
+                    <= settings.offline_after_seconds
         });
         let current_traffic = traffic.get(&node.id).copied();
         let node_response = public_node(
@@ -159,6 +163,7 @@ pub async fn generate(state: &AppState, generated_at: i64) -> Result<(), PublicS
             online,
             generated_at,
             &settings.site_timezone,
+            current_day_start_utc,
         )?;
         summary.add(&node_response)?;
         public_nodes.push(node_response);
@@ -271,6 +276,7 @@ struct PublicNodeResponse {
     id: String,
     name: String,
     region_code: String,
+    sort_order: i64,
     online: bool,
     first_seen_at: Option<i64>,
     last_seen_at: Option<i64>,
@@ -339,28 +345,30 @@ fn public_node(
     online: bool,
     generated_at: i64,
     timezone: &str,
+    current_day_start_utc: i64,
 ) -> Result<PublicNodeResponse, PublicSnapshotError> {
-    let traffic = match traffic {
-        Some(traffic) => traffic,
-        None => {
-            let cycle = time::billing_cycle(generated_at, timezone, node.traffic_reset_day)
-                .map_err(PublicSnapshotError::Time)?;
-            PublicTrafficState {
-                rx_total_bytes: 0,
-                tx_total_bytes: 0,
-                today_rx_bytes: 0,
-                today_tx_bytes: 0,
-                cycle_start_utc: cycle.start_utc,
-                cycle_end_utc: cycle.end_utc,
-                cycle_rx_bytes: 0,
-                cycle_tx_bytes: 0,
-            }
-        }
-    };
+    let current_cycle = time::billing_cycle(generated_at, timezone, node.traffic_reset_day)
+        .map_err(PublicSnapshotError::Time)?;
+    let total_rx = traffic.map_or(0, |traffic| traffic.rx_total_bytes);
+    let total_tx = traffic.map_or(0, |traffic| traffic.tx_total_bytes);
+    let (today_rx, today_tx) = traffic
+        .filter(|traffic| traffic.day_start_utc == current_day_start_utc)
+        .map_or((0, 0), |traffic| {
+            (traffic.today_rx_bytes, traffic.today_tx_bytes)
+        });
+    let (cycle_rx, cycle_tx) = traffic
+        .filter(|traffic| {
+            traffic.cycle_start_utc == current_cycle.start_utc
+                && traffic.cycle_end_utc == current_cycle.end_utc
+        })
+        .map_or((0, 0), |traffic| {
+            (traffic.cycle_rx_bytes, traffic.cycle_tx_bytes)
+        });
     Ok(PublicNodeResponse {
         id: node.public_id.clone(),
         name: node.name.clone(),
         region_code: node.region_code.clone(),
+        sort_order: node.sort_order,
         online,
         first_seen_at: snapshot
             .map(|snapshot| snapshot.first_seen_at)
@@ -369,15 +377,15 @@ fn public_node(
         system: snapshot.map(SystemResponse::from),
         metrics: snapshot.map(MetricsResponse::from),
         traffic: TrafficResponse {
-            today_rx: traffic.today_rx_bytes,
-            today_tx: traffic.today_tx_bytes,
-            cycle_rx: traffic.cycle_rx_bytes,
-            cycle_tx: traffic.cycle_tx_bytes,
-            total_rx: traffic.rx_total_bytes,
-            total_tx: traffic.tx_total_bytes,
+            today_rx,
+            today_tx,
+            cycle_rx,
+            cycle_tx,
+            total_rx,
+            total_tx,
             limit: node.traffic_limit_bytes,
-            cycle_start_at: traffic.cycle_start_utc,
-            cycle_end_at: traffic.cycle_end_utc,
+            cycle_start_at: current_cycle.start_utc,
+            cycle_end_at: current_cycle.end_utc,
         },
         billing: node.price_micros.map(|price_micros| BillingResponse {
             price_micros,
@@ -638,6 +646,8 @@ mod tests {
         let value = cached_json(&context.state).await;
         assert_eq!(value["nodes"][0]["id"], public_id(10));
         assert_eq!(value["nodes"][1]["id"], public_id(20));
+        assert_eq!(value["nodes"][0]["sort_order"], 0);
+        assert_eq!(value["nodes"][1]["sort_order"], 1);
         let first = &value["nodes"][0];
         assert_eq!(first["online"], false);
         assert!(first["first_seen_at"].is_null());
@@ -652,7 +662,6 @@ mod tests {
         assert_eq!(value["nodes"][1]["billing"]["currency"], "USD");
 
         for forbidden in [
-            "sort_order",
             "last_ip",
             "token",
             "token_hash",
@@ -738,13 +747,21 @@ mod tests {
 
     #[tokio::test]
     async fn recovered_traffic_is_public_while_live_status_starts_offline() {
+        let generated_at = 8_000;
         let context = TestContext::new(
             "recovered",
             vec![node(1, 0)],
-            vec![recovery(1, 500, 600, 70, 80, 90, 100)],
+            vec![recovery(
+                1,
+                (500, 600),
+                (70, 80),
+                (90, 100),
+                generated_at,
+                1,
+            )],
         )
         .await;
-        generate(&context.state, 8_000)
+        generate(&context.state, generated_at)
             .await
             .expect("recovered snapshot");
         let value = cached_json(&context.state).await;
@@ -788,21 +805,21 @@ mod tests {
 
     #[tokio::test]
     async fn generation_overflow_retains_previous_cache_and_ring() {
+        let generated_at = 9_000;
         let context = TestContext::new(
             "overflow",
             vec![node(1, 0), node(2, 1)],
             vec![recovery(
                 1,
-                JS_SAFE_INTEGER_MAX,
-                0,
-                JS_SAFE_INTEGER_MAX,
-                0,
-                JS_SAFE_INTEGER_MAX,
-                0,
+                (JS_SAFE_INTEGER_MAX, 0),
+                (JS_SAFE_INTEGER_MAX, 0),
+                (JS_SAFE_INTEGER_MAX, 0),
+                generated_at,
+                1,
             )],
         )
         .await;
-        generate(&context.state, 9_000)
+        generate(&context.state, generated_at)
             .await
             .expect("last valid snapshot");
         let previous = context.state.public_snapshot.load().await;
@@ -827,6 +844,69 @@ mod tests {
         assert_eq!(current.body.as_ref(), previous.body.as_ref());
         assert_eq!(current.etag, previous.etag);
         assert_eq!(context.state.public_network_rates.lock().len(), 1);
+        context.finish().await;
+    }
+
+    #[tokio::test]
+    async fn public_view_normalizes_stale_and_current_natural_day_buckets() {
+        let generated_at = second("2026-09-07T12:00:00Z");
+        let yesterday = second("2026-09-06T12:00:00Z");
+        let context = TestContext::new(
+            "day-normalization",
+            vec![node(1, 0), node(2, 1)],
+            vec![
+                recovery(1, (500, 600), (100, 200), (10, 20), yesterday, 1),
+                recovery(2, (700, 800), (300, 400), (30, 40), generated_at, 1),
+            ],
+        )
+        .await;
+        generate(&context.state, generated_at)
+            .await
+            .expect("normalized daily snapshot");
+        let value = cached_json(&context.state).await;
+        assert_eq!(value["nodes"][0]["traffic"]["today_rx"], 0);
+        assert_eq!(value["nodes"][0]["traffic"]["today_tx"], 0);
+        assert_eq!(value["nodes"][0]["traffic"]["total_rx"], 500);
+        assert_eq!(value["nodes"][0]["traffic"]["total_tx"], 600);
+        assert_eq!(value["nodes"][1]["traffic"]["today_rx"], 300);
+        assert_eq!(value["nodes"][1]["traffic"]["today_tx"], 400);
+        assert_eq!(value["summary"]["today_rx"], 300);
+        assert_eq!(value["summary"]["today_tx"], 400);
+        context.finish().await;
+    }
+
+    #[tokio::test]
+    async fn public_view_normalizes_stale_cycle_with_reset_day_31_across_february() {
+        let generated_at = second("2026-03-01T12:00:00Z");
+        let previous_cycle_time = second("2026-02-20T12:00:00Z");
+        let mut metadata = node(1, 0);
+        metadata.traffic_reset_day = 31;
+        let context = TestContext::new(
+            "cycle-normalization",
+            vec![metadata],
+            vec![recovery(
+                1,
+                (500, 600),
+                (100, 200),
+                (300, 400),
+                previous_cycle_time,
+                31,
+            )],
+        )
+        .await;
+        generate(&context.state, generated_at)
+            .await
+            .expect("normalized cycle snapshot");
+        let value = cached_json(&context.state).await;
+        let traffic = &value["nodes"][0]["traffic"];
+        let expected = time::billing_cycle(generated_at, "Asia/Shanghai", 31)
+            .expect("current reset-day-31 cycle");
+        assert_eq!(traffic["cycle_rx"], 0);
+        assert_eq!(traffic["cycle_tx"], 0);
+        assert_eq!(traffic["cycle_start_at"], expected.start_utc);
+        assert_eq!(traffic["cycle_end_at"], expected.end_utc);
+        assert_eq!(traffic["total_rx"], 500);
+        assert_eq!(traffic["total_tx"], 600);
         context.finish().await;
     }
 
@@ -881,6 +961,7 @@ mod tests {
 
     fn snapshot(last_seen_at: i64, cpu_usage: f64, rx_rate: i64, tx_rate: i64) -> NodeSnapshot {
         NodeSnapshot {
+            live_since_start: true,
             first_seen_at: last_seen_at - 100,
             last_seen_at,
             last_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -915,28 +996,37 @@ mod tests {
 
     fn recovery(
         node_id: i64,
-        total_rx: i64,
-        total_tx: i64,
-        today_rx: i64,
-        today_tx: i64,
-        cycle_rx: i64,
-        cycle_tx: i64,
+        total: (i64, i64),
+        today: (i64, i64),
+        cycle_usage: (i64, i64),
+        timestamp: i64,
+        reset_day: i64,
     ) -> TrafficRecoveryRow {
+        let day_start_utc = time::day_start_utc(timestamp, "Asia/Shanghai").expect("recovery day");
+        let cycle = time::billing_cycle(timestamp, "Asia/Shanghai", reset_day)
+            .expect("recovery billing cycle");
         TrafficRecoveryRow {
             node_id,
-            rx_total_bytes: total_rx,
-            tx_total_bytes: total_tx,
+            rx_total_bytes: total.0,
+            tx_total_bytes: total.1,
             last_rx_counter_bytes: None,
             last_tx_counter_bytes: None,
             last_boot_id: None,
-            day_start_utc: 1_000,
-            today_rx_bytes: today_rx,
-            today_tx_bytes: today_tx,
-            cycle_start_utc: 500,
-            cycle_end_utc: 20_000,
-            cycle_rx_bytes: cycle_rx,
-            cycle_tx_bytes: cycle_tx,
+            day_start_utc,
+            today_rx_bytes: today.0,
+            today_tx_bytes: today.1,
+            cycle_start_utc: cycle.start_utc,
+            cycle_end_utc: cycle.end_utc,
+            cycle_rx_bytes: cycle_usage.0,
+            cycle_tx_bytes: cycle_usage.1,
         }
+    }
+
+    fn second(value: &str) -> i64 {
+        value
+            .parse::<jiff::Timestamp>()
+            .expect("valid timestamp")
+            .as_second()
     }
 
     fn traffic_sample(

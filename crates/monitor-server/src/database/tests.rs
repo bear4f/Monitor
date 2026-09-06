@@ -412,6 +412,7 @@ fn traffic_checkpoint_rolls_back_all_tables_on_late_failure() {
         previous_day: None,
         previous_cycle: None,
         snapshot: crate::snapshot::NodeSnapshot {
+            live_since_start: true,
             first_seen_at: 900,
             last_seen_at: 950,
             last_ip: "127.0.0.1".parse().expect("IP"),

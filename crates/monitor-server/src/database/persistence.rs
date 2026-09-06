@@ -5,9 +5,9 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, types::T
 use super::{
     DatabaseError,
     models::{
-        AdminNodeRow, DeletedNodeRow, EnabledPingTargetRow, NewNodeRow, NodeMetaRow, NodePatchRow,
-        NodeTokenRow, NodeUpdateResult, RotatedNodeTokenRow, SessionRow, SettingsRow,
-        SqlitePragmas, TrafficCheckpointRow, TrafficRecoveryRow, UpdateNodeResult,
+        AdminNodeRow, DeletedNodeRow, EnabledPingTargetRow, NewNodeRow, NodeLastStateRow,
+        NodeMetaRow, NodePatchRow, NodeTokenRow, NodeUpdateResult, RotatedNodeTokenRow, SessionRow,
+        SettingsRow, SqlitePragmas, TrafficCheckpointRow, TrafficRecoveryRow, UpdateNodeResult,
     },
 };
 
@@ -343,6 +343,77 @@ pub(super) fn load_node_tokens(
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|source| DatabaseError::Sql {
             operation: "read startup node tokens",
+            source,
+        })
+}
+
+pub(super) fn load_node_last_states(
+    connection: &Connection,
+) -> Result<Vec<NodeLastStateRow>, DatabaseError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT node_id, hostname, os_name, os_version, kernel, architecture,
+                    cpu_model, cpu_cores, virtualization, agent_version, boot_id,
+                    cpu_usage_bp, load_1_milli, load_5_milli, load_15_milli,
+                    memory_total_bytes, memory_used_bytes, swap_total_bytes,
+                    swap_used_bytes, disk_total_bytes, disk_used_bytes,
+                    rx_rate_bytes_per_sec, tx_rate_bytes_per_sec, uptime_seconds,
+                    process_count, last_ip, last_seen_at
+             FROM node_last_state ORDER BY node_id",
+        )
+        .map_err(|source| DatabaseError::Sql {
+            operation: "prepare startup node last-state query",
+            source,
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            let last_seen_at = row.get(26)?;
+            let last_ip = row.get::<_, String>(25)?.parse().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(25, Type::Text, Box::new(error))
+            })?;
+            Ok(NodeLastStateRow {
+                node_id: row.get(0)?,
+                snapshot: crate::snapshot::NodeSnapshot {
+                    live_since_start: false,
+                    first_seen_at: last_seen_at,
+                    last_seen_at,
+                    last_ip,
+                    hostname: row.get(1)?,
+                    os_name: row.get(2)?,
+                    os_version: row.get(3)?,
+                    kernel: row.get(4)?,
+                    architecture: row.get(5)?,
+                    cpu_model: row.get(6)?,
+                    cpu_cores: row.get(7)?,
+                    virtualization: row.get(8)?,
+                    agent_version: row.get(9)?,
+                    boot_id: row.get(10)?,
+                    cpu_usage: row.get::<_, i64>(11)? as f64 / 100.0,
+                    load_1: row.get::<_, i64>(12)? as f64 / 1_000.0,
+                    load_5: row.get::<_, i64>(13)? as f64 / 1_000.0,
+                    load_15: row.get::<_, i64>(14)? as f64 / 1_000.0,
+                    memory_total: row.get(15)?,
+                    memory_used: row.get(16)?,
+                    swap_total: row.get(17)?,
+                    swap_used: row.get(18)?,
+                    disk_total: row.get(19)?,
+                    disk_used: row.get(20)?,
+                    rx_counter_bytes: 0,
+                    tx_counter_bytes: 0,
+                    rx_rate_bytes_per_sec: row.get(21)?,
+                    tx_rate_bytes_per_sec: row.get(22)?,
+                    uptime_seconds: row.get(23)?,
+                    process_count: row.get(24)?,
+                },
+            })
+        })
+        .map_err(|source| DatabaseError::Sql {
+            operation: "query startup node last states",
+            source,
+        })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "read startup node last states",
             source,
         })
 }

@@ -530,8 +530,9 @@ fn admin_node_response(
 ) -> AdminNodeResponse {
     let last_seen_at = snapshot.map_or(row.last_seen_at, |snapshot| Some(snapshot.last_seen_at));
     let last_ip = snapshot.map_or(row.last_ip, |snapshot| Some(snapshot.last_ip.to_string()));
-    let online =
-        last_seen_at.is_some_and(|last_seen| now.saturating_sub(last_seen) <= offline_after);
+    let online = snapshot.is_some_and(|snapshot| {
+        snapshot.live_since_start && now.saturating_sub(snapshot.last_seen_at) <= offline_after
+    });
     AdminNodeResponse {
         id: row.node.public_id,
         name: row.node.name,
@@ -946,7 +947,7 @@ mod tests {
         assert_eq!(nodes[0]["id"], first.0);
         assert_eq!(nodes[1]["id"], second.0);
         assert_eq!(nodes[0]["last_ip"], "203.0.113.10");
-        assert_eq!(nodes[0]["online"], true);
+        assert_eq!(nodes[0]["online"], false);
         assert_eq!(nodes[0]["cycle_rx"], 50);
         assert_eq!(nodes[0]["cycle_tx"], 60);
         for node in nodes {
