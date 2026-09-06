@@ -166,6 +166,54 @@ pub struct TrafficCycleCheckpointRow {
     pub tx_bytes: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResourceHistoryWriteRow {
+    pub node_id: i64,
+    pub bucket_ts: i64,
+    pub sample_count: i64,
+    pub cpu_usage_bp: i64,
+    pub load_1_milli: i64,
+    pub load_5_milli: i64,
+    pub load_15_milli: i64,
+    pub memory_used_bytes: i64,
+    pub swap_used_bytes: i64,
+    pub disk_used_bytes: i64,
+    pub rx_rate_bytes_per_sec: i64,
+    pub tx_rate_bytes_per_sec: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PingHistoryWriteRow {
+    pub node_id: i64,
+    pub bucket_ts: i64,
+    pub target_id: i64,
+    pub sample_count: i64,
+    pub success_count: i64,
+    pub latency_avg_ms: Option<f64>,
+    pub latency_min_ms: Option<f64>,
+    pub latency_max_ms: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResourceHistoryPoint {
+    pub bucket_ts: i64,
+    pub cpu_usage: f64,
+    pub memory_used_bytes: i64,
+    pub disk_used_bytes: i64,
+    pub rx_rate_bytes_per_sec: i64,
+    pub tx_rate_bytes_per_sec: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PingHistoryPoint {
+    pub target_id: i64,
+    pub name: String,
+    pub ip_family: i64,
+    pub sort_order: i64,
+    pub bucket_ts: Option<i64>,
+    pub latency_ms: Option<f64>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionRow {
     pub created_at: i64,

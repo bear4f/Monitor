@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     app::{AgentConfig, AppState},
     auth::{decode_hex, sha256, unix_timestamp},
+    history::{PingSample, ResourceSample},
     snapshot::NodeSnapshot,
     time,
     traffic::TrafficSample,
@@ -172,20 +173,40 @@ pub(super) async fn report(
             .map(|snapshot| snapshot.first_seen_at)
             .or(node.first_seen_at)
             .unwrap_or(received_at);
-        let snapshot = report.into_snapshot(first_seen_at, received_at, source_ip);
         let update = state
             .traffic
             .update(
                 identity.node_id,
                 TrafficSample {
-                    rx_counter_bytes: snapshot.rx_counter_bytes,
-                    tx_counter_bytes: snapshot.tx_counter_bytes,
-                    boot_id: &snapshot.boot_id,
+                    rx_counter_bytes: report.network.rx_bytes,
+                    tx_counter_bytes: report.network.tx_bytes,
+                    boot_id: &report.boot_id,
                     day_start_utc,
                     billing_cycle,
                 },
             )
             .map_err(|_| ApiError::invalid_request())?;
+        state.history.record(
+            identity.node_id,
+            received_at,
+            ResourceSample {
+                cpu_usage: report.cpu.usage,
+                load_1: report.cpu.load_1,
+                load_5: report.cpu.load_5,
+                load_15: report.cpu.load_15,
+                memory_used_bytes: report.memory.used,
+                swap_used_bytes: report.memory.swap_used,
+                disk_used_bytes: report.disk.used,
+                rx_rate_bytes_per_sec: report.network.rx_rate,
+                tx_rate_bytes_per_sec: report.network.tx_rate,
+            },
+            report.pings.iter().map(|ping| PingSample {
+                target_id: ping.target_id,
+                success: ping.success,
+                latency_ms: ping.latency_ms,
+            }),
+        );
+        let snapshot = report.into_snapshot(first_seen_at, received_at, source_ip);
         snapshots.insert(identity.node_id, snapshot);
         update.wake_checkpoint
     };
@@ -645,6 +666,7 @@ mod tests {
             .get(context.node_id)
             .expect("traffic without database worker");
         assert_eq!((traffic.rx_total_bytes, traffic.tx_total_bytes), (50, 60));
+        assert_eq!(context.state.history.resource_samples(context.node_id), 2);
 
         let path = context.path.clone();
         drop(context);
@@ -970,6 +992,7 @@ mod tests {
                 .contains_key(&context.node_id)
         );
         assert!(context.state.traffic.get(context.node_id).is_none());
+        assert_eq!(context.state.history.resource_samples(context.node_id), 0);
         assert_eq!(
             send_valid_report(&context, &context.token).await,
             StatusCode::UNAUTHORIZED

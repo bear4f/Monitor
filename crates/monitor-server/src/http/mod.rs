@@ -1,5 +1,6 @@
 mod agent;
 mod auth;
+mod history;
 mod nodes;
 pub(crate) mod public;
 
@@ -18,6 +19,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agent/config", get(agent::config))
         .route("/api/agent/report", post(agent::report))
         .route("/api/public/snapshot", get(public::snapshot))
+        .route("/api/public/nodes/{id}/history", get(history::resource))
+        .route("/api/public/nodes/{id}/ping", get(history::ping))
         .route("/api/admin/password", patch(auth::change_password))
         .route("/api/admin/nodes", get(nodes::list).post(nodes::create))
         .route(

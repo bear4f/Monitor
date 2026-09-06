@@ -597,6 +597,268 @@ fn index_descending_flags(connection: &Connection, index: &str) -> Vec<bool> {
         .collect()
 }
 
+fn history_node(public_id: &str) -> NewNodeRow {
+    NewNodeRow {
+        public_id: public_id.to_owned(),
+        name: "History node".into(),
+        region_code: "US".into(),
+        traffic_limit_bytes: None,
+        traffic_reset_day: 1,
+        price_micros: None,
+        currency: None,
+        renewal_cycle: None,
+        expires_at: None,
+    }
+}
+
+fn resource_history_row(
+    node_id: i64,
+    bucket_ts: i64,
+    sample_count: i64,
+    cpu_usage_bp: i64,
+) -> ResourceHistoryWriteRow {
+    ResourceHistoryWriteRow {
+        node_id,
+        bucket_ts,
+        sample_count,
+        cpu_usage_bp,
+        load_1_milli: 100,
+        load_5_milli: 200,
+        load_15_milli: 300,
+        memory_used_bytes: bucket_ts + 10,
+        swap_used_bytes: 0,
+        disk_used_bytes: bucket_ts + 20,
+        rx_rate_bytes_per_sec: cpu_usage_bp,
+        tx_rate_bytes_per_sec: cpu_usage_bp * 2,
+    }
+}
+
+#[tokio::test]
+async fn history_batch_upsert_is_absolute_and_queries_weighted_five_minute_data() {
+    let path = TestDatabasePath::new("history-upsert");
+    let database = Database::open(path.as_path()).expect("open database");
+    let node = database
+        .create_node(history_node(&"a".repeat(32)), [1; 32], 1)
+        .await
+        .expect("create node");
+    database
+        .shutdown()
+        .await
+        .expect("close before target fixture");
+    let connection = Connection::open(path.as_path()).expect("open fixture connection");
+    connection
+        .execute(
+            "INSERT INTO ping_targets
+             (id, name, host, ip_family, enabled, sort_order, created_at, updated_at)
+             VALUES (1, 'enabled', '127.0.0.1', 4, 1, 1, 1, 1),
+                    (2, 'disabled', '::1', 6, 0, 0, 1, 1)",
+            [],
+        )
+        .expect("insert target fixtures");
+    drop(connection);
+
+    let database = Database::open(path.as_path()).expect("reopen database");
+    let resources = vec![
+        resource_history_row(node.id, 0, 1, 1_000),
+        resource_history_row(node.id, 60, 3, 3_000),
+    ];
+    let pings = vec![
+        PingHistoryWriteRow {
+            node_id: node.id,
+            bucket_ts: 0,
+            target_id: 2,
+            sample_count: 2,
+            success_count: 1,
+            latency_avg_ms: Some(10.0),
+            latency_min_ms: Some(10.0),
+            latency_max_ms: Some(10.0),
+        },
+        PingHistoryWriteRow {
+            node_id: node.id,
+            bucket_ts: 60,
+            target_id: 2,
+            sample_count: 4,
+            success_count: 3,
+            latency_avg_ms: Some(30.0),
+            latency_min_ms: Some(20.0),
+            latency_max_ms: Some(40.0),
+        },
+    ];
+    database
+        .persist_history_batch(resources.clone(), pings.clone())
+        .await
+        .expect("persist history");
+    database
+        .persist_history_batch(resources, pings)
+        .await
+        .expect("retry same absolute history");
+
+    let minute = database
+        .query_resource_history(node.id, 0, 300, 60)
+        .await
+        .expect("query minute history");
+    assert_eq!(minute.len(), 2);
+    let five_minute = database
+        .query_resource_history(node.id, 0, 300, 300)
+        .await
+        .expect("query five-minute history");
+    assert_eq!(five_minute.len(), 1);
+    assert_eq!(five_minute[0].cpu_usage, 25.0);
+    assert_eq!(five_minute[0].memory_used_bytes, 40);
+
+    let ping = database
+        .query_ping_history(node.id, 0, 300, 300)
+        .await
+        .expect("query ping history");
+    assert_eq!(
+        ping.len(),
+        2,
+        "enabled empty and disabled historical targets"
+    );
+    assert_eq!(ping[0].target_id, 2);
+    assert_eq!(ping[0].latency_ms, Some(25.0));
+    assert_eq!(ping[1].target_id, 1);
+    assert_eq!(ping[1].bucket_ts, None);
+
+    database.shutdown().await.expect("shutdown database");
+}
+
+#[tokio::test]
+async fn all_failure_ping_stays_null_and_history_cleanup_respects_batch_limit() {
+    let path = TestDatabasePath::new("history-cleanup");
+    let database = Database::open(path.as_path()).expect("open database");
+    let node = database
+        .create_node(history_node(&"b".repeat(32)), [2; 32], 1)
+        .await
+        .expect("create node");
+    database
+        .shutdown()
+        .await
+        .expect("close before target fixture");
+    let connection = Connection::open(path.as_path()).expect("open fixture connection");
+    connection
+        .execute(
+            "INSERT INTO ping_targets
+             (id, name, host, ip_family, enabled, sort_order, created_at, updated_at)
+             VALUES (1, 'target', '127.0.0.1', 4, 1, 0, 1, 1)",
+            [],
+        )
+        .expect("insert target fixture");
+    drop(connection);
+    let database = Database::open(path.as_path()).expect("reopen database");
+    let mut resources: Vec<_> = (0..4)
+        .map(|minute| resource_history_row(node.id, minute * 60, 1, 100))
+        .collect();
+    resources.push(resource_history_row(node.id, 20_040, 1, 200));
+    database
+        .persist_history_batch(
+            resources,
+            vec![
+                PingHistoryWriteRow {
+                    node_id: node.id,
+                    bucket_ts: 0,
+                    target_id: 1,
+                    sample_count: 3,
+                    success_count: 0,
+                    latency_avg_ms: None,
+                    latency_min_ms: None,
+                    latency_max_ms: None,
+                },
+                PingHistoryWriteRow {
+                    node_id: node.id,
+                    bucket_ts: 20_040,
+                    target_id: 1,
+                    sample_count: 1,
+                    success_count: 1,
+                    latency_avg_ms: Some(5.0),
+                    latency_min_ms: Some(5.0),
+                    latency_max_ms: Some(5.0),
+                },
+            ],
+        )
+        .await
+        .expect("persist fixtures");
+    let ping = database
+        .query_ping_history(node.id, 0, 300, 300)
+        .await
+        .expect("query failure ping");
+    assert_eq!(ping[0].latency_ms, None);
+
+    assert_eq!(
+        database
+            .cleanup_history_batch(10_000, 10_000, 3)
+            .await
+            .expect("first cleanup"),
+        3
+    );
+    let remaining = database
+        .query_resource_history(node.id, 0, 300, 60)
+        .await
+        .expect("remaining resource rows");
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(
+        database
+            .cleanup_history_batch(10_000, 10_000, 3)
+            .await
+            .expect("second cleanup"),
+        2
+    );
+    assert_eq!(
+        database
+            .query_resource_history(node.id, 20_000, 21_000, 60)
+            .await
+            .expect("retained resource row")
+            .len(),
+        1
+    );
+    let retained_ping = database
+        .query_ping_history(node.id, 20_000, 21_000, 60)
+        .await
+        .expect("retained ping row");
+    assert_eq!(retained_ping[0].latency_ms, Some(5.0));
+    database.shutdown().await.expect("shutdown database");
+}
+
+#[tokio::test]
+async fn stale_history_after_node_delete_is_ignored_without_reviving_node() {
+    let path = TestDatabasePath::new("stale-history");
+    let database = Database::open(path.as_path()).expect("open database");
+    let public_id = "c".repeat(32);
+    let node = database
+        .create_node(history_node(&public_id), [3; 32], 1)
+        .await
+        .expect("create node");
+    database
+        .delete_node(public_id, 2)
+        .await
+        .expect("delete node")
+        .expect("deleted row");
+    database
+        .persist_history_batch(
+            vec![resource_history_row(node.id, 0, 1, 100)],
+            vec![PingHistoryWriteRow {
+                node_id: node.id,
+                bucket_ts: 0,
+                target_id: 99,
+                sample_count: 1,
+                success_count: 0,
+                latency_avg_ms: None,
+                latency_min_ms: None,
+                latency_max_ms: None,
+            }],
+        )
+        .await
+        .expect("stale persistence is harmless");
+    assert!(
+        database
+            .query_resource_history(node.id, 0, 60, 60)
+            .await
+            .expect("query stale history")
+            .is_empty()
+    );
+    database.shutdown().await.expect("shutdown database");
+}
+
 #[test]
 fn expected_table_list_has_no_duplicates() {
     let unique: BTreeSet<_> = EXPECTED_TABLES.into_iter().collect();

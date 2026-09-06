@@ -295,6 +295,7 @@ pub(super) async fn delete(
     drop(metadata);
     state.snapshots.write().await.remove(&deleted.node_id);
     state.traffic.remove(deleted.node_id);
+    state.history.remove_node(deleted.node_id);
     Ok(no_content_response())
 }
 

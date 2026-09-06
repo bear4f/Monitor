@@ -5,6 +5,7 @@ use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 
 use crate::auth::LoginLimiter;
 use crate::database::{Database, DatabaseError, NodeMetaRow, SettingsRow, StartupHydration};
+use crate::history::HistoryAccumulator;
 use crate::public_snapshot::{NetworkRateRing, PublicSnapshotCache};
 use crate::snapshot::SnapshotStore;
 use crate::traffic::TrafficState;
@@ -43,6 +44,7 @@ pub struct AppState {
     pub(crate) agent_config: AgentConfigCache,
     pub(crate) traffic: TrafficState,
     pub(crate) traffic_flush: Arc<Notify>,
+    pub(crate) history: HistoryAccumulator,
     pub(crate) public_snapshot: PublicSnapshotCache,
     pub(crate) public_network_rates: NetworkRateRing,
 }
@@ -101,6 +103,7 @@ impl AppState {
             agent_config: Arc::new(RwLock::new(agent_config)),
             traffic,
             traffic_flush: Arc::new(Notify::new()),
+            history: HistoryAccumulator::new(),
             public_snapshot: PublicSnapshotCache::new(),
             public_network_rates: NetworkRateRing::new(),
         }

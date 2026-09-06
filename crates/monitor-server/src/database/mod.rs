@@ -13,7 +13,8 @@ use std::{
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use models::{
     AdminNodeRow, DeletedNodeRow, EnabledPingTargetRow, NewNodeRow, NodeLastStateRow, NodeMetaRow,
-    NodePatchRow, NodeTokenRow, NodeUpdateResult, RotatedNodeTokenRow, SessionRow, SettingsRow,
+    NodePatchRow, NodeTokenRow, NodeUpdateResult, PingHistoryPoint, PingHistoryWriteRow,
+    ResourceHistoryPoint, ResourceHistoryWriteRow, RotatedNodeTokenRow, SessionRow, SettingsRow,
     SqlitePragmas, StartupHydration, TrafficCheckpointRow, TrafficCycleCheckpointRow,
     TrafficDayCheckpointRow, TrafficRecoveryRow, UpdateNodeResult,
 };
@@ -188,6 +189,31 @@ enum Command {
         rows: Vec<TrafficCheckpointRow>,
         persisted_at: i64,
         response: oneshot::Sender<Result<(), DatabaseError>>,
+    },
+    PersistHistoryBatch {
+        resources: Vec<ResourceHistoryWriteRow>,
+        pings: Vec<PingHistoryWriteRow>,
+        response: oneshot::Sender<Result<(), DatabaseError>>,
+    },
+    QueryResourceHistory {
+        node_id: i64,
+        from: i64,
+        to: i64,
+        step: i64,
+        response: oneshot::Sender<Result<Vec<ResourceHistoryPoint>, DatabaseError>>,
+    },
+    QueryPingHistory {
+        node_id: i64,
+        from: i64,
+        to: i64,
+        step: i64,
+        response: oneshot::Sender<Result<Vec<PingHistoryPoint>, DatabaseError>>,
+    },
+    CleanupHistoryBatch {
+        resource_cutoff: i64,
+        ping_cutoff: i64,
+        limit: usize,
+        response: oneshot::Sender<Result<usize, DatabaseError>>,
     },
     ReadPragmas(oneshot::Sender<Result<SqlitePragmas, DatabaseError>>),
     ReadSchemaVersion(oneshot::Sender<Result<i64, DatabaseError>>),
@@ -411,6 +437,68 @@ impl Database {
         self.request(|response| Command::PersistTrafficBatch {
             rows,
             persisted_at,
+            response,
+        })
+        .await
+    }
+
+    pub async fn persist_history_batch(
+        &self,
+        resources: Vec<ResourceHistoryWriteRow>,
+        pings: Vec<PingHistoryWriteRow>,
+    ) -> Result<(), DatabaseError> {
+        self.request(|response| Command::PersistHistoryBatch {
+            resources,
+            pings,
+            response,
+        })
+        .await
+    }
+
+    pub async fn query_resource_history(
+        &self,
+        node_id: i64,
+        from: i64,
+        to: i64,
+        step: i64,
+    ) -> Result<Vec<ResourceHistoryPoint>, DatabaseError> {
+        self.request(|response| Command::QueryResourceHistory {
+            node_id,
+            from,
+            to,
+            step,
+            response,
+        })
+        .await
+    }
+
+    pub async fn query_ping_history(
+        &self,
+        node_id: i64,
+        from: i64,
+        to: i64,
+        step: i64,
+    ) -> Result<Vec<PingHistoryPoint>, DatabaseError> {
+        self.request(|response| Command::QueryPingHistory {
+            node_id,
+            from,
+            to,
+            step,
+            response,
+        })
+        .await
+    }
+
+    pub async fn cleanup_history_batch(
+        &self,
+        resource_cutoff: i64,
+        ping_cutoff: i64,
+        limit: usize,
+    ) -> Result<usize, DatabaseError> {
+        self.request(|response| Command::CleanupHistoryBatch {
+            resource_cutoff,
+            ping_cutoff,
+            limit,
             response,
         })
         .await
@@ -691,6 +779,60 @@ fn database_worker(
                     &mut connection,
                     &rows,
                     persisted_at,
+                ));
+            }
+            Command::PersistHistoryBatch {
+                resources,
+                pings,
+                response,
+            } => {
+                let _ = response.send(persistence::persist_history_batch(
+                    &mut connection,
+                    &resources,
+                    &pings,
+                ));
+            }
+            Command::QueryResourceHistory {
+                node_id,
+                from,
+                to,
+                step,
+                response,
+            } => {
+                let _ = response.send(persistence::query_resource_history(
+                    &connection,
+                    node_id,
+                    from,
+                    to,
+                    step,
+                ));
+            }
+            Command::QueryPingHistory {
+                node_id,
+                from,
+                to,
+                step,
+                response,
+            } => {
+                let _ = response.send(persistence::query_ping_history(
+                    &connection,
+                    node_id,
+                    from,
+                    to,
+                    step,
+                ));
+            }
+            Command::CleanupHistoryBatch {
+                resource_cutoff,
+                ping_cutoff,
+                limit,
+                response,
+            } => {
+                let _ = response.send(persistence::cleanup_history_batch(
+                    &mut connection,
+                    resource_cutoff,
+                    ping_cutoff,
+                    limit,
                 ));
             }
             Command::ReadPragmas(response) => {

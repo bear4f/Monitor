@@ -6,8 +6,10 @@ use super::{
     DatabaseError,
     models::{
         AdminNodeRow, DeletedNodeRow, EnabledPingTargetRow, NewNodeRow, NodeLastStateRow,
-        NodeMetaRow, NodePatchRow, NodeTokenRow, NodeUpdateResult, RotatedNodeTokenRow, SessionRow,
-        SettingsRow, SqlitePragmas, TrafficCheckpointRow, TrafficRecoveryRow, UpdateNodeResult,
+        NodeMetaRow, NodePatchRow, NodeTokenRow, NodeUpdateResult, PingHistoryPoint,
+        PingHistoryWriteRow, ResourceHistoryPoint, ResourceHistoryWriteRow, RotatedNodeTokenRow,
+        SessionRow, SettingsRow, SqlitePragmas, TrafficCheckpointRow, TrafficRecoveryRow,
+        UpdateNodeResult,
     },
 };
 
@@ -1187,6 +1189,298 @@ pub(super) fn persist_traffic_batch(
 
 fn scaled_metric(value: f64, scale: f64) -> i64 {
     (value * scale).round() as i64
+}
+
+pub(super) fn persist_history_batch(
+    connection: &mut Connection,
+    resources: &[ResourceHistoryWriteRow],
+    pings: &[PingHistoryWriteRow],
+) -> Result<(), DatabaseError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "begin history batch transaction",
+            source,
+        })?;
+
+    for row in resources {
+        transaction
+            .execute(
+                "INSERT INTO node_history (
+                    node_id, bucket_ts, sample_count, cpu_usage_bp,
+                    load_1_milli, load_5_milli, load_15_milli,
+                    memory_used_bytes, swap_used_bytes, disk_used_bytes,
+                    rx_rate_bytes_per_sec, tx_rate_bytes_per_sec
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+                 WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?1)
+                 ON CONFLICT(node_id, bucket_ts) DO UPDATE SET
+                    sample_count = excluded.sample_count,
+                    cpu_usage_bp = excluded.cpu_usage_bp,
+                    load_1_milli = excluded.load_1_milli,
+                    load_5_milli = excluded.load_5_milli,
+                    load_15_milli = excluded.load_15_milli,
+                    memory_used_bytes = excluded.memory_used_bytes,
+                    swap_used_bytes = excluded.swap_used_bytes,
+                    disk_used_bytes = excluded.disk_used_bytes,
+                    rx_rate_bytes_per_sec = excluded.rx_rate_bytes_per_sec,
+                    tx_rate_bytes_per_sec = excluded.tx_rate_bytes_per_sec",
+                params![
+                    row.node_id,
+                    row.bucket_ts,
+                    row.sample_count,
+                    row.cpu_usage_bp,
+                    row.load_1_milli,
+                    row.load_5_milli,
+                    row.load_15_milli,
+                    row.memory_used_bytes,
+                    row.swap_used_bytes,
+                    row.disk_used_bytes,
+                    row.rx_rate_bytes_per_sec,
+                    row.tx_rate_bytes_per_sec,
+                ],
+            )
+            .map_err(|source| DatabaseError::Sql {
+                operation: "persist resource history row",
+                source,
+            })?;
+    }
+
+    for row in pings {
+        transaction
+            .execute(
+                "INSERT INTO ping_history (
+                    node_id, bucket_ts, target_id, sample_count, success_count,
+                    latency_avg_ms, latency_min_ms, latency_max_ms
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8
+                 WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?1)
+                   AND EXISTS (SELECT 1 FROM ping_targets WHERE id = ?3)
+                 ON CONFLICT(node_id, bucket_ts, target_id) DO UPDATE SET
+                    sample_count = excluded.sample_count,
+                    success_count = excluded.success_count,
+                    latency_avg_ms = excluded.latency_avg_ms,
+                    latency_min_ms = excluded.latency_min_ms,
+                    latency_max_ms = excluded.latency_max_ms",
+                params![
+                    row.node_id,
+                    row.bucket_ts,
+                    row.target_id,
+                    row.sample_count,
+                    row.success_count,
+                    row.latency_avg_ms,
+                    row.latency_min_ms,
+                    row.latency_max_ms,
+                ],
+            )
+            .map_err(|source| DatabaseError::Sql {
+                operation: "persist ping history row",
+                source,
+            })?;
+    }
+
+    transaction.commit().map_err(|source| DatabaseError::Sql {
+        operation: "commit history batch transaction",
+        source,
+    })
+}
+
+pub(super) fn query_resource_history(
+    connection: &Connection,
+    node_id: i64,
+    from: i64,
+    to: i64,
+    step: i64,
+) -> Result<Vec<ResourceHistoryPoint>, DatabaseError> {
+    let sql = if step == 300 {
+        "SELECT bucket_ts - bucket_ts % 300,
+                SUM(CAST(cpu_usage_bp AS REAL) * sample_count) / SUM(sample_count) / 100.0,
+                CAST(ROUND(AVG(memory_used_bytes)) AS INTEGER),
+                CAST(ROUND(AVG(disk_used_bytes)) AS INTEGER),
+                CAST(ROUND(SUM(CAST(rx_rate_bytes_per_sec AS REAL) * sample_count)
+                     / SUM(sample_count)) AS INTEGER),
+                CAST(ROUND(SUM(CAST(tx_rate_bytes_per_sec AS REAL) * sample_count)
+                     / SUM(sample_count)) AS INTEGER)
+         FROM node_history
+         WHERE node_id = ?1 AND bucket_ts >= ?2 AND bucket_ts < ?3
+         GROUP BY bucket_ts - bucket_ts % 300
+         ORDER BY bucket_ts - bucket_ts % 300"
+    } else {
+        "SELECT bucket_ts, cpu_usage_bp / 100.0,
+                memory_used_bytes, disk_used_bytes,
+                rx_rate_bytes_per_sec, tx_rate_bytes_per_sec
+         FROM node_history
+         WHERE node_id = ?1 AND bucket_ts >= ?2 AND bucket_ts < ?3
+         ORDER BY bucket_ts"
+    };
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|source| DatabaseError::Sql {
+            operation: "prepare resource history query",
+            source,
+        })?;
+    let rows = statement
+        .query_map(params![node_id, from, to], |row| {
+            Ok(ResourceHistoryPoint {
+                bucket_ts: row.get(0)?,
+                cpu_usage: row.get(1)?,
+                memory_used_bytes: row.get(2)?,
+                disk_used_bytes: row.get(3)?,
+                rx_rate_bytes_per_sec: row.get(4)?,
+                tx_rate_bytes_per_sec: row.get(5)?,
+            })
+        })
+        .map_err(|source| DatabaseError::Sql {
+            operation: "query resource history",
+            source,
+        })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "read resource history",
+            source,
+        })
+}
+
+pub(super) fn query_ping_history(
+    connection: &Connection,
+    node_id: i64,
+    from: i64,
+    to: i64,
+    step: i64,
+) -> Result<Vec<PingHistoryPoint>, DatabaseError> {
+    let sql = if step == 300 {
+        "SELECT t.id, t.name, t.ip_family, t.sort_order,
+                h.bucket_ts, h.latency_ms
+         FROM ping_targets AS t
+         LEFT JOIN (
+             SELECT target_id, bucket_ts - bucket_ts % 300 AS bucket_ts,
+                    CASE WHEN SUM(success_count) = 0 THEN NULL
+                         ELSE SUM(COALESCE(latency_avg_ms, 0.0) * success_count)
+                              / SUM(success_count)
+                    END AS latency_ms
+             FROM ping_history
+             WHERE node_id = ?1 AND bucket_ts >= ?2 AND bucket_ts < ?3
+             GROUP BY target_id, bucket_ts - bucket_ts % 300
+         ) AS h ON h.target_id = t.id
+         WHERE t.enabled = 1 OR h.target_id IS NOT NULL
+         ORDER BY t.sort_order, t.id, h.bucket_ts"
+    } else {
+        "SELECT t.id, t.name, t.ip_family, t.sort_order,
+                h.bucket_ts, h.latency_avg_ms
+         FROM ping_targets AS t
+         LEFT JOIN ping_history AS h
+           ON h.target_id = t.id AND h.node_id = ?1
+          AND h.bucket_ts >= ?2 AND h.bucket_ts < ?3
+         WHERE t.enabled = 1 OR h.target_id IS NOT NULL
+         ORDER BY t.sort_order, t.id, h.bucket_ts"
+    };
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|source| DatabaseError::Sql {
+            operation: "prepare ping history query",
+            source,
+        })?;
+    let rows = statement
+        .query_map(params![node_id, from, to], |row| {
+            Ok(PingHistoryPoint {
+                target_id: row.get(0)?,
+                name: row.get(1)?,
+                ip_family: row.get(2)?,
+                sort_order: row.get(3)?,
+                bucket_ts: row.get(4)?,
+                latency_ms: row.get(5)?,
+            })
+        })
+        .map_err(|source| DatabaseError::Sql {
+            operation: "query ping history",
+            source,
+        })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "read ping history",
+            source,
+        })
+}
+
+pub(super) fn cleanup_history_batch(
+    connection: &mut Connection,
+    resource_cutoff: i64,
+    ping_cutoff: i64,
+    limit: usize,
+) -> Result<usize, DatabaseError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "begin history cleanup transaction",
+            source,
+        })?;
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let node_ids = {
+        let mut statement = transaction
+            .prepare("SELECT id FROM nodes ORDER BY id")
+            .map_err(|source| DatabaseError::Sql {
+                operation: "prepare history cleanup node query",
+                source,
+            })?;
+        statement
+            .query_map([], |row| row.get(0))
+            .map_err(|source| DatabaseError::Sql {
+                operation: "query history cleanup nodes",
+                source,
+            })?
+            .collect::<Result<Vec<i64>, _>>()
+            .map_err(|source| DatabaseError::Sql {
+                operation: "read history cleanup nodes",
+                source,
+            })?
+    };
+    let mut deleted_resources = 0;
+    for node_id in &node_ids {
+        let remaining = limit.saturating_sub(deleted_resources as i64);
+        if remaining == 0 {
+            break;
+        }
+        deleted_resources += transaction
+            .execute(
+                "DELETE FROM node_history
+                 WHERE node_id = ?1 AND bucket_ts IN (
+                     SELECT bucket_ts FROM node_history
+                     WHERE node_id = ?1 AND bucket_ts < ?2
+                     ORDER BY bucket_ts LIMIT ?3
+                 )",
+                params![node_id, resource_cutoff, remaining],
+            )
+            .map_err(|source| DatabaseError::Sql {
+                operation: "clean resource history batch",
+                source,
+            })?;
+    }
+    let mut deleted_pings = 0;
+    for node_id in &node_ids {
+        let remaining = limit.saturating_sub((deleted_resources + deleted_pings) as i64);
+        if remaining == 0 {
+            break;
+        }
+        deleted_pings += transaction
+            .execute(
+                "DELETE FROM ping_history
+                 WHERE node_id = ?1 AND (bucket_ts, target_id) IN (
+                     SELECT bucket_ts, target_id FROM ping_history
+                     WHERE node_id = ?1 AND bucket_ts < ?2
+                     ORDER BY bucket_ts, target_id LIMIT ?3
+                 )",
+                params![node_id, ping_cutoff, remaining],
+            )
+            .map_err(|source| DatabaseError::Sql {
+                operation: "clean ping history batch",
+                source,
+            })?;
+    }
+    transaction.commit().map_err(|source| DatabaseError::Sql {
+        operation: "commit history cleanup transaction",
+        source,
+    })?;
+    Ok(deleted_resources + deleted_pings)
 }
 
 pub(super) fn read_pragmas(connection: &Connection) -> Result<SqlitePragmas, DatabaseError> {

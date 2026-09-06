@@ -3,6 +3,7 @@ pub mod app;
 pub mod auth;
 pub mod config;
 pub mod database;
+pub mod history;
 pub mod http;
 pub mod public_snapshot;
 pub mod snapshot;
@@ -69,6 +70,8 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
     public_snapshot::generate_now(&state).await?;
     tokio::spawn(public_snapshot::run_worker(state.clone()));
     tokio::spawn(traffic::run_checkpoint_worker(state.clone()));
+    tokio::spawn(history::run_minute_worker(state.clone()));
+    tokio::spawn(history::run_cleanup_worker(state.clone()));
 
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
