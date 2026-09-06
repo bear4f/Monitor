@@ -1,11 +1,13 @@
+pub mod admin_cli;
 pub mod app;
+pub mod auth;
 pub mod config;
 pub mod database;
+pub mod http;
 
 use std::io;
 
 use app::AppState;
-use axum::Router;
 use config::Config;
 use database::{Database, hydrate_startup};
 
@@ -56,11 +58,14 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
 
     tracing::info!(listen = %config.listen, db = %config.database_path.display(), "monitor-server started");
 
-    let router = Router::<AppState>::new().with_state(state);
-    axum::serve(listener, router)
-        .await
-        .map_err(|source| ServerError::Io {
-            operation: "HTTP server failed",
-            source,
-        })
+    let router = http::router(state);
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await
+    .map_err(|source| ServerError::Io {
+        operation: "HTTP server failed",
+        source,
+    })
 }

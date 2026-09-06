@@ -10,7 +10,9 @@ use std::{
 };
 
 pub use migrations::CURRENT_SCHEMA_VERSION;
-pub use models::{NodeMetaRow, SettingsRow, SqlitePragmas, StartupHydration, TrafficRecoveryRow};
+pub use models::{
+    NodeMetaRow, SessionRow, SettingsRow, SqlitePragmas, StartupHydration, TrafficRecoveryRow,
+};
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
 
@@ -88,6 +90,38 @@ pub struct Database {
 }
 
 enum Command {
+    LoadAdminPasswordHash(oneshot::Sender<Result<Option<String>, DatabaseError>>),
+    SetAdminPassword {
+        password_hash: String,
+        updated_at: i64,
+        response: oneshot::Sender<Result<(), DatabaseError>>,
+    },
+    ChangeAdminPassword {
+        expected_password_hash: String,
+        new_password_hash: String,
+        updated_at: i64,
+        response: oneshot::Sender<Result<bool, DatabaseError>>,
+    },
+    CreateSession {
+        expected_password_hash: String,
+        token_hash: [u8; 32],
+        created_at: i64,
+        expires_at: i64,
+        response: oneshot::Sender<Result<bool, DatabaseError>>,
+    },
+    FindSession {
+        token_hash: [u8; 32],
+        response: oneshot::Sender<Result<Option<SessionRow>, DatabaseError>>,
+    },
+    DeleteSession {
+        token_hash: [u8; 32],
+        response: oneshot::Sender<Result<bool, DatabaseError>>,
+    },
+    DeleteAllSessions(oneshot::Sender<Result<usize, DatabaseError>>),
+    DeleteExpiredSessions {
+        now: i64,
+        response: oneshot::Sender<Result<usize, DatabaseError>>,
+    },
     LoadSettings(oneshot::Sender<Result<SettingsRow, DatabaseError>>),
     UpsertSettings(SettingsRow, oneshot::Sender<Result<(), DatabaseError>>),
     LoadNodeMetadata(oneshot::Sender<Result<Vec<NodeMetaRow>, DatabaseError>>),
@@ -120,6 +154,83 @@ impl Database {
 
     pub async fn load_settings(&self) -> Result<SettingsRow, DatabaseError> {
         self.request(Command::LoadSettings).await
+    }
+
+    pub async fn load_admin_password_hash(&self) -> Result<Option<String>, DatabaseError> {
+        self.request(Command::LoadAdminPasswordHash).await
+    }
+
+    pub async fn set_admin_password(
+        &self,
+        password_hash: String,
+        updated_at: i64,
+    ) -> Result<(), DatabaseError> {
+        self.request(|response| Command::SetAdminPassword {
+            password_hash,
+            updated_at,
+            response,
+        })
+        .await
+    }
+
+    pub async fn change_admin_password(
+        &self,
+        expected_password_hash: String,
+        new_password_hash: String,
+        updated_at: i64,
+    ) -> Result<bool, DatabaseError> {
+        self.request(|response| Command::ChangeAdminPassword {
+            expected_password_hash,
+            new_password_hash,
+            updated_at,
+            response,
+        })
+        .await
+    }
+
+    pub async fn create_session(
+        &self,
+        expected_password_hash: String,
+        token_hash: [u8; 32],
+        created_at: i64,
+        expires_at: i64,
+    ) -> Result<bool, DatabaseError> {
+        self.request(|response| Command::CreateSession {
+            expected_password_hash,
+            token_hash,
+            created_at,
+            expires_at,
+            response,
+        })
+        .await
+    }
+
+    pub async fn find_session(
+        &self,
+        token_hash: [u8; 32],
+    ) -> Result<Option<SessionRow>, DatabaseError> {
+        self.request(|response| Command::FindSession {
+            token_hash,
+            response,
+        })
+        .await
+    }
+
+    pub async fn delete_session(&self, token_hash: [u8; 32]) -> Result<bool, DatabaseError> {
+        self.request(|response| Command::DeleteSession {
+            token_hash,
+            response,
+        })
+        .await
+    }
+
+    pub async fn delete_all_sessions(&self) -> Result<usize, DatabaseError> {
+        self.request(Command::DeleteAllSessions).await
+    }
+
+    pub async fn delete_expired_sessions(&self, now: i64) -> Result<usize, DatabaseError> {
+        self.request(|response| Command::DeleteExpiredSessions { now, response })
+            .await
     }
 
     pub async fn upsert_settings(&self, settings: SettingsRow) -> Result<(), DatabaseError> {
@@ -201,6 +312,66 @@ fn database_worker(
 
     while let Some(command) = receiver.blocking_recv() {
         match command {
+            Command::LoadAdminPasswordHash(response) => {
+                let _ = response.send(persistence::load_admin_password_hash(&connection));
+            }
+            Command::SetAdminPassword {
+                password_hash,
+                updated_at,
+                response,
+            } => {
+                let _ = response.send(persistence::set_admin_password(
+                    &mut connection,
+                    &password_hash,
+                    updated_at,
+                ));
+            }
+            Command::ChangeAdminPassword {
+                expected_password_hash,
+                new_password_hash,
+                updated_at,
+                response,
+            } => {
+                let _ = response.send(persistence::change_admin_password(
+                    &mut connection,
+                    &expected_password_hash,
+                    &new_password_hash,
+                    updated_at,
+                ));
+            }
+            Command::CreateSession {
+                expected_password_hash,
+                token_hash,
+                created_at,
+                expires_at,
+                response,
+            } => {
+                let _ = response.send(persistence::create_session(
+                    &connection,
+                    &expected_password_hash,
+                    &token_hash,
+                    created_at,
+                    expires_at,
+                ));
+            }
+            Command::FindSession {
+                token_hash,
+                response,
+            } => {
+                let _ = response.send(persistence::find_session(&connection, &token_hash));
+            }
+            Command::DeleteSession {
+                token_hash,
+                response,
+            } => {
+                let _ = response.send(persistence::delete_session(&connection, &token_hash));
+            }
+            Command::DeleteAllSessions(response) => {
+                let _ = response.send(persistence::delete_all_sessions(&connection));
+            }
+            Command::DeleteExpiredSessions { now, response } => {
+                let _ = response.send(persistence::delete_expired_sessions(&connection, now));
+            }
             Command::LoadSettings(response) => {
                 let _ = response.send(persistence::load_settings(&connection));
             }

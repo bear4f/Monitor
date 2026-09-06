@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::{Mutex, RwLock};
 
+use crate::auth::LoginLimiter;
 use crate::database::{
     Database, DatabaseError, NodeMetaRow, SettingsRow, StartupHydration, TrafficRecoveryRow,
 };
@@ -12,6 +13,7 @@ pub type NodeMetaCache = Arc<RwLock<HashMap<i64, NodeMetaRow>>>;
 #[derive(Clone)]
 pub struct AppState {
     pub database: Database,
+    pub login_limiter: Arc<LoginLimiter>,
     pub settings: SettingsCache,
     settings_mutation_lock: Arc<Mutex<()>>,
     pub node_metadata: NodeMetaCache,
@@ -28,6 +30,7 @@ impl AppState {
 
         Self {
             database,
+            login_limiter: Arc::new(LoginLimiter::new()),
             settings: Arc::new(RwLock::new(hydration.settings)),
             settings_mutation_lock: Arc::new(Mutex::new(())),
             node_metadata: Arc::new(RwLock::new(node_metadata)),

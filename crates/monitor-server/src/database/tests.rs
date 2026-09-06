@@ -212,6 +212,158 @@ async fn settings_upsert_and_startup_hydration_use_persisted_state() {
     database.shutdown().await.expect("shutdown database");
 }
 
+#[tokio::test]
+async fn session_persistence_supports_lookup_and_targeted_cleanup() {
+    let path = TestDatabasePath::new("sessions");
+    let database = Database::open(path.as_path()).expect("open database");
+    let admin_hash = "x".repeat(32);
+    database
+        .set_admin_password(admin_hash.clone(), 1)
+        .await
+        .expect("set administrator fixture");
+
+    let expired_hash = [1_u8; 32];
+    let active_hash = [2_u8; 32];
+    assert!(
+        database
+            .create_session(admin_hash.clone(), expired_hash, 1, 2)
+            .await
+            .expect("create expired session")
+    );
+    assert!(
+        database
+            .create_session(admin_hash.clone(), active_hash, 1, 20)
+            .await
+            .expect("create active session")
+    );
+    assert_eq!(
+        database
+            .find_session(active_hash)
+            .await
+            .expect("find active session"),
+        Some(SessionRow {
+            created_at: 1,
+            expires_at: 20,
+        })
+    );
+    assert_eq!(
+        database
+            .delete_expired_sessions(10)
+            .await
+            .expect("delete expired sessions"),
+        1
+    );
+    assert_eq!(
+        database
+            .find_session(expired_hash)
+            .await
+            .expect("look up expired session"),
+        None
+    );
+    assert!(
+        database
+            .delete_session(active_hash)
+            .await
+            .expect("delete active session")
+    );
+
+    assert!(
+        database
+            .create_session(admin_hash, [3_u8; 32], 1, 20)
+            .await
+            .expect("create final session")
+    );
+    assert_eq!(
+        database
+            .delete_all_sessions()
+            .await
+            .expect("delete all sessions"),
+        1
+    );
+    database.shutdown().await.expect("shutdown database");
+}
+
+#[tokio::test]
+async fn session_creation_rejects_a_stale_admin_password_hash() {
+    let path = TestDatabasePath::new("stale-session-password");
+    let database = Database::open(path.as_path()).expect("open database");
+    let old_password_hash = "o".repeat(32);
+    let new_password_hash = "n".repeat(32);
+    database
+        .set_admin_password(old_password_hash.clone(), 1)
+        .await
+        .expect("set administrator fixture");
+    assert!(
+        database
+            .change_admin_password(old_password_hash.clone(), new_password_hash.clone(), 2)
+            .await
+            .expect("change administrator password")
+    );
+
+    let stale_session_hash = [8_u8; 32];
+    assert!(
+        !database
+            .create_session(old_password_hash, stale_session_hash, 3, 20)
+            .await
+            .expect("reject stale session")
+    );
+    assert_eq!(
+        database
+            .find_session(stale_session_hash)
+            .await
+            .expect("look up rejected session"),
+        None
+    );
+    assert!(
+        database
+            .create_session(new_password_hash, [9_u8; 32], 3, 20)
+            .await
+            .expect("create current session")
+    );
+
+    database.shutdown().await.expect("shutdown database");
+}
+
+#[test]
+fn password_change_rolls_back_if_session_invalidation_fails() {
+    let path = TestDatabasePath::new("password-rollback");
+    let mut connection = open_ready_connection(path.as_path()).expect("open database");
+    let old_password_hash = "o".repeat(32);
+    let new_password_hash = "n".repeat(32);
+    persistence::set_admin_password(&mut connection, &old_password_hash, 1)
+        .expect("set administrator fixture");
+    assert!(
+        persistence::create_session(&connection, &old_password_hash, &[7_u8; 32], 1, 20,)
+            .expect("create session fixture")
+    );
+    connection
+        .execute_batch(
+            "CREATE TEMP TRIGGER fail_session_invalidation
+             BEFORE DELETE ON sessions
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced session delete failure');
+             END;",
+        )
+        .expect("create failure trigger");
+
+    let result = persistence::change_admin_password(
+        &mut connection,
+        &old_password_hash,
+        &new_password_hash,
+        2,
+    );
+    assert!(result.is_err());
+    assert_eq!(
+        persistence::load_admin_password_hash(&connection).expect("load administrator"),
+        Some(old_password_hash)
+    );
+    assert!(
+        persistence::find_session(&connection, &[7_u8; 32])
+            .expect("load session")
+            .is_some()
+    );
+}
+
 fn table_names(connection: &Connection) -> Vec<String> {
     let mut statement = connection
         .prepare(

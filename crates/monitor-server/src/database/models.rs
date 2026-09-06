@@ -37,6 +37,12 @@ pub struct TrafficRecoveryRow {
     pub last_boot_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionRow {
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SqlitePragmas {
     pub foreign_keys: i64,

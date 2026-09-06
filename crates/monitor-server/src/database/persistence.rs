@@ -2,8 +2,187 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{
     DatabaseError,
-    models::{NodeMetaRow, SettingsRow, SqlitePragmas, TrafficRecoveryRow},
+    models::{NodeMetaRow, SessionRow, SettingsRow, SqlitePragmas, TrafficRecoveryRow},
 };
+
+pub(super) fn load_admin_password_hash(
+    connection: &Connection,
+) -> Result<Option<String>, DatabaseError> {
+    connection
+        .query_row("SELECT password_hash FROM admin WHERE id = 1", [], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "load administrator password hash",
+            source,
+        })
+}
+
+pub(super) fn set_admin_password(
+    connection: &mut Connection,
+    password_hash: &str,
+    updated_at: i64,
+) -> Result<(), DatabaseError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "begin administrator password transaction",
+            source,
+        })?;
+    transaction
+        .execute(
+            "INSERT INTO admin (id, password_hash, updated_at) VALUES (1, ?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET
+                password_hash = excluded.password_hash,
+                updated_at = excluded.updated_at",
+            params![password_hash, updated_at],
+        )
+        .map_err(|source| DatabaseError::Sql {
+            operation: "set administrator password",
+            source,
+        })?;
+    transaction
+        .execute("DELETE FROM sessions", [])
+        .map_err(|source| DatabaseError::Sql {
+            operation: "invalidate sessions after setting administrator password",
+            source,
+        })?;
+    transaction.commit().map_err(|source| DatabaseError::Sql {
+        operation: "commit administrator password transaction",
+        source,
+    })
+}
+
+pub(super) fn change_admin_password(
+    connection: &mut Connection,
+    expected_password_hash: &str,
+    new_password_hash: &str,
+    updated_at: i64,
+) -> Result<bool, DatabaseError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "begin administrator password change transaction",
+            source,
+        })?;
+    let changed = transaction
+        .execute(
+            "UPDATE admin SET password_hash = ?1, updated_at = ?2
+             WHERE id = 1 AND password_hash = ?3",
+            params![new_password_hash, updated_at, expected_password_hash],
+        )
+        .map_err(|source| DatabaseError::Sql {
+            operation: "change administrator password",
+            source,
+        })?;
+    if changed == 0 {
+        transaction.commit().map_err(|source| DatabaseError::Sql {
+            operation: "commit unchanged administrator password transaction",
+            source,
+        })?;
+        return Ok(false);
+    }
+
+    transaction
+        .execute("DELETE FROM sessions", [])
+        .map_err(|source| DatabaseError::Sql {
+            operation: "invalidate sessions after administrator password change",
+            source,
+        })?;
+    transaction.commit().map_err(|source| DatabaseError::Sql {
+        operation: "commit administrator password change transaction",
+        source,
+    })?;
+    Ok(true)
+}
+
+pub(super) fn create_session(
+    connection: &Connection,
+    expected_password_hash: &str,
+    token_hash: &[u8; 32],
+    created_at: i64,
+    expires_at: i64,
+) -> Result<bool, DatabaseError> {
+    connection
+        .execute(
+            "INSERT INTO sessions (token_hash, created_at, expires_at)
+             SELECT ?1, ?2, ?3
+             WHERE EXISTS (
+                SELECT 1 FROM admin WHERE id = 1 AND password_hash = ?4
+             )",
+            params![
+                token_hash.as_slice(),
+                created_at,
+                expires_at,
+                expected_password_hash,
+            ],
+        )
+        .map(|inserted| inserted != 0)
+        .map_err(|source| DatabaseError::Sql {
+            operation: "create administrator session",
+            source,
+        })
+}
+
+pub(super) fn find_session(
+    connection: &Connection,
+    token_hash: &[u8; 32],
+) -> Result<Option<SessionRow>, DatabaseError> {
+    connection
+        .query_row(
+            "SELECT created_at, expires_at FROM sessions WHERE token_hash = ?1",
+            [token_hash.as_slice()],
+            |row| {
+                Ok(SessionRow {
+                    created_at: row.get(0)?,
+                    expires_at: row.get(1)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "find administrator session",
+            source,
+        })
+}
+
+pub(super) fn delete_session(
+    connection: &Connection,
+    token_hash: &[u8; 32],
+) -> Result<bool, DatabaseError> {
+    connection
+        .execute(
+            "DELETE FROM sessions WHERE token_hash = ?1",
+            [token_hash.as_slice()],
+        )
+        .map(|deleted| deleted != 0)
+        .map_err(|source| DatabaseError::Sql {
+            operation: "delete administrator session",
+            source,
+        })
+}
+
+pub(super) fn delete_all_sessions(connection: &Connection) -> Result<usize, DatabaseError> {
+    connection
+        .execute("DELETE FROM sessions", [])
+        .map_err(|source| DatabaseError::Sql {
+            operation: "delete all administrator sessions",
+            source,
+        })
+}
+
+pub(super) fn delete_expired_sessions(
+    connection: &Connection,
+    now: i64,
+) -> Result<usize, DatabaseError> {
+    connection
+        .execute("DELETE FROM sessions WHERE expires_at <= ?1", [now])
+        .map_err(|source| DatabaseError::Sql {
+            operation: "delete expired administrator sessions",
+            source,
+        })
+}
 
 pub(super) fn ensure_default_settings(connection: &Connection) -> Result<(), DatabaseError> {
     connection
