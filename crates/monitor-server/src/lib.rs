@@ -5,6 +5,7 @@ pub mod config;
 pub mod database;
 pub mod history;
 pub mod http;
+mod ping_target;
 pub mod public_snapshot;
 pub mod snapshot;
 pub mod time;

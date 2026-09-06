@@ -5,11 +5,12 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, types::T
 use super::{
     DatabaseError,
     models::{
-        AdminNodeRow, DeletedNodeRow, EnabledPingTargetRow, NewNodeRow, NodeLastStateRow,
-        NodeMetaRow, NodePatchRow, NodeTokenRow, NodeUpdateResult, PingHistoryPoint,
-        PingHistoryWriteRow, ResourceHistoryPoint, ResourceHistoryWriteRow, RotatedNodeTokenRow,
-        SessionRow, SettingsRow, SqlitePragmas, TrafficCheckpointRow, TrafficRecoveryRow,
-        UpdateNodeResult,
+        AdminNodeRow, CreatePingTargetResult, DeletedNodeRow, DeletedPingTargetRow,
+        EnabledPingTargetRow, NewNodeRow, NewPingTargetRow, NodeLastStateRow, NodeMetaRow,
+        NodePatchRow, NodeTokenRow, NodeUpdateResult, PingHistoryPoint, PingHistoryWriteRow,
+        PingTargetMutationRow, PingTargetPatchRow, PingTargetRow, ResourceHistoryPoint,
+        ResourceHistoryWriteRow, RotatedNodeTokenRow, SessionRow, SettingsRow, SqlitePragmas,
+        TrafficCheckpointRow, TrafficRecoveryRow, UpdateNodeResult, UpdatePingTargetResult,
     },
 };
 
@@ -450,6 +451,306 @@ pub(super) fn load_enabled_ping_targets(
             operation: "read enabled ping targets",
             source,
         })
+}
+
+pub(super) fn list_ping_targets(
+    connection: &Connection,
+) -> Result<Vec<PingTargetRow>, DatabaseError> {
+    select_ping_targets(connection, false)
+}
+
+pub(super) fn create_ping_target(
+    connection: &mut Connection,
+    target: &NewPingTargetRow,
+    now: i64,
+) -> Result<CreatePingTargetResult, DatabaseError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "begin ping target creation transaction",
+            source,
+        })?;
+    let sort_order: i64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM ping_targets",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| DatabaseError::Sql {
+            operation: "select next ping target sort order",
+            source,
+        })?;
+    transaction
+        .execute(
+            "INSERT INTO ping_targets (
+                name, host, ip_family, enabled, sort_order, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+            params![
+                target.name,
+                target.host,
+                target.ip_family,
+                target.enabled,
+                sort_order,
+                now,
+            ],
+        )
+        .map_err(|source| DatabaseError::Sql {
+            operation: "insert ping target",
+            source,
+        })?;
+    if enabled_ping_target_count(&transaction)? > 6 {
+        return Ok(CreatePingTargetResult::Conflict);
+    }
+    let created = PingTargetRow {
+        id: transaction.last_insert_rowid(),
+        name: target.name.clone(),
+        host: target.host.clone(),
+        ip_family: target.ip_family,
+        enabled: target.enabled,
+        sort_order,
+    };
+    let enabled_targets = select_enabled_ping_targets(&transaction)?;
+    transaction.commit().map_err(|source| DatabaseError::Sql {
+        operation: "commit ping target creation transaction",
+        source,
+    })?;
+    Ok(CreatePingTargetResult::Created(PingTargetMutationRow {
+        target: created,
+        enabled_targets,
+    }))
+}
+
+pub(super) fn update_ping_target(
+    connection: &mut Connection,
+    id: i64,
+    patch: &PingTargetPatchRow,
+    now: i64,
+) -> Result<UpdatePingTargetResult, DatabaseError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "begin ping target update transaction",
+            source,
+        })?;
+    let Some(existing) = select_ping_target(&transaction, id)? else {
+        return Ok(UpdatePingTargetResult::NotFound);
+    };
+    let new_order = patch.sort_order.unwrap_or(existing.sort_order);
+    let target_count: i64 = transaction
+        .query_row("SELECT count(*) FROM ping_targets", [], |row| row.get(0))
+        .map_err(|source| DatabaseError::Sql {
+            operation: "count ping targets for reorder",
+            source,
+        })?;
+    if new_order < 0 || new_order >= target_count {
+        return Ok(UpdatePingTargetResult::InvalidSortOrder);
+    }
+    let updated = PingTargetRow {
+        id,
+        name: patch.name.clone().unwrap_or(existing.name),
+        host: patch.host.clone().unwrap_or(existing.host),
+        ip_family: patch.ip_family.unwrap_or(existing.ip_family),
+        enabled: patch.enabled.unwrap_or(existing.enabled),
+        sort_order: new_order,
+    };
+    if !crate::ping_target::valid_host_for_family(&updated.host, updated.ip_family) {
+        return Ok(UpdatePingTargetResult::InvalidConfiguration);
+    }
+
+    if existing.sort_order < new_order {
+        transaction
+            .execute(
+                "UPDATE ping_targets SET sort_order = sort_order - 1, updated_at = ?1
+                 WHERE sort_order > ?2 AND sort_order <= ?3",
+                params![now, existing.sort_order, new_order],
+            )
+            .map_err(|source| DatabaseError::Sql {
+                operation: "shift ping targets toward lower sort order",
+                source,
+            })?;
+    } else if existing.sort_order > new_order {
+        transaction
+            .execute(
+                "UPDATE ping_targets SET sort_order = sort_order + 1, updated_at = ?1
+                 WHERE sort_order >= ?2 AND sort_order < ?3",
+                params![now, new_order, existing.sort_order],
+            )
+            .map_err(|source| DatabaseError::Sql {
+                operation: "shift ping targets toward higher sort order",
+                source,
+            })?;
+    }
+    transaction
+        .execute(
+            "UPDATE ping_targets SET name = ?1, host = ?2, ip_family = ?3,
+                    enabled = ?4, sort_order = ?5, updated_at = ?6
+             WHERE id = ?7",
+            params![
+                updated.name,
+                updated.host,
+                updated.ip_family,
+                updated.enabled,
+                updated.sort_order,
+                now,
+                updated.id,
+            ],
+        )
+        .map_err(|source| DatabaseError::Sql {
+            operation: "update ping target",
+            source,
+        })?;
+    if enabled_ping_target_count(&transaction)? > 6 {
+        return Ok(UpdatePingTargetResult::Conflict);
+    }
+    let enabled_targets = select_enabled_ping_targets(&transaction)?;
+    transaction.commit().map_err(|source| DatabaseError::Sql {
+        operation: "commit ping target update transaction",
+        source,
+    })?;
+    Ok(UpdatePingTargetResult::Updated(PingTargetMutationRow {
+        target: updated,
+        enabled_targets,
+    }))
+}
+
+pub(super) fn delete_ping_target(
+    connection: &mut Connection,
+    id: i64,
+    now: i64,
+) -> Result<Option<DeletedPingTargetRow>, DatabaseError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "begin ping target deletion transaction",
+            source,
+        })?;
+    let sort_order = transaction
+        .query_row(
+            "SELECT sort_order FROM ping_targets WHERE id = ?1",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "find ping target for deletion",
+            source,
+        })?;
+    let Some(sort_order) = sort_order else {
+        return Ok(None);
+    };
+    transaction
+        .execute("DELETE FROM ping_targets WHERE id = ?1", [id])
+        .map_err(|source| DatabaseError::Sql {
+            operation: "delete ping target",
+            source,
+        })?;
+    transaction
+        .execute(
+            "UPDATE ping_targets SET sort_order = sort_order - 1, updated_at = ?1
+             WHERE sort_order > ?2",
+            params![now, sort_order],
+        )
+        .map_err(|source| DatabaseError::Sql {
+            operation: "close ping target sort order gap",
+            source,
+        })?;
+    let enabled_targets = select_enabled_ping_targets(&transaction)?;
+    transaction.commit().map_err(|source| DatabaseError::Sql {
+        operation: "commit ping target deletion transaction",
+        source,
+    })?;
+    Ok(Some(DeletedPingTargetRow {
+        target_id: id,
+        enabled_targets,
+    }))
+}
+
+fn enabled_ping_target_count(transaction: &Transaction<'_>) -> Result<i64, DatabaseError> {
+    transaction
+        .query_row(
+            "SELECT count(*) FROM ping_targets WHERE enabled = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| DatabaseError::Sql {
+            operation: "count enabled ping targets",
+            source,
+        })
+}
+
+fn select_ping_target(
+    transaction: &Transaction<'_>,
+    id: i64,
+) -> Result<Option<PingTargetRow>, DatabaseError> {
+    transaction
+        .query_row(
+            "SELECT id, name, host, ip_family, enabled, sort_order
+             FROM ping_targets WHERE id = ?1",
+            [id],
+            ping_target_from_row,
+        )
+        .optional()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "find ping target",
+            source,
+        })
+}
+
+fn select_ping_targets(
+    connection: &Connection,
+    enabled_only: bool,
+) -> Result<Vec<PingTargetRow>, DatabaseError> {
+    let sql = if enabled_only {
+        "SELECT id, name, host, ip_family, enabled, sort_order
+         FROM ping_targets WHERE enabled = 1 ORDER BY sort_order, id"
+    } else {
+        "SELECT id, name, host, ip_family, enabled, sort_order
+         FROM ping_targets ORDER BY sort_order, id"
+    };
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|source| DatabaseError::Sql {
+            operation: "prepare ping target query",
+            source,
+        })?;
+    let rows = statement
+        .query_map([], ping_target_from_row)
+        .map_err(|source| DatabaseError::Sql {
+            operation: "query ping targets",
+            source,
+        })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "read ping targets",
+            source,
+        })
+}
+
+fn select_enabled_ping_targets(
+    connection: &Connection,
+) -> Result<Vec<EnabledPingTargetRow>, DatabaseError> {
+    select_ping_targets(connection, true).map(|targets| {
+        targets
+            .into_iter()
+            .map(|target| EnabledPingTargetRow {
+                id: target.id,
+                name: target.name,
+                host: target.host,
+                ip_family: target.ip_family,
+            })
+            .collect()
+    })
+}
+
+fn ping_target_from_row(row: &Row<'_>) -> rusqlite::Result<PingTargetRow> {
+    Ok(PingTargetRow {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        host: row.get(2)?,
+        ip_family: row.get(3)?,
+        enabled: row.get(4)?,
+        sort_order: row.get(5)?,
+    })
 }
 
 pub(super) fn list_admin_nodes(

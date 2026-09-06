@@ -149,6 +149,16 @@ impl HistoryAccumulator {
         }
     }
 
+    pub fn remove_target(&self, target_id: i64) {
+        let mut state = self.lock();
+        if let Some(current) = &mut state.current {
+            current.pings.retain(|(_, id), _| *id != target_id);
+        }
+        for batch in &mut state.pending {
+            batch.pings.retain(|row| row.target_id != target_id);
+        }
+    }
+
     fn pending_snapshot(&self) -> Vec<HistoryBatch> {
         self.lock().pending.iter().cloned().collect()
     }
@@ -179,6 +189,27 @@ impl HistoryAccumulator {
                 .iter()
                 .flat_map(|batch| &batch.resources)
                 .filter(|row| row.node_id == node_id)
+                .map(|row| row.sample_count)
+                .sum::<i64>()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ping_samples(&self, target_id: i64) -> i64 {
+        let state = self.lock();
+        let current = state.current.as_ref().map_or(0, |minute| {
+            minute
+                .pings
+                .iter()
+                .filter(|((_, id), _)| *id == target_id)
+                .map(|(_, ping)| ping.sample_count)
+                .sum()
+        });
+        current
+            + state
+                .pending
+                .iter()
+                .flat_map(|batch| &batch.pings)
+                .filter(|row| row.target_id == target_id)
                 .map(|row| row.sample_count)
                 .sum::<i64>()
     }
@@ -558,6 +589,22 @@ mod tests {
                 .flat_map(|batch| &batch.resources)
                 .all(|row| row.node_id != 1)
         );
+    }
+
+    #[test]
+    fn removing_a_target_clears_only_its_current_and_pending_ping_samples() {
+        let history = HistoryAccumulator::new();
+        let sample = |target_id| PingSample {
+            target_id,
+            success: false,
+            latency_ms: None,
+        };
+        history.record(1, 60, resource(10.0, 10, 10), [sample(7), sample(8)]);
+        history.record(1, 120, resource(20.0, 20, 20), [sample(7), sample(8)]);
+        history.remove_target(7);
+
+        assert_eq!(history.ping_samples(7), 0);
+        assert_eq!(history.ping_samples(8), 2);
     }
 
     #[test]

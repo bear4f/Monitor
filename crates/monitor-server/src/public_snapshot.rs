@@ -136,6 +136,7 @@ pub async fn generate_now(state: &AppState) -> Result<(), PublicSnapshotError> {
 }
 
 pub async fn generate(state: &AppState, generated_at: i64) -> Result<(), PublicSnapshotError> {
+    let _generation_guard = state.public_snapshot_generation_gate.lock().await;
     let settings = state.settings.read().await.clone();
     let nodes: Vec<_> = state.node_metadata.read().await.values().cloned().collect();
     let snapshots = state.snapshots.read().await.clone();

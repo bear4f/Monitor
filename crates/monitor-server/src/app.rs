@@ -36,7 +36,8 @@ pub struct AppState {
     pub login_limiter: Arc<LoginLimiter>,
     pub(crate) auth_hash_gate: Arc<Semaphore>,
     pub settings: SettingsCache,
-    settings_mutation_lock: Arc<Mutex<()>>,
+    pub(crate) settings_mutation_lock: Arc<Mutex<()>>,
+    pub(crate) ping_target_mutation_lock: Arc<Mutex<()>>,
     pub node_metadata: NodeMetaCache,
     pub(crate) node_tokens: NodeTokenCache,
     pub(crate) node_lifecycle_gate: Arc<RwLock<()>>,
@@ -47,6 +48,7 @@ pub struct AppState {
     pub(crate) history: HistoryAccumulator,
     pub(crate) public_snapshot: PublicSnapshotCache,
     pub(crate) public_network_rates: NetworkRateRing,
+    pub(crate) public_snapshot_generation_gate: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -96,6 +98,7 @@ impl AppState {
             auth_hash_gate: Arc::new(Semaphore::new(1)),
             settings: Arc::new(RwLock::new(hydration.settings)),
             settings_mutation_lock: Arc::new(Mutex::new(())),
+            ping_target_mutation_lock: Arc::new(Mutex::new(())),
             node_metadata: Arc::new(RwLock::new(node_metadata)),
             node_tokens: Arc::new(RwLock::new(node_tokens)),
             node_lifecycle_gate: Arc::new(RwLock::new(())),
@@ -106,14 +109,25 @@ impl AppState {
             history: HistoryAccumulator::new(),
             public_snapshot: PublicSnapshotCache::new(),
             public_network_rates: NetworkRateRing::new(),
+            public_snapshot_generation_gate: Arc::new(Mutex::new(())),
         }
     }
 
     pub async fn persist_settings(&self, settings: SettingsRow) -> Result<(), DatabaseError> {
         let _mutation_guard = self.settings_mutation_lock.lock().await;
-        // Preserve mutation order across persistent commit and cache publication.
+        self.commit_settings_under_lock(settings).await
+    }
+
+    pub(crate) async fn commit_settings_under_lock(
+        &self,
+        settings: SettingsRow,
+    ) -> Result<(), DatabaseError> {
+        // The caller holds the mutation lock across commit and both cache publications.
         self.database.upsert_settings(settings.clone()).await?;
-        *self.settings.write().await = settings;
+        *self.settings.write().await = settings.clone();
+        let mut config = self.agent_config.write().await;
+        config.report_interval_seconds = settings.agent_report_interval_seconds;
+        config.ping_interval_seconds = settings.ping_interval_seconds;
         Ok(())
     }
 }

@@ -12,11 +12,13 @@ use std::{
 
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use models::{
-    AdminNodeRow, DeletedNodeRow, EnabledPingTargetRow, NewNodeRow, NodeLastStateRow, NodeMetaRow,
+    AdminNodeRow, CreatePingTargetResult, DeletedNodeRow, DeletedPingTargetRow,
+    EnabledPingTargetRow, NewNodeRow, NewPingTargetRow, NodeLastStateRow, NodeMetaRow,
     NodePatchRow, NodeTokenRow, NodeUpdateResult, PingHistoryPoint, PingHistoryWriteRow,
-    ResourceHistoryPoint, ResourceHistoryWriteRow, RotatedNodeTokenRow, SessionRow, SettingsRow,
-    SqlitePragmas, StartupHydration, TrafficCheckpointRow, TrafficCycleCheckpointRow,
-    TrafficDayCheckpointRow, TrafficRecoveryRow, UpdateNodeResult,
+    PingTargetMutationRow, PingTargetPatchRow, PingTargetRow, ResourceHistoryPoint,
+    ResourceHistoryWriteRow, RotatedNodeTokenRow, SessionRow, SettingsRow, SqlitePragmas,
+    StartupHydration, TrafficCheckpointRow, TrafficCycleCheckpointRow, TrafficDayCheckpointRow,
+    TrafficRecoveryRow, UpdateNodeResult, UpdatePingTargetResult,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -149,6 +151,23 @@ enum Command {
     LoadNodeTokens(oneshot::Sender<Result<Vec<NodeTokenRow>, DatabaseError>>),
     LoadNodeLastStates(oneshot::Sender<Result<Vec<NodeLastStateRow>, DatabaseError>>),
     LoadEnabledPingTargets(oneshot::Sender<Result<Vec<EnabledPingTargetRow>, DatabaseError>>),
+    ListPingTargets(oneshot::Sender<Result<Vec<PingTargetRow>, DatabaseError>>),
+    CreatePingTarget {
+        target: NewPingTargetRow,
+        now: i64,
+        response: oneshot::Sender<Result<CreatePingTargetResult, DatabaseError>>,
+    },
+    UpdatePingTarget {
+        id: i64,
+        patch: PingTargetPatchRow,
+        now: i64,
+        response: oneshot::Sender<Result<UpdatePingTargetResult, DatabaseError>>,
+    },
+    DeletePingTarget {
+        id: i64,
+        now: i64,
+        response: oneshot::Sender<Result<Option<DeletedPingTargetRow>, DatabaseError>>,
+    },
     ListAdminNodes {
         day_start_utc: i64,
         now: i64,
@@ -330,6 +349,47 @@ impl Database {
         &self,
     ) -> Result<Vec<EnabledPingTargetRow>, DatabaseError> {
         self.request(Command::LoadEnabledPingTargets).await
+    }
+
+    pub async fn list_ping_targets(&self) -> Result<Vec<PingTargetRow>, DatabaseError> {
+        self.request(Command::ListPingTargets).await
+    }
+
+    pub async fn create_ping_target(
+        &self,
+        target: NewPingTargetRow,
+        now: i64,
+    ) -> Result<CreatePingTargetResult, DatabaseError> {
+        self.request(|response| Command::CreatePingTarget {
+            target,
+            now,
+            response,
+        })
+        .await
+    }
+
+    pub async fn update_ping_target(
+        &self,
+        id: i64,
+        patch: PingTargetPatchRow,
+        now: i64,
+    ) -> Result<UpdatePingTargetResult, DatabaseError> {
+        self.request(|response| Command::UpdatePingTarget {
+            id,
+            patch,
+            now,
+            response,
+        })
+        .await
+    }
+
+    pub async fn delete_ping_target(
+        &self,
+        id: i64,
+        now: i64,
+    ) -> Result<Option<DeletedPingTargetRow>, DatabaseError> {
+        self.request(|response| Command::DeletePingTarget { id, now, response })
+            .await
     }
 
     pub async fn list_admin_nodes(
@@ -689,6 +749,36 @@ fn database_worker(
             }
             Command::LoadEnabledPingTargets(response) => {
                 let _ = response.send(persistence::load_enabled_ping_targets(&connection));
+            }
+            Command::ListPingTargets(response) => {
+                let _ = response.send(persistence::list_ping_targets(&connection));
+            }
+            Command::CreatePingTarget {
+                target,
+                now,
+                response,
+            } => {
+                let _ = response.send(persistence::create_ping_target(
+                    &mut connection,
+                    &target,
+                    now,
+                ));
+            }
+            Command::UpdatePingTarget {
+                id,
+                patch,
+                now,
+                response,
+            } => {
+                let _ = response.send(persistence::update_ping_target(
+                    &mut connection,
+                    id,
+                    &patch,
+                    now,
+                ));
+            }
+            Command::DeletePingTarget { id, now, response } => {
+                let _ = response.send(persistence::delete_ping_target(&mut connection, id, now));
             }
             Command::ListAdminNodes {
                 day_start_utc,

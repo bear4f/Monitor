@@ -3,7 +3,7 @@ use axum::{
     http::StatusCode,
     response::Response,
 };
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     app::AppState,
@@ -15,6 +15,7 @@ use crate::{
 use super::auth::{
     ApiError, authenticate_session, json_response, no_content_response, parse_json, validate_csrf,
 };
+use super::patch::PatchField;
 
 const JSON_BODY_LIMIT: usize = 8 * 1_024;
 const JS_SAFE_INTEGER_MAX: i64 = 9_007_199_254_740_991;
@@ -59,32 +60,6 @@ struct PatchNodeRequest {
     expires_at: PatchField<i64>,
     #[serde(default)]
     sort_order: PatchField<i64>,
-}
-
-#[derive(Default)]
-enum PatchField<T> {
-    #[default]
-    Missing,
-    Null,
-    Value(T),
-}
-
-impl<'de, T> Deserialize<'de> for PatchField<T>
-where
-    T: Deserialize<'de>,
-{
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Option::<T>::deserialize(deserializer).map(|value| value.map_or(Self::Null, Self::Value))
-    }
-}
-
-impl<T> PatchField<T> {
-    const fn is_missing(&self) -> bool {
-        matches!(self, Self::Missing)
-    }
 }
 
 #[derive(Serialize)]

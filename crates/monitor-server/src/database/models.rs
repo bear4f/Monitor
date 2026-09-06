@@ -48,6 +48,60 @@ pub struct EnabledPingTargetRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PingTargetRow {
+    pub id: i64,
+    pub name: String,
+    pub host: String,
+    pub ip_family: i64,
+    pub enabled: bool,
+    pub sort_order: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewPingTargetRow {
+    pub name: String,
+    pub host: String,
+    pub ip_family: i64,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PingTargetPatchRow {
+    pub name: Option<String>,
+    pub host: Option<String>,
+    pub ip_family: Option<i64>,
+    pub enabled: Option<bool>,
+    pub sort_order: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PingTargetMutationRow {
+    pub target: PingTargetRow,
+    pub enabled_targets: Vec<EnabledPingTargetRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreatePingTargetResult {
+    Conflict,
+    Created(PingTargetMutationRow),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpdatePingTargetResult {
+    NotFound,
+    InvalidSortOrder,
+    InvalidConfiguration,
+    Conflict,
+    Updated(PingTargetMutationRow),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletedPingTargetRow {
+    pub target_id: i64,
+    pub enabled_targets: Vec<EnabledPingTargetRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewNodeRow {
     pub public_id: String,
     pub name: String,

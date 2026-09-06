@@ -492,6 +492,10 @@ impl ApiError {
         Self::new(StatusCode::NOT_FOUND, "not_found", "not found")
     }
 
+    pub(super) fn conflict() -> Self {
+        Self::new(StatusCode::CONFLICT, "conflict", "conflict")
+    }
+
     const fn new(status: StatusCode, code: &'static str, message: &'static str) -> Self {
         Self {
             status,
