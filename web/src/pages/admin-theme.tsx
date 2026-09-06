@@ -15,6 +15,7 @@ export function AdminThemePage() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     void getSettings()
@@ -24,7 +25,7 @@ export function AdminThemePage() {
       })
       .catch((caught) => setError(handleAdminError(caught)))
       .finally(() => setLoading(false));
-  }, []);
+  }, [attempt]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
@@ -62,7 +63,7 @@ export function AdminThemePage() {
           {error && <div className="admin-error" role="alert">{error}</div>}
           <div className="dialog-actions"><Button type="submit" disabled={busy}>{busy ? "保存中…" : "保存"}</Button></div>
         </form>
-      ) : <div className="admin-error" role="alert">{error ?? "暂时无法加载设置"}</div>}
+      ) : <div className="admin-error" role="alert"><span>{error ?? "暂时无法加载设置"}</span><button type="button" className="text-link" onClick={() => { setLoading(true); setAttempt((value) => value + 1); }}>重试</button></div>}
     </section>
   );
 }

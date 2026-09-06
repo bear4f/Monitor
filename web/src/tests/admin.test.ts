@@ -27,6 +27,11 @@ import {
   parseAdminSettings,
   parseApiError,
   parseBoundedInteger,
+  parseSettingsForm,
+  settingsToForm,
+  passwordApiErrorAction,
+  AdminApiError,
+  validateTimezoneInput,
   passwordByteLength,
   passwordFormError,
 } from "../api/admin";
@@ -53,6 +58,52 @@ describe("admin pure helpers", () => {
     expect(parseBoundedInteger("", 2, 60)).toBeNull();
     expect(parseBoundedInteger("61", 2, 60)).toBeNull();
   });
+  it("keeps settings form numbers as strings until submit validation", () => {
+    const form = settingsToForm(settings);
+    expect(form.history_retention_days).toBe("7");
+    expect(parseSettingsForm({ ...form, site_name: " New " })).toEqual({
+      ok: true,
+      value: {
+        site_name: "New",
+        site_timezone: "UTC",
+        history_retention_days: 7,
+        agent_report_interval_seconds: 10,
+        ping_interval_seconds: 30,
+        offline_after_seconds: 60,
+        default_traffic_reset_day: 1,
+      },
+    });
+  });
+  it("rejects each invalid settings range and cross-field relation", () => {
+    const form = settingsToForm(settings);
+    const invalid: Array<keyof typeof form> = [
+      "history_retention_days", "agent_report_interval_seconds", "ping_interval_seconds",
+      "offline_after_seconds", "default_traffic_reset_day",
+    ];
+    for (const key of invalid) expect(parseSettingsForm({ ...form, [key]: "" }).ok).toBe(false);
+    expect(parseSettingsForm({ ...form, history_retention_days: "0" }).ok).toBe(false);
+    expect(parseSettingsForm({ ...form, history_retention_days: "31" }).ok).toBe(false);
+    expect(parseSettingsForm({ ...form, agent_report_interval_seconds: "1" }).ok).toBe(false);
+    expect(parseSettingsForm({ ...form, agent_report_interval_seconds: "61" }).ok).toBe(false);
+    expect(parseSettingsForm({ ...form, ping_interval_seconds: "9" }).ok).toBe(false);
+    expect(parseSettingsForm({ ...form, ping_interval_seconds: "301" }).ok).toBe(false);
+    expect(parseSettingsForm({ ...form, offline_after_seconds: "4" }).ok).toBe(false);
+    expect(parseSettingsForm({ ...form, offline_after_seconds: "601" }).ok).toBe(false);
+    expect(parseSettingsForm({ ...form, default_traffic_reset_day: "0" }).ok).toBe(false);
+    expect(parseSettingsForm({ ...form, default_traffic_reset_day: "32" }).ok).toBe(false);
+    expect(parseSettingsForm({ ...form, agent_report_interval_seconds: "10", offline_after_seconds: "10" })).toEqual({ ok: false, error: "离线判定时间必须大于 Agent 上报间隔" });
+    expect(parseSettingsForm({ ...form, agent_report_interval_seconds: "10", offline_after_seconds: "9" }).ok).toBe(false);
+    expect(parseSettingsForm({ ...form, agent_report_interval_seconds: "10", offline_after_seconds: "11" }).ok).toBe(true);
+    expect(parseSettingsForm({ ...form, history_retention_days: "1" }).ok).toBe(true);
+    expect(parseSettingsForm({ ...form, history_retention_days: "30" }).ok).toBe(true);
+    expect(parseSettingsForm({ ...form, agent_report_interval_seconds: "1.5" }).ok).toBe(false);
+    expect(parseSettingsForm({ ...form, ping_interval_seconds: "1e2" }).ok).toBe(false);
+    expect(parseSettingsForm({ ...form, offline_after_seconds: "-1" }).ok).toBe(false);
+    expect(parseSettingsForm({ ...form, site_name: "  Site  " }).ok).toBe(true);
+    expect(validateTimezoneInput(" Asia/Shanghai ")).toBe(true);
+    expect(validateTimezoneInput(" ")).toBe(false);
+    expect(validateTimezoneInput("x".repeat(65))).toBe(false);
+  });
   it("preserves API error codes and password byte rules", () => {
     expect(parseApiError({ error: { code: "invalid_credentials", message: "bad" } })).toEqual({ code: "invalid_credentials", message: "bad" });
     expect(parseApiError({ error: { code: 1, message: "bad" } })).toBeNull();
@@ -60,6 +111,11 @@ describe("admin pure helpers", () => {
     expect(passwordFormError("old", "new", "different")).toContain("不一致");
     expect(passwordFormError("same", "same", "same")).toContain("相同");
     expect(passwordFormError("old", "new", "new")).toBeNull();
+    expect(passwordFormError("", "new", "new")).toContain("长度");
+    expect(passwordFormError("old", "new", "new2")).toContain("不一致");
+    expect(passwordApiErrorAction(new AdminApiError(401, "bad", null, "invalid_credentials"))).toBe("invalid-current");
+    expect(passwordApiErrorAction(new AdminApiError(401, "expired", null, "unauthorized"))).toBe("session-expired");
+    expect(passwordApiErrorAction(new AdminApiError(401, "expired"))).toBe("session-expired");
   });
   const target = {
     id: 1,

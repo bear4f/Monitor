@@ -66,6 +66,16 @@ export interface AdminSettings {
   offline_after_seconds: number;
   default_traffic_reset_day: number;
 }
+export interface SettingsForm {
+  site_name: string;
+  site_timezone: string;
+  history_retention_days: string;
+  agent_report_interval_seconds: string;
+  ping_interval_seconds: string;
+  offline_after_seconds: string;
+  default_traffic_reset_day: string;
+}
+export type EditableSettings = Omit<AdminSettings, "theme_default">;
 
 export function readCookie(name: string): string | null {
   if (typeof document === "undefined") return null;
@@ -399,6 +409,54 @@ export function parseBoundedInteger(value: string, min: number, max: number): nu
   if (!/^\d+$/.test(value)) return null;
   const number = Number(value);
   return Number.isSafeInteger(number) && number >= min && number <= max ? number : null;
+}
+export function settingsToForm(settings: AdminSettings): SettingsForm {
+  return {
+    site_name: settings.site_name,
+    site_timezone: settings.site_timezone,
+    history_retention_days: String(settings.history_retention_days),
+    agent_report_interval_seconds: String(settings.agent_report_interval_seconds),
+    ping_interval_seconds: String(settings.ping_interval_seconds),
+    offline_after_seconds: String(settings.offline_after_seconds),
+    default_traffic_reset_day: String(settings.default_traffic_reset_day),
+  };
+}
+export function validateTimezoneInput(value: string): boolean {
+  const trimmed = value.trim();
+  return trimmed.length >= 1 && trimmed.length <= 64;
+}
+export function parseSettingsForm(form: SettingsForm):
+  | { ok: true; value: EditableSettings }
+  | { ok: false; error: string } {
+  const siteName = form.site_name.trim();
+  const timezone = form.site_timezone.trim();
+  if (siteName.length < 1 || siteName.length > 64) return { ok: false, error: "请输入有效的站点名称" };
+  if (!validateTimezoneInput(timezone)) return { ok: false, error: "请输入有效的站点时区" };
+  const history = parseBoundedInteger(form.history_retention_days, 1, 30);
+  const report = parseBoundedInteger(form.agent_report_interval_seconds, 2, 60);
+  const ping = parseBoundedInteger(form.ping_interval_seconds, 10, 300);
+  const offline = parseBoundedInteger(form.offline_after_seconds, 5, 600);
+  const reset = parseBoundedInteger(form.default_traffic_reset_day, 1, 31);
+  if (history === null || report === null || ping === null || offline === null || reset === null) return { ok: false, error: "请输入有效的设置值" };
+  if (offline <= report) return { ok: false, error: "离线判定时间必须大于 Agent 上报间隔" };
+  return {
+    ok: true,
+    value: {
+      site_name: siteName,
+      site_timezone: timezone,
+      history_retention_days: history,
+      agent_report_interval_seconds: report,
+      ping_interval_seconds: ping,
+      offline_after_seconds: offline,
+      default_traffic_reset_day: reset,
+    },
+  };
+}
+export type PasswordApiErrorAction = "invalid-current" | "session-expired" | "other";
+export function passwordApiErrorAction(error: unknown): PasswordApiErrorAction {
+  if (!(error instanceof AdminApiError)) return "other";
+  if (error.status !== 401) return "other";
+  return error.code === "invalid_credentials" ? "invalid-current" : "session-expired";
 }
 export function passwordByteLength(value: string): number { return new TextEncoder().encode(value).length; }
 export function passwordFormError(current: string, next: string, confirm: string): string | null {
