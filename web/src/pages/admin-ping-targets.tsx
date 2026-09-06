@@ -56,16 +56,17 @@ export function AdminPingTargetsPage() {
       setDialogError(null);
     } catch (e) {
       const message = handleAdminError(e);
-      if (
-        localError &&
-        !(e instanceof AdminApiError && (e.status === 401 || e.status === 403))
-      )
+      const authFailure =
+        e instanceof AdminApiError && (e.status === 401 || e.status === 403);
+      if (localError && !authFailure) {
         localError(
           e instanceof AdminApiError
             ? pingTargetMutationMessage(e.status) ?? message
             : message,
         );
-      else setError(message);
+      } else {
+        setError(message);
+      }
     } finally {
       setBusy(false);
     }
