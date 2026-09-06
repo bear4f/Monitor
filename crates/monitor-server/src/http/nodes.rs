@@ -3,13 +3,13 @@ use axum::{
     http::StatusCode,
     response::Response,
 };
-use jiff::Timestamp;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::{
     app::AppState,
     auth::{encode_hex, random_token, sha256, unix_timestamp},
     database::{AdminNodeRow, NewNodeRow, NodeMetaRow, NodePatchRow, UpdateNodeResult},
+    time,
 };
 
 use super::auth::{
@@ -294,6 +294,7 @@ pub(super) async fn delete(
     }
     drop(metadata);
     state.snapshots.write().await.remove(&deleted.node_id);
+    state.traffic.remove(deleted.node_id);
     Ok(no_content_response())
 }
 
@@ -515,21 +516,10 @@ fn valid_public_id(value: &str) -> bool {
 }
 
 fn day_start_utc(now: i64, timezone: &str) -> Result<i64, ApiError> {
-    let timestamp = Timestamp::from_second(now).map_err(|error| {
-        tracing::error!(error = %error, "current timestamp is outside jiff range");
+    time::day_start_utc(now, timezone).map_err(|error| {
+        tracing::error!(timezone, error = %error, "site day start calculation failed");
         ApiError::internal()
-    })?;
-    let zoned = timestamp.in_tz(timezone).map_err(|error| {
-        tracing::error!(timezone, error = %error, "site timezone is invalid");
-        ApiError::internal()
-    })?;
-    zoned
-        .start_of_day()
-        .map(|start| start.timestamp().as_second())
-        .map_err(|error| {
-            tracing::error!(timezone, error = %error, "site day start is outside jiff range");
-            ApiError::internal()
-        })
+    })
 }
 
 fn admin_node_response(
@@ -574,6 +564,7 @@ mod tests {
         http::{Request as HttpRequest, header::CONTENT_TYPE},
         response::IntoResponse,
     };
+    use jiff::Timestamp;
     use rusqlite::{Connection, params};
     use serde_json::{Value, json};
 

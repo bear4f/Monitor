@@ -1,13 +1,12 @@
 use std::{collections::HashMap, sync::Arc};
 
 use serde::Serialize;
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 
 use crate::auth::LoginLimiter;
-use crate::database::{
-    Database, DatabaseError, NodeMetaRow, SettingsRow, StartupHydration, TrafficRecoveryRow,
-};
+use crate::database::{Database, DatabaseError, NodeMetaRow, SettingsRow, StartupHydration};
 use crate::snapshot::SnapshotStore;
+use crate::traffic::TrafficState;
 
 pub type SettingsCache = Arc<RwLock<SettingsRow>>;
 pub type NodeMetaCache = Arc<RwLock<HashMap<i64, NodeMetaRow>>>;
@@ -41,7 +40,8 @@ pub struct AppState {
     pub(crate) node_lifecycle_gate: Arc<RwLock<()>>,
     pub(crate) snapshots: SnapshotStore,
     pub(crate) agent_config: AgentConfigCache,
-    pub traffic_recovery: Arc<[TrafficRecoveryRow]>,
+    pub(crate) traffic: TrafficState,
+    pub(crate) traffic_flush: Arc<Notify>,
 }
 
 impl AppState {
@@ -71,6 +71,8 @@ impl AppState {
                 .collect(),
         };
 
+        let traffic = TrafficState::from_recovery(hydration.traffic_recovery);
+
         Self {
             database,
             login_limiter: Arc::new(LoginLimiter::new()),
@@ -82,7 +84,8 @@ impl AppState {
             node_lifecycle_gate: Arc::new(RwLock::new(())),
             snapshots: Arc::new(RwLock::new(HashMap::new())),
             agent_config: Arc::new(RwLock::new(agent_config)),
-            traffic_recovery: hydration.traffic_recovery.into(),
+            traffic,
+            traffic_flush: Arc::new(Notify::new()),
         }
     }
 

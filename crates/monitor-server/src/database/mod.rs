@@ -3,17 +3,19 @@ mod models;
 mod persistence;
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::mpsc as std_mpsc,
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 pub use migrations::CURRENT_SCHEMA_VERSION;
 pub use models::{
     AdminNodeRow, DeletedNodeRow, EnabledPingTargetRow, NewNodeRow, NodeMetaRow, NodePatchRow,
     NodeTokenRow, NodeUpdateResult, RotatedNodeTokenRow, SessionRow, SettingsRow, SqlitePragmas,
-    StartupHydration, TrafficRecoveryRow, UpdateNodeResult,
+    StartupHydration, TrafficCheckpointRow, TrafficCycleCheckpointRow, TrafficDayCheckpointRow,
+    TrafficRecoveryRow, UpdateNodeResult,
 };
 use rusqlite::Connection;
 use tokio::sync::{mpsc, oneshot};
@@ -44,6 +46,11 @@ pub enum DatabaseError {
     WorkerResponseDropped,
     TooManyEnabledPingTargets {
         count: usize,
+    },
+    Clock(std::time::SystemTimeError),
+    Time {
+        operation: &'static str,
+        source: jiff::Error,
     },
 }
 
@@ -76,6 +83,8 @@ impl std::fmt::Display for DatabaseError {
                     "database has {count} enabled ping targets; maximum is 6"
                 )
             }
+            Self::Clock(source) => write!(formatter, "read system clock: {source}"),
+            Self::Time { operation, source } => write!(formatter, "{operation}: {source}"),
         }
     }
 }
@@ -87,6 +96,8 @@ impl std::error::Error for DatabaseError {
             | Self::Sql { source, .. }
             | Self::Migration { source, .. } => Some(source),
             Self::WorkerSpawn(source) => Some(source),
+            Self::Clock(source) => Some(source),
+            Self::Time { source, .. } => Some(source),
             Self::UnsupportedSchemaVersion { .. }
             | Self::MissingSettings
             | Self::WorkerStopped
@@ -167,7 +178,16 @@ enum Command {
     LoadSettings(oneshot::Sender<Result<SettingsRow, DatabaseError>>),
     UpsertSettings(SettingsRow, oneshot::Sender<Result<(), DatabaseError>>),
     LoadNodeMetadata(oneshot::Sender<Result<Vec<NodeMetaRow>, DatabaseError>>),
-    LoadTrafficRecovery(oneshot::Sender<Result<Vec<TrafficRecoveryRow>, DatabaseError>>),
+    LoadTrafficRecovery {
+        day_start_utc: i64,
+        now: i64,
+        response: oneshot::Sender<Result<Vec<TrafficRecoveryRow>, DatabaseError>>,
+    },
+    PersistTrafficBatch {
+        rows: Vec<TrafficCheckpointRow>,
+        persisted_at: i64,
+        response: oneshot::Sender<Result<(), DatabaseError>>,
+    },
     ReadPragmas(oneshot::Sender<Result<SqlitePragmas, DatabaseError>>),
     ReadSchemaVersion(oneshot::Sender<Result<i64, DatabaseError>>),
     Shutdown(oneshot::Sender<()>),
@@ -365,8 +385,30 @@ impl Database {
         self.request(Command::LoadNodeMetadata).await
     }
 
-    pub async fn load_traffic_recovery(&self) -> Result<Vec<TrafficRecoveryRow>, DatabaseError> {
-        self.request(Command::LoadTrafficRecovery).await
+    pub async fn load_traffic_recovery(
+        &self,
+        day_start_utc: i64,
+        now: i64,
+    ) -> Result<Vec<TrafficRecoveryRow>, DatabaseError> {
+        self.request(|response| Command::LoadTrafficRecovery {
+            day_start_utc,
+            now,
+            response,
+        })
+        .await
+    }
+
+    pub async fn persist_traffic_batch(
+        &self,
+        rows: Vec<TrafficCheckpointRow>,
+        persisted_at: i64,
+    ) -> Result<(), DatabaseError> {
+        self.request(|response| Command::PersistTrafficBatch {
+            rows,
+            persisted_at,
+            response,
+        })
+        .await
     }
 
     pub async fn read_pragmas(&self) -> Result<SqlitePragmas, DatabaseError> {
@@ -413,7 +455,50 @@ pub async fn hydrate_startup(database: &Database) -> Result<StartupHydration, Da
             count: enabled_ping_targets.len(),
         });
     }
-    let traffic_recovery = database.load_traffic_recovery().await?;
+    let now = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(DatabaseError::Clock)?
+            .as_secs(),
+    )
+    .map_err(|_| DatabaseError::Time {
+        operation: "convert startup timestamp",
+        source: jiff::Error::from_args(format_args!("timestamp does not fit in i64")),
+    })?;
+    let day_start_utc =
+        crate::time::day_start_utc(now, &settings.site_timezone).map_err(|source| {
+            DatabaseError::Time {
+                operation: "calculate startup natural day",
+                source,
+            }
+        })?;
+    let mut traffic_recovery = database.load_traffic_recovery(day_start_utc, now).await?;
+    let reset_days: HashMap<i64, i64> = nodes
+        .iter()
+        .map(|node| (node.id, node.traffic_reset_day))
+        .collect();
+    for row in &mut traffic_recovery {
+        let reset_day =
+            reset_days
+                .get(&row.node_id)
+                .copied()
+                .ok_or_else(|| DatabaseError::Sql {
+                    operation: "match startup traffic state to node metadata",
+                    source: rusqlite::Error::QueryReturnedNoRows,
+                })?;
+        let cycle = crate::time::billing_cycle(now, &settings.site_timezone, reset_day).map_err(
+            |source| DatabaseError::Time {
+                operation: "calculate startup billing cycle",
+                source,
+            },
+        )?;
+        if row.cycle_start_utc != cycle.start_utc || row.cycle_end_utc != cycle.end_utc {
+            row.cycle_start_utc = cycle.start_utc;
+            row.cycle_end_utc = cycle.end_utc;
+            row.cycle_rx_bytes = 0;
+            row.cycle_tx_bytes = 0;
+        }
+    }
 
     Ok(StartupHydration {
         settings,
@@ -576,8 +661,27 @@ fn database_worker(
             Command::LoadNodeMetadata(response) => {
                 let _ = response.send(persistence::load_node_metadata(&connection));
             }
-            Command::LoadTrafficRecovery(response) => {
-                let _ = response.send(persistence::load_traffic_recovery(&connection));
+            Command::LoadTrafficRecovery {
+                day_start_utc,
+                now,
+                response,
+            } => {
+                let _ = response.send(persistence::load_traffic_recovery(
+                    &connection,
+                    day_start_utc,
+                    now,
+                ));
+            }
+            Command::PersistTrafficBatch {
+                rows,
+                persisted_at,
+                response,
+            } => {
+                let _ = response.send(persistence::persist_traffic_batch(
+                    &mut connection,
+                    &rows,
+                    persisted_at,
+                ));
             }
             Command::ReadPragmas(response) => {
                 let _ = response.send(persistence::read_pragmas(&connection));

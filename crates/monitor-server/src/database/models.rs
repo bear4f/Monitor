@@ -115,6 +115,49 @@ pub struct TrafficRecoveryRow {
     pub last_rx_counter_bytes: Option<i64>,
     pub last_tx_counter_bytes: Option<i64>,
     pub last_boot_id: Option<String>,
+    pub day_start_utc: i64,
+    pub today_rx_bytes: i64,
+    pub today_tx_bytes: i64,
+    pub cycle_start_utc: i64,
+    pub cycle_end_utc: i64,
+    pub cycle_rx_bytes: i64,
+    pub cycle_tx_bytes: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrafficCheckpointRow {
+    pub node_id: i64,
+    pub captured_generation: u64,
+    pub rx_total_bytes: i64,
+    pub tx_total_bytes: i64,
+    pub last_rx_counter_bytes: i64,
+    pub last_tx_counter_bytes: i64,
+    pub last_boot_id: String,
+    pub day_start_utc: i64,
+    pub today_rx_bytes: i64,
+    pub today_tx_bytes: i64,
+    pub cycle_start_utc: i64,
+    pub cycle_end_utc: i64,
+    pub cycle_rx_bytes: i64,
+    pub cycle_tx_bytes: i64,
+    pub previous_day: Option<TrafficDayCheckpointRow>,
+    pub previous_cycle: Option<TrafficCycleCheckpointRow>,
+    pub snapshot: crate::snapshot::NodeSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrafficDayCheckpointRow {
+    pub day_start_utc: i64,
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrafficCycleCheckpointRow {
+    pub cycle_start_utc: i64,
+    pub cycle_end_utc: i64,
+    pub rx_bytes: i64,
+    pub tx_bytes: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

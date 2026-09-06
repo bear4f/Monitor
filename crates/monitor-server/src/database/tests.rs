@@ -364,6 +364,107 @@ fn password_change_rolls_back_if_session_invalidation_fails() {
     );
 }
 
+#[test]
+fn traffic_checkpoint_rolls_back_all_tables_on_late_failure() {
+    let path = TestDatabasePath::new("traffic-rollback");
+    let mut connection = open_ready_connection(path.as_path()).expect("open database");
+    let node = persistence::create_node(
+        &mut connection,
+        &NewNodeRow {
+            public_id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            name: "Rollback node".into(),
+            region_code: "US".into(),
+            traffic_limit_bytes: None,
+            traffic_reset_day: 1,
+            price_micros: None,
+            currency: None,
+            renewal_cycle: None,
+            expires_at: None,
+        },
+        &[1; 32],
+        1,
+    )
+    .expect("create node");
+    connection
+        .execute_batch(
+            "CREATE TEMP TRIGGER fail_last_state
+             BEFORE INSERT ON node_last_state
+             BEGIN
+                 SELECT RAISE(ABORT, 'forced last-state failure');
+             END;",
+        )
+        .expect("create checkpoint failure trigger");
+    let checkpoint = TrafficCheckpointRow {
+        node_id: node.id,
+        captured_generation: 1,
+        rx_total_bytes: 50,
+        tx_total_bytes: 75,
+        last_rx_counter_bytes: 150,
+        last_tx_counter_bytes: 275,
+        last_boot_id: "boot".into(),
+        day_start_utc: 900,
+        today_rx_bytes: 50,
+        today_tx_bytes: 75,
+        cycle_start_utc: 800,
+        cycle_end_utc: 2_000,
+        cycle_rx_bytes: 50,
+        cycle_tx_bytes: 75,
+        previous_day: None,
+        previous_cycle: None,
+        snapshot: crate::snapshot::NodeSnapshot {
+            first_seen_at: 900,
+            last_seen_at: 950,
+            last_ip: "127.0.0.1".parse().expect("IP"),
+            hostname: "rollback".into(),
+            os_name: "Debian".into(),
+            os_version: "13".into(),
+            kernel: "6.12".into(),
+            architecture: "x86_64".into(),
+            virtualization: "qemu".into(),
+            agent_version: "0.1.0".into(),
+            cpu_model: "CPU".into(),
+            cpu_cores: 1,
+            cpu_usage: 1.0,
+            load_1: 0.1,
+            load_5: 0.1,
+            load_15: 0.1,
+            memory_total: 100,
+            memory_used: 50,
+            swap_total: 0,
+            swap_used: 0,
+            disk_total: 100,
+            disk_used: 50,
+            rx_counter_bytes: 150,
+            tx_counter_bytes: 275,
+            rx_rate_bytes_per_sec: 1,
+            tx_rate_bytes_per_sec: 1,
+            uptime_seconds: 10,
+            process_count: 2,
+            boot_id: "boot".into(),
+        },
+    };
+    assert!(persistence::persist_traffic_batch(&mut connection, &[checkpoint], 1_000).is_err());
+    let totals: (i64, i64, Option<i64>) = connection
+        .query_row(
+            "SELECT rx_total_bytes, tx_total_bytes, last_rx_counter_bytes
+             FROM traffic_totals WHERE node_id = ?1",
+            [node.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("traffic totals after rollback");
+    assert_eq!(totals, (0, 0, None));
+    for table in ["traffic_daily", "traffic_cycles", "node_last_state"] {
+        let count: i64 = connection
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE node_id = ?1"),
+                [node.id],
+                |row| row.get(0),
+            )
+            .expect("count rolled back rows");
+        assert_eq!(count, 0, "{table}");
+    }
+}
+
 fn table_names(connection: &Connection) -> Vec<String> {
     let mut statement = connection
         .prepare(

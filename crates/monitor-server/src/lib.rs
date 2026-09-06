@@ -5,6 +5,8 @@ pub mod config;
 pub mod database;
 pub mod http;
 pub mod snapshot;
+pub mod time;
+pub mod traffic;
 
 use std::io;
 
@@ -49,6 +51,7 @@ pub async fn run(config: Config) -> Result<(), ServerError> {
     let database = Database::open(&config.database_path)?;
     let hydration = hydrate_startup(&database).await?;
     let state = AppState::new(database, hydration);
+    tokio::spawn(traffic::run_checkpoint_worker(state.clone()));
 
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await

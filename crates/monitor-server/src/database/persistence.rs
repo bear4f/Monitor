@@ -7,7 +7,7 @@ use super::{
     models::{
         AdminNodeRow, DeletedNodeRow, EnabledPingTargetRow, NewNodeRow, NodeMetaRow, NodePatchRow,
         NodeTokenRow, NodeUpdateResult, RotatedNodeTokenRow, SessionRow, SettingsRow,
-        SqlitePragmas, TrafficRecoveryRow, UpdateNodeResult,
+        SqlitePragmas, TrafficCheckpointRow, TrafficRecoveryRow, UpdateNodeResult,
     },
 };
 
@@ -824,12 +824,30 @@ fn hash_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<[u8; 32]> {
 
 pub(super) fn load_traffic_recovery(
     connection: &Connection,
+    day_start_utc: i64,
+    now: i64,
 ) -> Result<Vec<TrafficRecoveryRow>, DatabaseError> {
     let mut statement = connection
         .prepare(
-            "SELECT node_id, rx_total_bytes, tx_total_bytes,
-                    last_rx_counter_bytes, last_tx_counter_bytes, last_boot_id
-             FROM traffic_totals ORDER BY node_id",
+            "SELECT t.node_id, t.rx_total_bytes, t.tx_total_bytes,
+                    t.last_rx_counter_bytes, t.last_tx_counter_bytes, t.last_boot_id,
+                    ?1, COALESCE(d.rx_bytes, 0), COALESCE(d.tx_bytes, 0),
+                    COALESCE(c.cycle_start_utc, -1), COALESCE(c.cycle_end_utc, -1),
+                    COALESCE(c.rx_bytes, 0), COALESCE(c.tx_bytes, 0)
+             FROM traffic_totals AS t
+             JOIN nodes AS n ON n.id = t.node_id
+             LEFT JOIN traffic_daily AS d
+               ON d.node_id = t.node_id AND d.day_start_utc = ?1
+             LEFT JOIN traffic_cycles AS c
+               ON c.node_id = t.node_id
+              AND c.cycle_start_utc = (
+                  SELECT MAX(c2.cycle_start_utc)
+                  FROM traffic_cycles AS c2
+                  WHERE c2.node_id = t.node_id
+                    AND c2.cycle_start_utc <= ?2
+                    AND c2.cycle_end_utc > ?2
+              )
+             ORDER BY t.node_id",
         )
         .map_err(|source| DatabaseError::Sql {
             operation: "prepare startup traffic recovery query",
@@ -837,7 +855,7 @@ pub(super) fn load_traffic_recovery(
         })?;
 
     let rows = statement
-        .query_map([], |row| {
+        .query_map(params![day_start_utc, now], |row| {
             Ok(TrafficRecoveryRow {
                 node_id: row.get(0)?,
                 rx_total_bytes: row.get(1)?,
@@ -845,6 +863,13 @@ pub(super) fn load_traffic_recovery(
                 last_rx_counter_bytes: row.get(3)?,
                 last_tx_counter_bytes: row.get(4)?,
                 last_boot_id: row.get(5)?,
+                day_start_utc: row.get(6)?,
+                today_rx_bytes: row.get(7)?,
+                today_tx_bytes: row.get(8)?,
+                cycle_start_utc: row.get(9)?,
+                cycle_end_utc: row.get(10)?,
+                cycle_rx_bytes: row.get(11)?,
+                cycle_tx_bytes: row.get(12)?,
             })
         })
         .map_err(|source| DatabaseError::Sql {
@@ -857,6 +882,240 @@ pub(super) fn load_traffic_recovery(
             operation: "read startup traffic recovery state",
             source,
         })
+}
+
+pub(super) fn persist_traffic_batch(
+    connection: &mut Connection,
+    rows: &[TrafficCheckpointRow],
+    persisted_at: i64,
+) -> Result<(), DatabaseError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| DatabaseError::Sql {
+            operation: "begin traffic checkpoint transaction",
+            source,
+        })?;
+
+    for row in rows {
+        let updated = transaction
+            .execute(
+                "INSERT INTO traffic_totals (
+                    node_id, rx_total_bytes, tx_total_bytes, last_rx_counter_bytes,
+                    last_tx_counter_bytes, last_boot_id, updated_at
+                 )
+                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7
+                 WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?1)
+                 ON CONFLICT(node_id) DO UPDATE SET
+                    rx_total_bytes = excluded.rx_total_bytes,
+                    tx_total_bytes = excluded.tx_total_bytes,
+                    last_rx_counter_bytes = excluded.last_rx_counter_bytes,
+                    last_tx_counter_bytes = excluded.last_tx_counter_bytes,
+                    last_boot_id = excluded.last_boot_id,
+                    updated_at = excluded.updated_at",
+                params![
+                    row.node_id,
+                    row.rx_total_bytes,
+                    row.tx_total_bytes,
+                    row.last_rx_counter_bytes,
+                    row.last_tx_counter_bytes,
+                    row.last_boot_id,
+                    persisted_at,
+                ],
+            )
+            .map_err(|source| DatabaseError::Sql {
+                operation: "persist traffic totals",
+                source,
+            })?;
+        if updated == 0 {
+            continue;
+        }
+
+        if let Some(day) = row.previous_day {
+            transaction
+                .execute(
+                    "INSERT INTO traffic_daily
+                        (node_id, day_start_utc, rx_bytes, tx_bytes, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(node_id, day_start_utc) DO UPDATE SET
+                        rx_bytes = excluded.rx_bytes,
+                        tx_bytes = excluded.tx_bytes,
+                        updated_at = excluded.updated_at",
+                    params![
+                        row.node_id,
+                        day.day_start_utc,
+                        day.rx_bytes,
+                        day.tx_bytes,
+                        persisted_at,
+                    ],
+                )
+                .map_err(|source| DatabaseError::Sql {
+                    operation: "persist previous daily traffic",
+                    source,
+                })?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO traffic_daily
+                    (node_id, day_start_utc, rx_bytes, tx_bytes, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(node_id, day_start_utc) DO UPDATE SET
+                    rx_bytes = excluded.rx_bytes,
+                    tx_bytes = excluded.tx_bytes,
+                    updated_at = excluded.updated_at",
+                params![
+                    row.node_id,
+                    row.day_start_utc,
+                    row.today_rx_bytes,
+                    row.today_tx_bytes,
+                    persisted_at,
+                ],
+            )
+            .map_err(|source| DatabaseError::Sql {
+                operation: "persist daily traffic",
+                source,
+            })?;
+        if let Some(cycle) = row.previous_cycle {
+            transaction
+                .execute(
+                    "INSERT INTO traffic_cycles
+                        (node_id, cycle_start_utc, cycle_end_utc, rx_bytes, tx_bytes, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(node_id, cycle_start_utc) DO UPDATE SET
+                        cycle_end_utc = excluded.cycle_end_utc,
+                        rx_bytes = excluded.rx_bytes,
+                        tx_bytes = excluded.tx_bytes,
+                        updated_at = excluded.updated_at",
+                    params![
+                        row.node_id,
+                        cycle.cycle_start_utc,
+                        cycle.cycle_end_utc,
+                        cycle.rx_bytes,
+                        cycle.tx_bytes,
+                        persisted_at,
+                    ],
+                )
+                .map_err(|source| DatabaseError::Sql {
+                    operation: "persist previous billing-cycle traffic",
+                    source,
+                })?;
+        }
+        transaction
+            .execute(
+                "INSERT INTO traffic_cycles
+                    (node_id, cycle_start_utc, cycle_end_utc, rx_bytes, tx_bytes, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(node_id, cycle_start_utc) DO UPDATE SET
+                    cycle_end_utc = excluded.cycle_end_utc,
+                    rx_bytes = excluded.rx_bytes,
+                    tx_bytes = excluded.tx_bytes,
+                    updated_at = excluded.updated_at",
+                params![
+                    row.node_id,
+                    row.cycle_start_utc,
+                    row.cycle_end_utc,
+                    row.cycle_rx_bytes,
+                    row.cycle_tx_bytes,
+                    persisted_at,
+                ],
+            )
+            .map_err(|source| DatabaseError::Sql {
+                operation: "persist billing-cycle traffic",
+                source,
+            })?;
+
+        let snapshot = &row.snapshot;
+        let state_persisted_at = persisted_at.max(snapshot.last_seen_at);
+        transaction
+            .execute(
+                "INSERT INTO node_last_state (
+                    node_id, hostname, os_name, os_version, kernel, architecture,
+                    cpu_model, cpu_cores, virtualization, agent_version, boot_id,
+                    cpu_usage_bp, load_1_milli, load_5_milli, load_15_milli,
+                    memory_total_bytes, memory_used_bytes, swap_total_bytes,
+                    swap_used_bytes, disk_total_bytes, disk_used_bytes,
+                    rx_rate_bytes_per_sec, tx_rate_bytes_per_sec, uptime_seconds,
+                    process_count, last_ip, last_seen_at, persisted_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                    ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
+                    ?25, ?26, ?27, ?28
+                 ) ON CONFLICT(node_id) DO UPDATE SET
+                    hostname = excluded.hostname, os_name = excluded.os_name,
+                    os_version = excluded.os_version, kernel = excluded.kernel,
+                    architecture = excluded.architecture, cpu_model = excluded.cpu_model,
+                    cpu_cores = excluded.cpu_cores, virtualization = excluded.virtualization,
+                    agent_version = excluded.agent_version, boot_id = excluded.boot_id,
+                    cpu_usage_bp = excluded.cpu_usage_bp,
+                    load_1_milli = excluded.load_1_milli,
+                    load_5_milli = excluded.load_5_milli,
+                    load_15_milli = excluded.load_15_milli,
+                    memory_total_bytes = excluded.memory_total_bytes,
+                    memory_used_bytes = excluded.memory_used_bytes,
+                    swap_total_bytes = excluded.swap_total_bytes,
+                    swap_used_bytes = excluded.swap_used_bytes,
+                    disk_total_bytes = excluded.disk_total_bytes,
+                    disk_used_bytes = excluded.disk_used_bytes,
+                    rx_rate_bytes_per_sec = excluded.rx_rate_bytes_per_sec,
+                    tx_rate_bytes_per_sec = excluded.tx_rate_bytes_per_sec,
+                    uptime_seconds = excluded.uptime_seconds,
+                    process_count = excluded.process_count,
+                    last_ip = excluded.last_ip, last_seen_at = excluded.last_seen_at,
+                    persisted_at = excluded.persisted_at",
+                params![
+                    row.node_id,
+                    snapshot.hostname,
+                    snapshot.os_name,
+                    snapshot.os_version,
+                    snapshot.kernel,
+                    snapshot.architecture,
+                    snapshot.cpu_model,
+                    snapshot.cpu_cores,
+                    snapshot.virtualization,
+                    snapshot.agent_version,
+                    snapshot.boot_id,
+                    scaled_metric(snapshot.cpu_usage, 100.0),
+                    scaled_metric(snapshot.load_1, 1_000.0),
+                    scaled_metric(snapshot.load_5, 1_000.0),
+                    scaled_metric(snapshot.load_15, 1_000.0),
+                    snapshot.memory_total,
+                    snapshot.memory_used,
+                    snapshot.swap_total,
+                    snapshot.swap_used,
+                    snapshot.disk_total,
+                    snapshot.disk_used,
+                    snapshot.rx_rate_bytes_per_sec,
+                    snapshot.tx_rate_bytes_per_sec,
+                    snapshot.uptime_seconds,
+                    snapshot.process_count,
+                    snapshot.last_ip.to_string(),
+                    snapshot.last_seen_at,
+                    state_persisted_at,
+                ],
+            )
+            .map_err(|source| DatabaseError::Sql {
+                operation: "persist node last state",
+                source,
+            })?;
+        transaction
+            .execute(
+                "UPDATE nodes SET first_seen_at = ?2
+                 WHERE id = ?1 AND first_seen_at IS NULL",
+                params![row.node_id, snapshot.first_seen_at],
+            )
+            .map_err(|source| DatabaseError::Sql {
+                operation: "persist node first seen time",
+                source,
+            })?;
+    }
+
+    transaction.commit().map_err(|source| DatabaseError::Sql {
+        operation: "commit traffic checkpoint transaction",
+        source,
+    })
+}
+
+fn scaled_metric(value: f64, scale: f64) -> i64 {
+    (value * scale).round() as i64
 }
 
 pub(super) fn read_pragmas(connection: &Connection) -> Result<SqlitePragmas, DatabaseError> {

@@ -11,6 +11,8 @@ use crate::{
     app::{AgentConfig, AppState},
     auth::{decode_hex, sha256, unix_timestamp},
     snapshot::NodeSnapshot,
+    time,
+    traffic::TrafficSample,
 };
 
 use super::auth::{ApiError, json_response, no_content_response, parse_json};
@@ -135,34 +137,61 @@ pub(super) async fn report(
     }
     let received_at = unix_timestamp().map_err(|_| ApiError::internal())?;
 
-    let _lifecycle_guard = state.node_lifecycle_gate.read().await;
-    let still_authenticated = state
-        .node_tokens
-        .read()
-        .await
-        .get(&identity.token_hash)
-        .copied()
-        == Some(identity.node_id);
-    if !still_authenticated {
-        return Err(ApiError::unauthorized());
+    let wake_checkpoint = {
+        let _lifecycle_guard = state.node_lifecycle_gate.read().await;
+        let still_authenticated = state
+            .node_tokens
+            .read()
+            .await
+            .get(&identity.token_hash)
+            .copied()
+            == Some(identity.node_id);
+        if !still_authenticated {
+            return Err(ApiError::unauthorized());
+        }
+        let node = state
+            .node_metadata
+            .read()
+            .await
+            .get(&identity.node_id)
+            .cloned()
+            .ok_or_else(ApiError::unauthorized)?;
+        let timezone = state.settings.read().await.site_timezone.clone();
+        let day_start_utc = time::day_start_utc(received_at, &timezone).map_err(|error| {
+            tracing::error!(timezone, error = %error, "site day start calculation failed");
+            ApiError::internal()
+        })?;
+        let billing_cycle = time::billing_cycle(received_at, &timezone, node.traffic_reset_day)
+            .map_err(|error| {
+                tracing::error!(timezone, error = %error, "billing cycle calculation failed");
+                ApiError::internal()
+            })?;
+        let mut snapshots = state.snapshots.write().await;
+        let first_seen_at = snapshots
+            .get(&identity.node_id)
+            .map(|snapshot| snapshot.first_seen_at)
+            .or(node.first_seen_at)
+            .unwrap_or(received_at);
+        let snapshot = report.into_snapshot(first_seen_at, received_at, source_ip);
+        let update = state
+            .traffic
+            .update(
+                identity.node_id,
+                TrafficSample {
+                    rx_counter_bytes: snapshot.rx_counter_bytes,
+                    tx_counter_bytes: snapshot.tx_counter_bytes,
+                    boot_id: &snapshot.boot_id,
+                    day_start_utc,
+                    billing_cycle,
+                },
+            )
+            .map_err(|_| ApiError::invalid_request())?;
+        snapshots.insert(identity.node_id, snapshot);
+        update.wake_checkpoint
+    };
+    if wake_checkpoint {
+        state.traffic_flush.notify_one();
     }
-    let persisted_first_seen = state
-        .node_metadata
-        .read()
-        .await
-        .get(&identity.node_id)
-        .and_then(|node| node.first_seen_at);
-    let mut snapshots = state.snapshots.write().await;
-    let first_seen_at = snapshots
-        .get(&identity.node_id)
-        .map(|snapshot| snapshot.first_seen_at)
-        .or(persisted_first_seen)
-        .unwrap_or(received_at);
-    snapshots.insert(
-        identity.node_id,
-        report.into_snapshot(first_seen_at, received_at, source_ip),
-    );
-    drop(snapshots);
 
     Ok(no_content_response())
 }
@@ -293,7 +322,7 @@ fn valid_finite_range(value: f64, minimum: f64, maximum: f64) -> bool {
 }
 
 fn valid_nonnegative_float(value: f64) -> bool {
-    value.is_finite() && value >= 0.0
+    value.is_finite() && (0.0..=(JS_SAFE_INTEGER_MAX as f64 / 1_000.0)).contains(&value)
 }
 
 fn valid_safe_integer(value: i64) -> bool {
@@ -575,6 +604,27 @@ mod tests {
                 .await
                 .contains_key(&context.node_id)
         );
+        let mut next = valid_report();
+        next["network"]["rx_bytes"] = json!(150);
+        next["network"]["tx_bytes"] = json!(260);
+        assert_eq!(
+            response(
+                report(
+                    State(context.state.clone()),
+                    ConnectInfo(loopback_peer()),
+                    context.report_request(&next.to_string()),
+                )
+                .await
+            )
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let traffic = context
+            .state
+            .traffic
+            .get(context.node_id)
+            .expect("traffic without database worker");
+        assert_eq!((traffic.rx_total_bytes, traffic.tx_total_bytes), (50, 60));
 
         let path = context.path.clone();
         drop(context);
@@ -902,6 +952,7 @@ mod tests {
                 .await
                 .contains_key(&context.node_id)
         );
+        assert!(context.state.traffic.get(context.node_id).is_none());
         assert_eq!(
             send_valid_report(&context, &context.token).await,
             StatusCode::UNAUTHORIZED
