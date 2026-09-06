@@ -1,6 +1,7 @@
 mod agent;
 mod auth;
 mod nodes;
+pub(crate) mod public;
 
 use axum::{
     Router,
@@ -16,6 +17,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/auth/me", get(auth::me))
         .route("/api/agent/config", get(agent::config))
         .route("/api/agent/report", post(agent::report))
+        .route("/api/public/snapshot", get(public::snapshot))
         .route("/api/admin/password", patch(auth::change_password))
         .route("/api/admin/nodes", get(nodes::list).post(nodes::create))
         .route(

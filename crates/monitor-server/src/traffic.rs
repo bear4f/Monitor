@@ -54,6 +54,18 @@ pub struct TrafficUpdate {
     pub wake_checkpoint: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicTrafficState {
+    pub rx_total_bytes: i64,
+    pub tx_total_bytes: i64,
+    pub today_rx_bytes: i64,
+    pub today_tx_bytes: i64,
+    pub cycle_start_utc: i64,
+    pub cycle_end_utc: i64,
+    pub cycle_rx_bytes: i64,
+    pub cycle_tx_bytes: i64,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TrafficCheckpointAck {
     node_id: i64,
@@ -228,6 +240,27 @@ impl TrafficState {
                     previous_cycle: state.previous_cycle,
                     snapshot,
                 })
+            })
+            .collect()
+    }
+
+    pub fn read_current(&self) -> HashMap<i64, PublicTrafficState> {
+        self.lock()
+            .iter()
+            .map(|(node_id, state)| {
+                (
+                    *node_id,
+                    PublicTrafficState {
+                        rx_total_bytes: state.rx_total_bytes,
+                        tx_total_bytes: state.tx_total_bytes,
+                        today_rx_bytes: state.today_rx_bytes,
+                        today_tx_bytes: state.today_tx_bytes,
+                        cycle_start_utc: state.cycle_start_utc,
+                        cycle_end_utc: state.cycle_end_utc,
+                        cycle_rx_bytes: state.cycle_rx_bytes,
+                        cycle_tx_bytes: state.cycle_tx_bytes,
+                    },
+                )
             })
             .collect()
     }
