@@ -104,6 +104,24 @@ describe("admin pure helpers", () => {
     expect(validateTimezoneInput(" ")).toBe(false);
     expect(validateTimezoneInput("x".repeat(65))).toBe(false);
   });
+  it("uses Unicode character counts for bounded text fields", () => {
+    expect(parseSettingsForm({
+      ...settingsToForm(settings),
+      site_name: "😀".repeat(64),
+    }).ok).toBe(true);
+    expect(parseSettingsForm({
+      ...settingsToForm(settings),
+      site_name: "😀".repeat(65),
+    }).ok).toBe(false);
+    expect(() => parsePingTarget({
+      id: 1,
+      name: "😀".repeat(65),
+      host: "example.com",
+      ip_family: 4,
+      enabled: true,
+      sort_order: 0,
+    })).toThrow();
+  });
   it("preserves API error codes and password byte rules", () => {
     expect(parseApiError({ error: { code: "invalid_credentials", message: "bad" } })).toEqual({ code: "invalid_credentials", message: "bad" });
     expect(parseApiError({ error: { code: 1, message: "bad" } })).toBeNull();

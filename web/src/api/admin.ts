@@ -245,6 +245,9 @@ function isCode(value: unknown, length: number): value is string {
     typeof value === "string" && new RegExp(`^[A-Z]{${length}}$`).test(value)
   );
 }
+function characterLength(value: string): number {
+  return Array.from(value).length;
+}
 function isRenewal(value: unknown): value is RenewalCycle {
   return (
     typeof value === "string" &&
@@ -344,11 +347,11 @@ export function parsePingTarget(value: unknown): PingTarget {
   if (
     !isSafeInt(item.id, true) ||
     typeof item.name !== "string" ||
-    item.name.length < 1 ||
-    item.name.length > 64 ||
+    characterLength(item.name) < 1 ||
+    characterLength(item.name) > 64 ||
     typeof item.host !== "string" ||
-    item.host.length < 1 ||
-    item.host.length > 253 ||
+    characterLength(item.host) < 1 ||
+    characterLength(item.host) > 253 ||
     (item.ip_family !== 4 && item.ip_family !== 6) ||
     typeof item.enabled !== "boolean" ||
     !isSafeInt(item.sort_order)
@@ -376,8 +379,8 @@ export function parseAdminSettings(value: unknown): AdminSettings {
   const siteName = typeof item.site_name === "string" ? item.site_name.trim() : "";
   const timezone = typeof item.site_timezone === "string" ? item.site_timezone.trim() : "";
   if (
-    siteName.length < 1 || siteName.length > 64 ||
-    timezone.length < 1 || timezone.length > 64 ||
+    characterLength(siteName) < 1 || characterLength(siteName) > 64 ||
+    characterLength(timezone) < 1 || characterLength(timezone) > 64 ||
     !(["light", "dark", "system"] as string[]).includes(String(item.theme_default)) ||
     !isBoundedInteger(item.history_retention_days, 1, 30) ||
     !isBoundedInteger(item.agent_report_interval_seconds, 2, 60) ||
@@ -423,14 +426,14 @@ export function settingsToForm(settings: AdminSettings): SettingsForm {
 }
 export function validateTimezoneInput(value: string): boolean {
   const trimmed = value.trim();
-  return trimmed.length >= 1 && trimmed.length <= 64;
+  return characterLength(trimmed) >= 1 && characterLength(trimmed) <= 64;
 }
 export function parseSettingsForm(form: SettingsForm):
   | { ok: true; value: EditableSettings }
   | { ok: false; error: string } {
   const siteName = form.site_name.trim();
   const timezone = form.site_timezone.trim();
-  if (siteName.length < 1 || siteName.length > 64) return { ok: false, error: "请输入有效的站点名称" };
+  if (characterLength(siteName) < 1 || characterLength(siteName) > 64) return { ok: false, error: "请输入有效的站点名称" };
   if (!validateTimezoneInput(timezone)) return { ok: false, error: "请输入有效的站点时区" };
   const history = parseBoundedInteger(form.history_retention_days, 1, 30);
   const report = parseBoundedInteger(form.agent_report_interval_seconds, 2, 60);

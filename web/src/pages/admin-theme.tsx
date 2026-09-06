@@ -22,6 +22,7 @@ export function AdminThemePage() {
       .then((value) => {
         setSettings(value);
         setTheme(value.theme_default);
+        setError(null);
       })
       .catch((caught) => setError(handleAdminError(caught)))
       .finally(() => setLoading(false));

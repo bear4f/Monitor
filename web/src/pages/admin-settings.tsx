@@ -39,7 +39,7 @@ export function AdminSettingsPage() {
 
   useEffect(() => {
     void getSettings()
-      .then((value) => { setSettings(value); setForm(settingsToForm(value)); })
+      .then((value) => { setSettings(value); setForm(settingsToForm(value)); setError(null); })
       .catch((caught) => setError(handleAdminError(caught)))
       .finally(() => setLoading(false));
   }, [attempt]);
