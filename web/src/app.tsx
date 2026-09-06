@@ -1,14 +1,22 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useEffect } from "react";
 import { usePublicSnapshot } from "./stores/public-snapshot";
 import { PublicHeader } from "./components/public-header";
 import { OverviewPage } from "./pages/overview";
 import { navigate, useRoute } from "./router";
+import { useAdminSession } from "./stores/auth";
 
 const NodeDetailPage = lazy(() => import("./pages/node-detail").then((module) => ({ default: module.NodeDetailPage })));
+const LoginPage = lazy(() => import("./pages/login").then((module) => ({ default: module.LoginPage })));
+const AdminNodesPage = lazy(() => import("./pages/admin-nodes").then((module) => ({ default: module.AdminNodesPage })));
+const AdminShell = lazy(() => import("./components/admin-shell").then((module) => ({ default: module.AdminShell })));
 
 export function App() {
   const route = useRoute();
   const snapshotState = usePublicSnapshot();
+  const auth = useAdminSession();
+
+  if (route.page === "login") return <Suspense fallback={<DetailLoading />}><LoginPage /></Suspense>;
+  if (route.page === "admin-nodes" || route.page === "admin-disabled") return <AdminGate auth={auth} page={route.page} />;
 
   return (
     <div className="app-shell">
@@ -27,6 +35,12 @@ export function App() {
       )}
     </div>
   );
+}
+
+function AdminGate({ auth, page }: { auth: ReturnType<typeof useAdminSession>; page: "admin-nodes" | "admin-disabled" }) {
+  useEffect(() => { if (auth === "unauthenticated") navigate("/login"); }, [auth]);
+  if (auth === "unknown" || auth === "unauthenticated") return <DetailLoading />;
+  return <Suspense fallback={<DetailLoading />}><AdminShell>{page === "admin-nodes" ? <AdminNodesPage /> : <main className="admin-disabled-page">此页面将在下一阶段实现</main>}</AdminShell></Suspense>;
 }
 
 function DetailLoading() {
