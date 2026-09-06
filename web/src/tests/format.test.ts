@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clampProgress, formatBytes, formatExpiry, formatRate, formatUptime } from "../lib/format";
+import { clampProgress, formatBytePair, formatBytes, formatExpiry, formatRate, formatUptime } from "../lib/format";
 
 describe("formatBytes", () => {
   it("uses IEC scaling with compact UI suffixes", () => {
@@ -8,6 +8,12 @@ describe("formatBytes", () => {
     expect(formatBytes(1.5 * 1024 ** 2)).toBe("1.5 MB");
     expect(formatBytes(1.234 * 1024 ** 3)).toBe("1.23 GB");
   });
+});
+
+it("shares a unit for compact capacity pairs", () => {
+  expect(formatBytePair(256 * 1024 ** 2, 1024 ** 3)).toBe("256 MB / 1 GB");
+  expect(formatBytePair(1.5 * 1024 ** 3, 20 * 1024 ** 3)).toBe("1.5 / 20 GB");
+  expect(formatBytePair(0, 1024 ** 3)).toBe("0 B / 1 GB");
 });
 
 it("formats byte rates", () => {

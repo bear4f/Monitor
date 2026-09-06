@@ -5,12 +5,25 @@ function trimDecimals(value: number, maximumFractionDigits = 2): string {
   return value.toFixed(maximumFractionDigits).replace(/\.?0+$/, "");
 }
 
+function byteUnitIndex(bytes: number): number {
+  return Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), BYTE_UNITS.length - 1);
+}
+
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return "—";
   if (bytes === 0) return "0 B";
 
-  const unitIndex = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), BYTE_UNITS.length - 1);
+  const unitIndex = byteUnitIndex(bytes);
   return `${trimDecimals(bytes / 1024 ** unitIndex)} ${BYTE_UNITS[unitIndex]}`;
+}
+
+export function formatBytePair(used: number, total: number): string {
+  if (!Number.isFinite(used) || !Number.isFinite(total) || used < 0 || total < 0) return "—";
+  if (used > 0 && total > 0 && byteUnitIndex(used) === byteUnitIndex(total)) {
+    const unitIndex = byteUnitIndex(total);
+    return `${trimDecimals(used / 1024 ** unitIndex)} / ${trimDecimals(total / 1024 ** unitIndex)} ${BYTE_UNITS[unitIndex]}`;
+  }
+  return `${formatBytes(used)} / ${formatBytes(total)}`;
 }
 
 export function formatRate(bytesPerSecond: number): string {

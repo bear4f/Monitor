@@ -1,9 +1,15 @@
-export function sparklinePoints(values: readonly number[], width: number, height: number, padding = 2): string {
+export function sparklinePoints(
+  values: readonly number[],
+  width: number,
+  height: number,
+  padding = 2,
+  domain?: readonly [number, number],
+): string {
   const finiteValues = values.filter(Number.isFinite);
   if (finiteValues.length === 0 || width <= padding * 2 || height <= padding * 2) return "";
 
-  const minimum = Math.min(...finiteValues);
-  const maximum = Math.max(...finiteValues);
+  const minimum = domain?.[0] ?? Math.min(...finiteValues);
+  const maximum = domain?.[1] ?? Math.max(...finiteValues);
   const range = maximum - minimum;
   const horizontalStep = finiteValues.length === 1 ? 0 : (width - padding * 2) / (finiteValues.length - 1);
 

@@ -11,8 +11,10 @@ interface SummaryCardsProps {
 export function SummaryCards({ summary }: SummaryCardsProps) {
   const offline = Math.max(0, summary.total_nodes - summary.online_nodes);
   const history = summary.network_rate_history;
-  const rxPoints = sparklinePoints(history.rx, 420, 42);
-  const txPoints = sparklinePoints(history.tx, 420, 42);
+  const rateMaximum = Math.max(1, ...history.rx, ...history.tx);
+  const rateDomain = [0, rateMaximum] as const;
+  const rxPoints = sparklinePoints(history.rx, 420, 42, 2, rateDomain);
+  const txPoints = sparklinePoints(history.tx, 420, 42, 2, rateDomain);
 
   return (
     <section className="summary-grid" aria-label="全站摘要">

@@ -9,6 +9,7 @@ mod maintenance;
 mod ping_target;
 pub mod public_snapshot;
 pub mod snapshot;
+mod static_files;
 pub mod time;
 pub mod traffic;
 

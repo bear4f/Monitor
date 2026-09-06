@@ -16,3 +16,7 @@ it("centers a constant sequence without division by zero", () => {
 it("maps a varying sequence into the plot", () => {
   expect(sparklinePoints([0, 5, 10], 100, 20)).toBe("2.00,18.00 50.00,10.00 98.00,2.00");
 });
+
+it("uses a shared domain so two rate series remain comparable", () => {
+  expect(sparklinePoints([0, 5], 100, 20, 2, [0, 10])).toBe("2.00,18.00 98.00,10.00");
+});

@@ -27,7 +27,6 @@ function readStoredTheme(): ThemePreference | null {
 
 function applyTheme(theme: "light" | "dark"): void {
   document.documentElement.dataset.theme = theme;
-  document.documentElement.style.colorScheme = theme;
 }
 
 export function useTheme(serverDefault: ThemePreference = "system") {

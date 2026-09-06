@@ -12,7 +12,7 @@ use axum::{
     routing::{get, patch, post},
 };
 
-use crate::app::AppState;
+use crate::{app::AppState, static_files};
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -47,4 +47,5 @@ pub fn router(state: AppState) -> Router {
             post(nodes::rotate_token),
         )
         .with_state(state)
+        .fallback(static_files::serve)
 }

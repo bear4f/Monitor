@@ -2,6 +2,7 @@ import { ArrowDown, ArrowUp } from "lucide-react";
 import type { PublicNode } from "../api/public";
 import {
   clampProgress,
+  formatBytePair,
   formatBytes,
   formatCpu,
   formatExpiry,
@@ -56,13 +57,13 @@ export function NodeCard({ node, generatedAt }: { node: PublicNode; generatedAt:
           label="内存"
           value={metrics ? formatPercent(memoryPercent) : "—"}
           progress={metrics ? memoryPercent : null}
-          detail={metrics ? `${formatBytes(metrics.memory_used)} / ${formatBytes(metrics.memory_total)}` : "—"}
+          detail={metrics ? formatBytePair(metrics.memory_used, metrics.memory_total) : "—"}
         />
         <Metric
           label="硬盘"
           value={metrics ? formatPercent(diskPercent) : "—"}
           progress={metrics ? diskPercent : null}
-          detail={metrics ? `${formatBytes(metrics.disk_used)} / ${formatBytes(metrics.disk_total)}` : "—"}
+          detail={metrics ? formatBytePair(metrics.disk_used, metrics.disk_total) : "—"}
         />
         <Metric
           label="流量"
@@ -87,16 +88,20 @@ function Metric({ label, value, progress, detail }: { label: string; value: stri
   return (
     <div className="metric">
       <div className="metric-heading"><span>{label}</span><strong>{value}</strong></div>
-      <div
+      <svg
         className="progress-track"
+        viewBox="0 0 100 8"
+        preserveAspectRatio="none"
         role={progressValue === null ? undefined : "progressbar"}
+        aria-hidden={progressValue === null ? "true" : undefined}
         aria-label={progressValue === null ? undefined : label}
         aria-valuemin={progressValue === null ? undefined : 0}
         aria-valuemax={progressValue === null ? undefined : 100}
         aria-valuenow={progressValue === null ? undefined : Math.round(progressValue)}
       >
-        {progressValue !== null && <span style={{ width: `${progressValue}%` }} />}
-      </div>
+        <rect className="progress-track-base" width="100" height="8" rx="4" />
+        {progressValue !== null && <rect className="progress-track-value" width={progressValue} height="8" rx="4" />}
+      </svg>
       <div className="metric-detail" title={detail}>{detail}</div>
     </div>
   );
