@@ -37,12 +37,12 @@ Monitor/
 ├── Cargo.toml
 ├── Cargo.lock
 ├── crates/
-│   ├── protocol/          # 仅共享 JSON DTO、枚举和边界常量
-│   ├── server/            # monitor-server
-│   │   ├── migrations/
+│   ├── monitor-common/    # 仅共享两个 Rust binary 实际共用的类型
+│   ├── monitor-server/
 │   │   └── src/
-│   └── agent/             # monitor-agent
+│   └── monitor-agent/     # Phase 3 增加
 │       └── src/linux/
+├── migrations/
 ├── web/                   # React/Vite/Tailwind
 │   └── src/
 ├── docs/reference/        # 权威截图
@@ -59,7 +59,7 @@ Monitor/
 └── README.md
 ```
 
-`protocol` 不是通用 SDK，只放 Server 和 Agent 必须共享的 report/config wire types，避免协议字段漂移。数据库 row、前端 view model 和业务 service 不放入该 crate。
+`monitor-common` 不是通用 SDK；只有 Server 和 Agent 确实共同使用的 wire types 才放入。数据库 row、前端 view model 和业务 service 不放入该 crate。Phase 2A 尚无跨 binary 类型，因此该 crate 不提前加入 DTO 或依赖。
 
 ## 4. Rust 模块
 
@@ -116,7 +116,7 @@ Linux parser 接受字符串/reader 输入，便于用固定 fixture 单元测�
 
 `AppState` 只持有以下长期对象：
 
-- `Db`：一个受互斥保护的 rusqlite connection；所有 SQLite 工作进入 `spawn_blocking`，不阻塞 Tokio reactor。
+- `Db`：专用 database worker thread 独占一个 rusqlite connection；Tokio 侧通过有界 channel 提交具体数据库操作并异步等待结果。
 - `NodeTokenCache`：`SHA-256(token) -> node_id`，启动时一次装载，Node 创建/删除/token 轮换时同步更新。
 - `NodeMetaCache`：公开页面需要的节点配置；只在后台 mutation 后更新。
 - `SnapshotStore`：`RwLock<HashMap<NodeId, NodeSnapshot>>`，每次 report 做短临界区更新。
@@ -132,11 +132,13 @@ Linux parser 接受字符串/reader 输入，便于用固定 fixture 单元测�
 
 ## 6. Tokio 与 SQLite
 
-- Axum 运行在固定 2 个 Tokio worker thread 上；数据库操作使用 Tokio blocking pool。
-- rusqlite connection 由 `Arc<Mutex<Connection>>` 包装。后台/管理写入量低，单连接避免连接池、写锁争用和额外内存。
+- Axum 运行在 Tokio runtime 上；SQLite 操作不占用 runtime worker。
+- rusqlite connection 只存在于一个专用 OS thread。一个容量受限的 Tokio channel 接收具体持久化命令，oneshot 返回结果；不引入连接池、通用 executor abstraction 或 `Arc<Mutex<Connection>>`。
 - handler 不跨 await 持有数据库或 snapshot 锁。
 - 数据库函数一次完成完整查询或事务；尤其 `GET /api/admin/nodes` 必须用一个 JOIN 查询取回节点、最后状态、总流量、今日与当前周期数据。
 - Agent report 热路径不触发 SQLite。token 校验、snapshot、traffic delta 和分钟聚合都在内存完成。
+
+Phase 2A 的启动顺序固定为：worker 打开 connection、集中设置 PRAGMA、事务执行 migration、确保默认 settings；随后 Tokio 侧依次读取 settings、node metadata、traffic recovery state 并构造 `AppState`，最后才 bind/serve HTTP。未来同时修改 SQLite 与 cache 的操作必须先 commit transaction，再更新 cache。
 
 如果数据库暂时写失败，当前 snapshot 仍继续服务；writer 保留未提交 traffic delta 并退避重试。认证/后台 mutation 的数据库失败直接返回 503，不能假装成功。
 
