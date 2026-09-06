@@ -1,12 +1,15 @@
 import "uplot/dist/uPlot.min.css";
 import "./node-detail.css";
 
+import { useState } from "react";
 import type { PublicNode, RenewalCycle } from "../api/public";
+import { PingChart } from "../components/ping-chart";
 import { ResourceChart } from "../components/resource-chart";
 import {
   chartData,
+  detailLocation,
   HISTORY_RANGES,
-  historyLocation,
+  parseDetailTab,
   parseHistoryRange,
 } from "../lib/history";
 import {
@@ -16,6 +19,7 @@ import {
   formatUptime,
 } from "../lib/format";
 import { navigate } from "../router";
+import { usePingHistory } from "../stores/ping-history";
 import type { PublicSnapshotState } from "../stores/public-snapshot";
 import { useResourceHistory } from "../stores/resource-history";
 import { Badge } from "../ui/primitives";
@@ -33,15 +37,19 @@ const CYCLE_LABELS: Record<NonNullable<RenewalCycle>, string> = {
 export function NodeDetailPage({ nodeId, snapshotState }: { nodeId: string; snapshotState: PublicSnapshotState }) {
   const snapshot = snapshotState.snapshot;
   const node = snapshot?.nodes.find((item) => item.id === nodeId) ?? null;
+  const tab = parseDetailTab(window.location.search);
   const range = parseHistoryRange(window.location.search);
   const mockMode = import.meta.env.DEV && new URLSearchParams(window.location.search).get("mock") === "1";
-  const history = useResourceHistory(nodeId, range, snapshot !== null && node !== null, mockMode);
+  const enabled = snapshot !== null && node !== null;
+  const resourceHistory = useResourceHistory(nodeId, range, enabled && tab === "resources", mockMode);
+  const pingHistory = usePingHistory(nodeId, range, enabled && tab === "latency", mockMode);
+  const [cutPeak, setCutPeak] = useState(false);
 
   if (!snapshot) return <DetailSkeleton />;
-  if (!node || history.notFound) return <DetailNotFound />;
+  if (!node || resourceHistory.notFound || pingHistory.notFound) return <DetailNotFound />;
 
   const metrics = node.metrics;
-  const data = history.history;
+  const data = resourceHistory.history;
   return (
     <main className="public-container node-detail-main">
       {snapshotState.stale && <div className="snapshot-notice" role="status">数据更新暂时中断，正在显示最近状态</div>}
@@ -50,34 +58,62 @@ export function NodeDetailPage({ nodeId, snapshotState }: { nodeId: string; snap
 
       <div className="detail-controls">
         <div className="detail-tabs" role="tablist" aria-label="节点详情">
-          <button className="detail-tab detail-tab-active" type="button" role="tab" aria-selected="true">资源</button>
-          <button className="detail-tab" type="button" role="tab" aria-selected="false" aria-disabled="true" disabled>网络延迟</button>
+          <button
+            className={`detail-tab${tab === "resources" ? " detail-tab-active" : ""}`}
+            type="button"
+            role="tab"
+            aria-selected={tab === "resources"}
+            onClick={() => navigate(detailLocation(nodeId, "resources", range, mockMode))}
+          >
+            资源
+          </button>
+          <button
+            className={`detail-tab${tab === "latency" ? " detail-tab-active" : ""}`}
+            type="button"
+            role="tab"
+            aria-selected={tab === "latency"}
+            onClick={() => navigate(detailLocation(nodeId, "latency", range, mockMode))}
+          >
+            网络延迟
+          </button>
         </div>
-        <div className="detail-ranges" aria-label="历史范围">
-          {HISTORY_RANGES.map((item) => (
-            <button
-              className={`detail-range${range === item ? " detail-range-active" : ""}`}
-              type="button"
-              aria-pressed={range === item}
-              key={item}
-              onClick={() => navigate(historyLocation(nodeId, item, mockMode))}
-            >
-              {RANGE_LABELS[item]}
-            </button>
-          ))}
+        <div className="detail-range-row">
+          <div className="detail-ranges" aria-label="历史范围">
+            {HISTORY_RANGES.map((item) => (
+              <button
+                className={`detail-range${range === item ? " detail-range-active" : ""}`}
+                type="button"
+                aria-pressed={range === item}
+                key={item}
+                onClick={() => navigate(detailLocation(nodeId, tab, item, mockMode))}
+              >
+                {RANGE_LABELS[item]}
+              </button>
+            ))}
+          </div>
+          {tab === "latency" && (
+            <label className="detail-cut-peak">
+              <input
+                type="checkbox"
+                checked={cutPeak}
+                onChange={(event) => setCutPeak(event.currentTarget.checked)}
+              />
+              <span>削峰</span>
+            </label>
+          )}
         </div>
       </div>
 
-      <div className="resource-charts">
+      {tab === "resources" ? <div className="resource-charts">
         <ResourceChart
           kind="cpu"
           title="CPU"
           nodeName={node.name}
           range={range}
           data={data ? chartData(data, "cpu") : null}
-          loading={history.loading}
-          error={history.error}
-          onRetry={history.retry}
+          loading={resourceHistory.loading}
+          error={resourceHistory.error}
+          onRetry={resourceHistory.retry}
         />
         <ResourceChart
           kind="memory"
@@ -86,9 +122,9 @@ export function NodeDetailPage({ nodeId, snapshotState }: { nodeId: string; snap
           range={range}
           data={data ? chartData(data, "memory") : null}
           total={metrics?.memory_total}
-          loading={history.loading}
-          error={history.error}
-          onRetry={history.retry}
+          loading={resourceHistory.loading}
+          error={resourceHistory.error}
+          onRetry={resourceHistory.retry}
         />
         <ResourceChart
           kind="network"
@@ -96,9 +132,9 @@ export function NodeDetailPage({ nodeId, snapshotState }: { nodeId: string; snap
           nodeName={node.name}
           range={range}
           data={data ? chartData(data, "network") : null}
-          loading={history.loading}
-          error={history.error}
-          onRetry={history.retry}
+          loading={resourceHistory.loading}
+          error={resourceHistory.error}
+          onRetry={resourceHistory.retry}
         />
         <ResourceChart
           kind="disk"
@@ -107,11 +143,23 @@ export function NodeDetailPage({ nodeId, snapshotState }: { nodeId: string; snap
           range={range}
           data={data ? chartData(data, "disk") : null}
           total={metrics?.disk_total}
-          loading={history.loading}
-          error={history.error}
-          onRetry={history.retry}
+          loading={resourceHistory.loading}
+          error={resourceHistory.error}
+          onRetry={resourceHistory.retry}
         />
-      </div>
+      </div> : (
+        <div className="latency-content">
+          <PingChart
+            nodeName={node.name}
+            range={range}
+            history={pingHistory.history}
+            loading={pingHistory.loading}
+            error={pingHistory.error}
+            cutPeak={cutPeak}
+            onRetry={pingHistory.retry}
+          />
+        </div>
+      )}
     </main>
   );
 }

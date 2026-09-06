@@ -2,10 +2,11 @@ import { describe, expect, it } from "vitest";
 import { parseResourceHistory, type ResourceHistory } from "../api/history";
 import {
   chartData,
+  detailLocation,
   formatAxisTime,
   formatTooltipTime,
-  historyLocation,
   niceByteRateScale,
+  parseDetailTab,
   parseHistoryRange,
   timeAxisSplits,
 } from "../lib/history";
@@ -56,8 +57,12 @@ it("parses only frozen ranges and builds stable range URLs", () => {
   expect(parseHistoryRange("?range=7d&mock=1")).toBe("7d");
   expect(parseHistoryRange("?range=2h")).toBe("1h");
   expect(parseHistoryRange("?range=6h&range=24h")).toBe("6h");
-  expect(historyLocation(fixture.node_id, "24h", false)).toBe(`/nodes/${fixture.node_id}?range=24h`);
-  expect(historyLocation(fixture.node_id, "1h", true)).toBe(`/nodes/${fixture.node_id}?range=1h&mock=1`);
+  expect(parseDetailTab("?tab=latency&range=6h")).toBe("latency");
+  expect(parseDetailTab("?tab=unknown")).toBe("resources");
+  expect(detailLocation(fixture.node_id, "resources", "24h", false)).toBe(`/nodes/${fixture.node_id}?range=24h`);
+  expect(detailLocation(fixture.node_id, "latency", "1h", true)).toBe(
+    `/nodes/${fixture.node_id}?tab=latency&range=1h&mock=1`,
+  );
 });
 
 it("uses readable IEC byte axes", () => {

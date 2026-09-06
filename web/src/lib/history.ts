@@ -3,6 +3,7 @@ import type { HistoryRange, ResourceHistory } from "../api/history";
 
 export const HISTORY_RANGES: readonly HistoryRange[] = ["1h", "6h", "24h", "7d"];
 
+export type DetailTab = "resources" | "latency";
 export type ResourceChartKind = "cpu" | "memory" | "network" | "disk";
 
 export function parseHistoryRange(search: string): HistoryRange {
@@ -10,8 +11,19 @@ export function parseHistoryRange(search: string): HistoryRange {
   return HISTORY_RANGES.includes(value as HistoryRange) ? value as HistoryRange : "1h";
 }
 
-export function historyLocation(nodeId: string, range: HistoryRange, mock: boolean): string {
-  const query = new URLSearchParams({ range });
+export function parseDetailTab(search: string): DetailTab {
+  return new URLSearchParams(search).get("tab") === "latency" ? "latency" : "resources";
+}
+
+export function detailLocation(
+  nodeId: string,
+  tab: DetailTab,
+  range: HistoryRange,
+  mock: boolean,
+): string {
+  const query = new URLSearchParams();
+  if (tab === "latency") query.set("tab", "latency");
+  query.set("range", range);
   if (mock) query.set("mock", "1");
   return `/nodes/${nodeId}?${query}`;
 }

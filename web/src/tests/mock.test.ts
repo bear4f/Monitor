@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { mockPublicSnapshot } from "../mock/public-snapshot";
+import { mockPingHistory } from "../mock/ping-history";
 import { mockResourceHistory } from "../mock/resource-history";
 
 describe("development snapshot fixture", () => {
@@ -35,4 +36,19 @@ it("builds deterministic dense resource history with real null gaps", () => {
   expect(history.series.rx_rate).toHaveLength(length);
   expect(history.series.tx_rate).toHaveLength(length);
   expect(history.series.cpu.some((value) => value === null)).toBe(true);
+});
+
+it("builds deterministic six-target ping history with gaps and spikes", () => {
+  const history = mockPingHistory(mockPublicSnapshot.nodes[0].id, "1h");
+  expect(history.targets).toHaveLength(6);
+  expect(history.targets.some((target) => target.ip_family === 4)).toBe(true);
+  expect(history.targets.some((target) => target.ip_family === 6)).toBe(true);
+  expect(history.series.map((series) => series.target_id)).toEqual(history.targets.map((target) => target.id));
+  expect(history.series.every((series) => series.latency.length === history.timestamps.length)).toBe(true);
+  expect(history.series.some((series) => series.latency.some((value) => value === null))).toBe(true);
+  expect(history.series.some((series) => series.latency.some((value) => (value ?? 0) > 400))).toBe(true);
+  expect(history.series.some((series) => series.latency.filter((value) => value !== null).length >= 20)).toBe(true);
+  const sevenDays = mockPingHistory(mockPublicSnapshot.nodes[0].id, "7d");
+  expect(sevenDays.step).toBe(300);
+  expect(sevenDays.timestamps).toHaveLength(2_016);
 });
