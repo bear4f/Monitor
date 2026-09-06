@@ -1,5 +1,6 @@
 const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"] as const;
 const DAY_SECONDS = 86_400;
+const CURRENCY_SYMBOLS: Record<string, string> = { USD: "$", CNY: "¥", EUR: "€", GBP: "£", JPY: "¥" };
 
 function trimDecimals(value: number, maximumFractionDigits = 2): string {
   return value.toFixed(maximumFractionDigits).replace(/\.?0+$/, "");
@@ -15,6 +16,10 @@ export function formatBytes(bytes: number): string {
 
   const unitIndex = byteUnitIndex(bytes);
   return `${trimDecimals(bytes / 1024 ** unitIndex)} ${BYTE_UNITS[unitIndex]}`;
+}
+
+export function formatAxisBytes(bytes: number): string {
+  return formatBytes(bytes);
 }
 
 export function formatBytePair(used: number, total: number): string {
@@ -88,4 +93,21 @@ export function ratioPercent(used: number, total: number): number {
 export function safeAdd(left: number, right: number): number | null {
   const result = left + right;
   return Number.isSafeInteger(left) && Number.isSafeInteger(right) && Number.isSafeInteger(result) ? result : null;
+}
+
+export function formatPrice(priceMicros: number, currency: string): string {
+  if (!Number.isSafeInteger(priceMicros) || priceMicros < 0) return "—";
+  if (priceMicros === 0) return "免费";
+  const amount = (priceMicros / 1_000_000).toFixed(2);
+  const symbol = CURRENCY_SYMBOLS[currency];
+  return symbol ? `${symbol}${amount}` : `${amount} ${currency}`;
+}
+
+export function formatCalendarDate(timestamp: number): string {
+  if (!Number.isFinite(timestamp)) return "—";
+  const date = new Date(timestamp * 1000);
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }

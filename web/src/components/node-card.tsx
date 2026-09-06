@@ -1,4 +1,5 @@
 import { ArrowDown, ArrowUp } from "lucide-react";
+import type { MouseEvent } from "react";
 import type { PublicNode } from "../api/public";
 import {
   clampProgress,
@@ -13,6 +14,7 @@ import {
   ratioPercent,
   safeAdd,
 } from "../lib/format";
+import { navigate } from "../router";
 import { Badge, Card } from "../ui/primitives";
 
 export function NodeCard({ node, generatedAt }: { node: PublicNode; generatedAt: number }) {
@@ -28,8 +30,17 @@ export function NodeCard({ node, generatedAt }: { node: PublicNode; generatedAt:
     ? `${system.os_name}${system.os_version ? ` ${system.os_version}` : ""} · ${system.virtualization} · ${system.architecture}`
     : "等待首次上报";
 
+  const mockQuery = import.meta.env.DEV && new URLSearchParams(window.location.search).get("mock") === "1" ? "?mock=1" : "";
+  const href = `/nodes/${node.id}${mockQuery}`;
+  const follow = (event: MouseEvent<HTMLAnchorElement>) => {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    navigate(href);
+  };
+
   return (
-    <Card className={`node-card${node.online ? "" : " node-card-offline"}`}>
+    <a className="node-card-link" href={href} onClick={follow} aria-label={`查看 ${node.name} 资源详情`}>
+      <Card className={`node-card${node.online ? "" : " node-card-offline"}`}>
       <div className="node-heading">
         <div className="node-identity">
           <h2 title={node.name}>{node.name}</h2>
@@ -79,7 +90,8 @@ export function NodeCard({ node, generatedAt }: { node: PublicNode; generatedAt:
         <TrafficValue muted icon={<ArrowDown />} value={formatBytes(node.traffic.total_rx)} />
         <TrafficValue muted icon={<ArrowUp />} value={formatBytes(node.traffic.total_tx)} />
       </div>
-    </Card>
+      </Card>
+    </a>
   );
 }
 
