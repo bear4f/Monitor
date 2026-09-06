@@ -2,7 +2,7 @@ import { useEffect, useSyncExternalStore } from "react";
 import { AdminApiError, authMe } from "../api/admin";
 import { navigate } from "../router";
 
-export type AuthStatus = "unknown" | "authenticated" | "unauthenticated";
+export type AuthStatus = "unknown" | "authenticated" | "unauthenticated" | "error";
 let status: AuthStatus = "unknown";
 let started = false;
 const listeners = new Set<() => void>();
@@ -11,8 +11,9 @@ const emit = () => listeners.forEach((listener) => listener());
 export function refreshAuth(): void {
   if (started) return;
   started = true;
-  authMe().then(() => { status = "authenticated"; emit(); }).catch(() => { status = "unauthenticated"; emit(); });
+  authMe().then(() => { status = "authenticated"; emit(); }).catch((error) => { status = error instanceof AdminApiError && error.status === 401 ? "unauthenticated" : "error"; emit(); });
 }
+export function retryAuth(): void { started = false; status = "unknown"; emit(); refreshAuth(); }
 export function setUnauthenticated(): void { status = "unauthenticated"; emit(); }
 export function setAuthenticated(): void { status = "authenticated"; emit(); }
 export function useAdminSession() {

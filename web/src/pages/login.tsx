@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useState } from "react";
-import { login } from "../api/admin";
+import { AdminApiError, login } from "../api/admin";
 import { navigate } from "../router";
 import { setAuthenticated, useAdminSession } from "../stores/auth";
 import { Button } from "../ui/primitives";
@@ -14,7 +14,7 @@ export function LoginPage() {
   const submit = async (event: FormEvent) => {
     event.preventDefault(); setError(null); setBusy(true);
     try { await login(password); setPassword(""); setAuthenticated(); navigate("/admin/nodes"); }
-    catch (caught) { const status = (caught as { status?: number }).status; setError(status === 401 ? "密码错误" : status === 429 ? "请稍后再试" : "暂时无法登录"); }
+    catch (caught) { const status = (caught as { status?: number }).status; const retry = caught instanceof AdminApiError ? caught.retryAfter : null; setError(status === 401 ? "密码错误" : status === 429 ? retry ? `请等待 ${retry} 秒后再试` : "请稍后再试" : "暂时无法登录"); }
     finally { setBusy(false); }
   };
   return <main className="login-page"><form className="login-panel" onSubmit={submit}>
