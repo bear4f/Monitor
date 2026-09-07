@@ -12,6 +12,11 @@ use argon2::{
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+unsafe extern "C" {
+    fn malloc_trim(pad: usize) -> i32;
+}
+
 pub const PASSWORD_MIN_BYTES: usize = 1;
 pub const PASSWORD_MAX_BYTES: usize = 1_024;
 pub const SESSION_DURATION_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -62,16 +67,37 @@ pub fn validate_password(password: &str) -> Result<(), AuthError> {
 
 pub async fn hash_password(password: String) -> Result<String, AuthError> {
     validate_password(&password)?;
-    tokio::task::spawn_blocking(move || hash_password_blocking(&password))
-        .await
-        .map_err(AuthError::Worker)?
+    tokio::task::spawn_blocking(move || {
+        let result = hash_password_blocking(&password);
+        release_password_working_set();
+        result
+    })
+    .await
+    .map_err(AuthError::Worker)?
 }
 
 pub async fn verify_password(password: String, encoded_hash: String) -> Result<bool, AuthError> {
     validate_password(&password)?;
-    tokio::task::spawn_blocking(move || verify_password_blocking(&password, &encoded_hash))
-        .await
-        .map_err(AuthError::Worker)?
+    tokio::task::spawn_blocking(move || {
+        let result = verify_password_blocking(&password, &encoded_hash);
+        release_password_working_set();
+        result
+    })
+    .await
+    .map_err(AuthError::Worker)?
+}
+
+#[inline]
+fn release_password_working_set() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        // SAFETY: malloc_trim(0) is the GNU libc allocator API; no pointer is
+        // passed, and this call is compiled only for linux/gnu targets. Its
+        // advisory return value is intentionally ignored.
+        unsafe {
+            malloc_trim(0);
+        }
+    }
 }
 
 fn hash_password_blocking(password: &str) -> Result<String, AuthError> {
