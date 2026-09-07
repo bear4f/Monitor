@@ -81,6 +81,21 @@ ensure_service_manager() {
   systemctl show-environment >/dev/null 2>&1 || die "systemd is not running"
 }
 
+preflight_systemd_unit() {
+  local unit_name=$1 unit_path=$2 binary=$3
+  local load_state fragment_path
+  load_state=$(systemctl show -p LoadState --value "$unit_name" 2>/dev/null || true)
+  fragment_path=$(systemctl show -p FragmentPath --value "$unit_name" 2>/dev/null || true)
+  if [[ -n $fragment_path && $fragment_path != "(null)" ]]; then
+    [[ $fragment_path == "$unit_path" ]] \
+      || die "$unit_name resolves to unrelated systemd fragment $fragment_path"
+    assert_unit_owned "$unit_path" "$binary" \
+      || die "$unit_name does not resolve to a recognized Monitor unit"
+  elif [[ -n $load_state && $load_state != not-found ]]; then
+    die "$unit_name is already provided by systemd without the expected Monitor fragment"
+  fi
+}
+
 ensure_user() {
   local user=$1
   if ! getent passwd "$user" >/dev/null; then
@@ -114,8 +129,13 @@ port_is_listening() {
 }
 
 check_server_port() {
-  if port_is_listening && ! systemctl is-active --quiet monitor-server.service; then
-    die "127.0.0.1:$SERVER_PORT is occupied by an unknown service; refusing to replace it"
+  if port_is_listening; then
+    systemctl is-active --quiet monitor-server.service \
+      || die "127.0.0.1:$SERVER_PORT is occupied by an unknown service; refusing to replace it"
+    [[ -f $SERVER_UNIT ]] \
+      || die "127.0.0.1:$SERVER_PORT is occupied but Monitor Server ownership is unrecognized"
+    assert_unit_owned "$SERVER_UNIT" "$SERVER_BINARY" \
+      || die "127.0.0.1:$SERVER_PORT is occupied but Monitor Server ownership is unrecognized"
   fi
 }
 
@@ -139,10 +159,104 @@ ensure_binary_path_safe() {
 valid_agent_environment_content() {
   local file=$1
   [[ -f $file && -r $file ]] || return 1
-  local server_count token_count
-  server_count=$(grep -Ec '^MONITOR_SERVER=https?://[^[:space:]/?#@]+/?$' "$file" || true)
-  token_count=$(grep -Ec '^MONITOR_TOKEN=[0-9a-f]{64}$' "$file" || true)
-  [[ $server_count -eq 1 && $token_count -eq 1 ]]
+  local server_count token_count server_value token_value
+  server_count=$(grep -Ec '^MONITOR_SERVER=' "$file" || true)
+  token_count=$(grep -Ec '^MONITOR_TOKEN=' "$file" || true)
+  [[ $server_count -eq 1 && $token_count -eq 1 ]] || return 1
+  server_value=$(sed -n 's/^MONITOR_SERVER=//p' "$file")
+  token_value=$(sed -n 's/^MONITOR_TOKEN=//p' "$file")
+  valid_agent_server_url "$server_value" || return 1
+  [[ $token_value =~ ^[0-9a-f]{64}$ ]]
+}
+
+valid_ipv4_literal() {
+  local value=$1 octet
+  local -a octets
+  IFS=. read -r -a octets <<< "$value"
+  [[ ${#octets[@]} == 4 ]] || return 1
+  for octet in "${octets[@]}"; do
+    [[ $octet =~ ^[0-9]{1,3}$ ]] || return 1
+    (( 10#$octet <= 255 )) || return 1
+  done
+}
+
+valid_ipv6_literal() {
+  local value=$1 side group count=0 ipv4_tail=
+  local -a groups
+  if [[ $value == *.* ]]; then
+    [[ $value == *:* ]] || return 1
+    ipv4_tail=${value##*:}
+    valid_ipv4_literal "$ipv4_tail" || return 1
+    value=${value%:*}:v4
+  fi
+  [[ $value == *:* && $value != *[^0-9A-Fa-f:v]* && $value != *:::* ]] || return 1
+  if [[ $value == *::* ]]; then
+    [[ ${value#*::} != *::* ]] || return 1
+    for side in "${value%%::*}" "${value#*::}"; do
+      [[ -z $side ]] && continue
+      IFS=: read -r -a groups <<< "$side"
+      for group in "${groups[@]}"; do
+        if [[ $group == v4 ]]; then
+          count=$((count + 2))
+        else
+          [[ $group =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+          count=$((count + 1))
+        fi
+      done
+    done
+    (( count < 8 ))
+  else
+    IFS=: read -r -a groups <<< "$value"
+    count=0
+    for group in "${groups[@]}"; do
+      if [[ $group == v4 ]]; then
+        count=$((count + 2))
+      else
+        [[ $group =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        count=$((count + 1))
+      fi
+    done
+    (( count == 8 ))
+  fi
+}
+
+valid_agent_server_url() {
+  local value=$1 authority host port
+  if [[ $value == http://* ]]; then
+    authority=${value#http://}
+  elif [[ $value == https://* ]]; then
+    authority=${value#https://}
+  else
+    return 1
+  fi
+  [[ $authority != *'?'* && $authority != *'#'* && $authority != *'@'* ]] || return 1
+  if [[ $authority == */ ]]; then
+    authority=${authority%/}
+  fi
+  [[ -n $authority && $authority != */* ]] || return 1
+
+  if [[ $authority == \[* ]]; then
+    [[ $authority =~ ^\[([0-9A-Fa-f:.]+)\](:([0-9]+))?$ ]] || return 1
+    host=${BASH_REMATCH[1]}
+    valid_ipv6_literal "$host" || return 1
+    port=${BASH_REMATCH[3]-}
+  else
+    [[ $authority != *:*:* ]] || return 1
+    if [[ $authority == *:* ]]; then
+      host=${authority%:*}
+      port=${authority##*:}
+    else
+      host=$authority
+      port=
+    fi
+    [[ $host =~ ^[A-Za-z0-9.-]+$ && -n $host ]] || return 1
+  fi
+  if [[ -n $port ]]; then
+    [[ $port =~ ^[0-9]{1,5}$ ]] || return 1
+    (( 10#$port >= 1 && 10#$port <= 65535 )) || return 1
+  elif [[ $authority == *: && $authority != \]* ]]; then
+    return 1
+  fi
 }
 
 valid_agent_environment() {
@@ -268,12 +382,14 @@ architecture_asset
 SCRIPT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 if [[ $COMPONENT == server || $COMPONENT == all ]]; then
+  preflight_systemd_unit monitor-server.service "$SERVER_UNIT" "$SERVER_BINARY"
   if [[ -e $SERVER_UNIT ]]; then
     assert_unit_owned "$SERVER_UNIT" "$SERVER_BINARY"
   fi
   ensure_binary_path_safe "$SERVER_BINARY" "$SERVER_UNIT"
 fi
 if [[ $COMPONENT == agent || $COMPONENT == all ]]; then
+  preflight_systemd_unit monitor-agent.service "$AGENT_UNIT" "$AGENT_BINARY"
   if [[ -e $AGENT_UNIT ]]; then
     assert_unit_owned "$AGENT_UNIT" "$AGENT_BINARY"
   fi

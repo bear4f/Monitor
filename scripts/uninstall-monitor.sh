@@ -73,7 +73,7 @@ remove_unit_if_owned() {
 remove_binary_if_owned() {
   local binary=$1 unit=$2
   [[ -e $binary ]] || return 0
-  assert_binary_owned "$binary" "$unit"
+  assert_component_owned "$unit" "$binary"
   rm -f -- "$binary"
 }
 
