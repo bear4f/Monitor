@@ -1,6 +1,8 @@
 use std::{
     error::Error,
-    fmt, thread,
+    fmt,
+    sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel},
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -10,7 +12,7 @@ use crate::{
     collector::{CollectorError, SystemCollector},
     ping::PingEngine,
 };
-use monitor_common::{AgentConfigPayload, AgentReport, PingReport};
+use monitor_common::{AgentConfigPayload, AgentPingTarget, AgentReport, PingReport};
 
 const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -28,6 +30,83 @@ impl Error for RuntimeError {}
 impl From<CollectorError> for RuntimeError {
     fn from(error: CollectorError) -> Self {
         Self(error.to_string())
+    }
+}
+
+struct PingJob {
+    targets: Vec<AgentPingTarget>,
+}
+
+struct CompletedPingRound {
+    targets: Vec<AgentPingTarget>,
+    reports: Vec<PingReport>,
+}
+
+struct PingWorker {
+    job_sender: SyncSender<PingJob>,
+    result_receiver: Receiver<CompletedPingRound>,
+    in_flight: bool,
+}
+
+impl PingWorker {
+    fn start() -> Result<Self, RuntimeError> {
+        let (job_sender, job_receiver) = sync_channel(1);
+        let (result_sender, result_receiver) = sync_channel(1);
+        let worker_thread = thread::Builder::new()
+            .name("monitor-ping".to_owned())
+            .spawn(move || ping_worker_loop(job_receiver, result_sender))
+            .map_err(|error| RuntimeError(format!("failed to start ping worker: {error}")))?;
+        drop(worker_thread);
+        Ok(Self {
+            job_sender,
+            result_receiver,
+            in_flight: false,
+        })
+    }
+
+    fn try_schedule(&mut self, targets: &[AgentPingTarget]) -> bool {
+        if targets.is_empty() || self.in_flight {
+            return false;
+        }
+        match self.job_sender.try_send(PingJob {
+            targets: targets.to_vec(),
+        }) {
+            Ok(()) => {
+                self.in_flight = true;
+                true
+            }
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    fn take_completed(&mut self, current_targets: &[AgentPingTarget]) -> Option<Vec<PingReport>> {
+        let completed = match self.result_receiver.try_recv() {
+            Ok(completed) => completed,
+            Err(TryRecvError::Empty) => return None,
+            Err(TryRecvError::Disconnected) => {
+                self.in_flight = false;
+                return None;
+            }
+        };
+        self.in_flight = false;
+        (completed.targets == current_targets).then_some(completed.reports)
+    }
+}
+
+fn ping_worker_loop(
+    job_receiver: Receiver<PingJob>,
+    result_sender: SyncSender<CompletedPingRound>,
+) {
+    let mut engine = PingEngine::new();
+    while let Ok(job) = job_receiver.recv() {
+        let reports = engine.ping_round(&job.targets);
+        let completed = CompletedPingRound {
+            targets: job.targets,
+            reports,
+        };
+        if result_sender.send(completed).is_err() {
+            break;
+        }
     }
 }
 
@@ -56,7 +135,7 @@ pub fn run(run_config: RunConfig) -> Result<(), RuntimeError> {
     };
 
     collector.initialize_baselines()?;
-    let mut ping_engine = PingEngine::new();
+    let mut ping_worker = PingWorker::start()?;
     let mut pending_ping: Option<Vec<PingReport>> = None;
     let now = Instant::now();
     let (mut next_report, mut next_ping) = initial_deadlines(now, &config);
@@ -97,9 +176,16 @@ pub fn run(run_config: RunConfig) -> Result<(), RuntimeError> {
             }
         }
 
+        if let Some(reports) = ping_worker.take_completed(&config.targets) {
+            pending_ping = Some(reports);
+            if let Some(next_ping) = next_ping {
+                next_report = schedule_report_after_ping(next_report, next_ping, Instant::now());
+            }
+        }
+
         let now = Instant::now();
         if next_ping.is_some_and(|deadline| now >= deadline) {
-            pending_ping = Some(ping_engine.ping_round(&config.targets));
+            ping_worker.try_schedule(&config.targets);
             let now = Instant::now();
             let next_deadline = advance_deadline(
                 next_ping.expect("due ping deadline"),
@@ -107,7 +193,6 @@ pub fn run(run_config: RunConfig) -> Result<(), RuntimeError> {
                 now,
             );
             next_ping = Some(next_deadline);
-            next_report = schedule_report_after_ping(next_report, next_deadline, now);
         }
 
         let now = Instant::now();
@@ -440,6 +525,73 @@ mod tests {
     }
 
     #[test]
+    fn busy_ping_worker_skips_a_second_job_without_queueing() {
+        let (mut worker, job_receiver, _result_sender) = test_ping_worker();
+        let targets = config(2, 15).targets;
+        assert!(worker.try_schedule(&targets));
+        assert_eq!(
+            job_receiver
+                .try_recv()
+                .expect("first scheduled job")
+                .targets,
+            targets
+        );
+        assert!(!worker.try_schedule(&targets));
+        assert!(matches!(job_receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn completed_ping_for_current_targets_is_accepted() {
+        let (mut worker, job_receiver, result_sender) = test_ping_worker();
+        let targets = config(2, 15).targets;
+        assert!(worker.try_schedule(&targets));
+        let job = job_receiver.try_recv().expect("scheduled job");
+        let reports = vec![PingReport {
+            target_id: 1,
+            success: true,
+            latency_ms: Some(1.5),
+        }];
+        result_sender
+            .try_send(CompletedPingRound {
+                targets: job.targets,
+                reports: reports.clone(),
+            })
+            .expect("completed result");
+        assert_eq!(worker.take_completed(&targets), Some(reports));
+        assert!(!worker.in_flight);
+    }
+
+    #[test]
+    fn completed_ping_for_stale_targets_is_discarded() {
+        let (mut worker, job_receiver, result_sender) = test_ping_worker();
+        let old_targets = config(2, 15).targets;
+        assert!(worker.try_schedule(&old_targets));
+        let job = job_receiver.try_recv().expect("scheduled job");
+        result_sender
+            .try_send(CompletedPingRound {
+                targets: job.targets,
+                reports: vec![PingReport {
+                    target_id: 1,
+                    success: false,
+                    latency_ms: None,
+                }],
+            })
+            .expect("completed result");
+        let mut current_targets = old_targets;
+        current_targets[0].id = 2;
+        assert_eq!(worker.take_completed(&current_targets), None);
+        assert!(!worker.in_flight);
+    }
+
+    #[test]
+    fn empty_targets_do_not_schedule_ping_work() {
+        let (mut worker, job_receiver, _result_sender) = test_ping_worker();
+        assert!(!worker.try_schedule(&[]));
+        assert!(!worker.in_flight);
+        assert!(matches!(job_receiver.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
     fn report_protocol_failures_are_retryable_but_authentication_is_fatal() {
         assert!(!report_error_is_fatal(FailureKind::Protocol));
         assert!(!report_error_is_fatal(FailureKind::Transient));
@@ -569,6 +721,24 @@ mod tests {
                 .expect("captured request")
                 .starts_with("GET /api/agent/config HTTP/1.1")
         );
+    }
+
+    fn test_ping_worker() -> (
+        PingWorker,
+        Receiver<PingJob>,
+        SyncSender<CompletedPingRound>,
+    ) {
+        let (job_sender, job_receiver) = sync_channel(1);
+        let (result_sender, result_receiver) = sync_channel(1);
+        (
+            PingWorker {
+                job_sender,
+                result_receiver,
+                in_flight: false,
+            },
+            job_receiver,
+            result_sender,
+        )
     }
 
     fn read_http_request(stream: &mut TcpStream) -> String {
