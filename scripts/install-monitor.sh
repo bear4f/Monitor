@@ -21,7 +21,7 @@ Usage: install-monitor.sh --version VERSION [--component server|agent|all]
        [--agent-env PATH]
 
 Install release binaries and their systemd units. VERSION is required and
-must identify an explicit GitHub Release (for example v0.1.0).
+must identify an explicit GitHub Release (for example v0.1.1).
 EOF
 }
 
@@ -435,6 +435,7 @@ if [[ $COMPONENT == server || $COMPONENT == all ]]; then
   server_asset="monitor-server-linux-$ASSET_ARCH"
   download_asset "$server_asset" "$WORK_DIR/monitor-server"
   verify_checksum "$server_asset" "$WORK_DIR/monitor-server" "$WORK_DIR/SHA256SUMS"
+  chmod 0755 "$WORK_DIR/monitor-server"
   [[ "$("$WORK_DIR/monitor-server" --version 2>/dev/null)" == "monitor-server $RELEASE_VERSION" ]] \
     || die "downloaded Server version does not match $RELEASE_VERSION"
 fi
@@ -442,6 +443,7 @@ if [[ $COMPONENT == agent || $COMPONENT == all ]]; then
   agent_asset="monitor-agent-linux-$ASSET_ARCH"
   download_asset "$agent_asset" "$WORK_DIR/monitor-agent"
   verify_checksum "$agent_asset" "$WORK_DIR/monitor-agent" "$WORK_DIR/SHA256SUMS"
+  chmod 0755 "$WORK_DIR/monitor-agent"
   [[ "$("$WORK_DIR/monitor-agent" --version 2>/dev/null)" == "monitor-agent $RELEASE_VERSION" ]] \
     || die "downloaded Agent version does not match $RELEASE_VERSION"
 fi

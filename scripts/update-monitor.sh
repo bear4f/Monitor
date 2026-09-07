@@ -145,12 +145,14 @@ if [[ $COMPONENT == server || $COMPONENT == all ]]; then
   server_asset="monitor-server-linux-$ASSET_ARCH"
   download_asset "$server_asset" "$WORK_DIR/monitor-server"
   verify_checksum "$server_asset" "$WORK_DIR/monitor-server" "$WORK_DIR/SHA256SUMS"
+  chmod 0755 "$WORK_DIR/monitor-server"
   [[ "$("$WORK_DIR/monitor-server" --version 2>/dev/null)" == "monitor-server $RELEASE_VERSION" ]] || die "Server version mismatch"
 fi
 if [[ $COMPONENT == agent || $COMPONENT == all ]]; then
   agent_asset="monitor-agent-linux-$ASSET_ARCH"
   download_asset "$agent_asset" "$WORK_DIR/monitor-agent"
   verify_checksum "$agent_asset" "$WORK_DIR/monitor-agent" "$WORK_DIR/SHA256SUMS"
+  chmod 0755 "$WORK_DIR/monitor-agent"
   [[ "$("$WORK_DIR/monitor-agent" --version 2>/dev/null)" == "monitor-agent $RELEASE_VERSION" ]] || die "Agent version mismatch"
 fi
 

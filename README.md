@@ -19,7 +19,7 @@ cd .. && cargo build --release --workspace
 ```
 
 The binaries are `target/release/monitor-server` and
-`target/release/monitor-agent`; both report `0.1.0` with `--version`.
+`target/release/monitor-agent`; both report `0.1.1` with `--version`.
 
 ## Server installation
 
@@ -29,7 +29,7 @@ the `SHA256SUMS` asset from that same release, verifies SHA256, then installs
 atomically:
 
 ```sh
-sudo ./scripts/install-monitor.sh --version v0.1.0 --component server
+sudo ./scripts/install-monitor.sh --version v0.1.1 --component server
 ```
 
 The unit runs as the dedicated `monitor:monitor` user with no capabilities,
@@ -68,7 +68,7 @@ Install the exact release and preserve the token outside argv, URLs, logs, and
 shell history:
 
 ```sh
-sudo ./scripts/install-monitor.sh --version v0.1.0 --component agent \
+sudo ./scripts/install-monitor.sh --version v0.1.1 --component agent \
   --agent-env /root/monitor-agent.env
 ```
 
@@ -84,7 +84,7 @@ staging a binary. The old binary is restored if restart or health verification
 fails; the database and Agent environment are preserved:
 
 ```sh
-sudo ./scripts/update-monitor.sh --version v0.1.0 --component all
+sudo ./scripts/update-monitor.sh --version v0.1.1 --component all
 ```
 
 Default uninstall stops and removes Monitor units and binaries, removes the

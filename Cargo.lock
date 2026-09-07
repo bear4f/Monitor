@@ -563,7 +563,7 @@ dependencies = [
 
 [[package]]
 name = "monitor-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "monitor-common",
@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "monitor-common"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "monitor-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "argon2",
  "axum",
