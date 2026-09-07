@@ -162,8 +162,8 @@ pub fn run(run_config: RunConfig) -> Result<(), RuntimeError> {
                     continue;
                 }
                 Err(error) if error.status_code() == Some(400) && included_ping => {
-                    match reconcile_stale_config(&client, &config)? {
-                        Some(next_config) => {
+                    match reconcile_stale_config(&client, &config) {
+                        Ok(Some(next_config)) => {
                             config = next_config;
                             let now = Instant::now();
                             next_config_refresh = now + CONFIG_REFRESH_INTERVAL;
@@ -171,16 +171,14 @@ pub fn run(run_config: RunConfig) -> Result<(), RuntimeError> {
                             next_report = now;
                             config_backoff.reset();
                         }
-                        None => {
-                            eprintln!(
-                                "monitor-agent: configuration reconciliation failed; retrying"
-                            );
-                            let now = Instant::now();
-                            next_config_refresh = now + config_backoff.next_delay();
-                            next_report =
-                                now + Duration::from_secs(config.report_interval_seconds as u64);
+                        Ok(None) => {
+                            retry_report(&mut report_backoff, &mut report_waiting, &mut next_report)
                         }
+                        Err(error) => return Err(error),
                     }
+                }
+                Err(error) if !report_error_is_fatal(error.kind()) => {
+                    retry_report(&mut report_backoff, &mut report_waiting, &mut next_report)
                 }
                 Err(error) => return Err(fatal_client_error(error)),
             }
@@ -235,12 +233,23 @@ fn reconcile_stale_config(
 ) -> Result<Option<AgentConfigPayload>, RuntimeError> {
     match client.get_config() {
         Ok(next) if previous.targets != next.targets => Ok(Some(next)),
-        Ok(_) => Err(RuntimeError(
-            "agent protocol error: report rejected with unchanged ping configuration".to_owned(),
-        )),
+        Ok(_) => Ok(None),
         Err(error) if error.kind() == FailureKind::Transient => Ok(None),
         Err(error) => Err(fatal_client_error(error)),
     }
+}
+
+fn retry_report(backoff: &mut Backoff, waiting: &mut bool, next_report: &mut Instant) {
+    if !*waiting {
+        eprintln!("monitor-agent: report rejected; retrying current state later");
+        *waiting = true;
+    }
+    thread::sleep(backoff.next_delay());
+    *next_report = Instant::now();
+}
+
+fn report_error_is_fatal(kind: FailureKind) -> bool {
+    kind == FailureKind::Authentication
 }
 
 fn fatal_client_error(error: ClientError) -> RuntimeError {
@@ -431,6 +440,13 @@ mod tests {
     }
 
     #[test]
+    fn report_protocol_failures_are_retryable_but_authentication_is_fatal() {
+        assert!(!report_error_is_fatal(FailureKind::Protocol));
+        assert!(!report_error_is_fatal(FailureKind::Transient));
+        assert!(report_error_is_fatal(FailureKind::Authentication));
+    }
+
+    #[test]
     fn target_or_ping_interval_change_resets_ping_schedule() {
         let original = config(2, 10);
         let mut changed = original.clone();
@@ -510,6 +526,49 @@ mod tests {
         assert!(requests[0].contains("\"pings\":[{"));
         assert!(requests[1].starts_with("GET /api/agent/config HTTP/1.1"));
         assert!(requests[2].contains("\"pings\":[]"));
+    }
+
+    #[test]
+    fn unchanged_stale_ping_config_is_a_retryable_report_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept fixture client");
+            let request = read_http_request(&mut stream);
+            let config_body = serde_json::to_string(&config(2, 10)).expect("config JSON");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{config_body}",
+                config_body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            sender.send(request).expect("send request");
+        });
+        let Action::Run(run_config) = parse(
+            [
+                "monitor-agent",
+                "--server",
+                &format!("http://{address}"),
+                "--token",
+                TOKEN,
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("parse fixture config") else {
+            panic!("expected run config");
+        };
+        let client = MonitorClient::new(&run_config);
+        let result = reconcile_stale_config(&client, &config(2, 10)).expect("reconciliation");
+        assert!(result.is_none());
+        assert!(
+            receiver
+                .recv()
+                .expect("captured request")
+                .starts_with("GET /api/agent/config HTTP/1.1")
+        );
     }
 
     fn read_http_request(stream: &mut TcpStream) -> String {

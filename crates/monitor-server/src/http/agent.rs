@@ -106,7 +106,7 @@ pub(super) async fn report(
                     billing_cycle,
                 },
             )
-            .map_err(|_| ApiError::invalid_request())?;
+            .map_err(|_| ApiError::internal())?;
         state.history.record(
             identity.node_id,
             received_at,
@@ -770,6 +770,116 @@ mod tests {
         assert_eq!(node.rx_total_bytes, 1_000);
         assert_eq!(node.tx_total_bytes, 0);
         assert!(node.rx_total_bytes <= crate::traffic::JS_SAFE_INTEGER_MAX);
+        context.finish().await;
+    }
+
+    #[tokio::test]
+    async fn report_crossing_browser_safe_total_remains_successful() {
+        let context = TestContext::new().await;
+        let mut baseline = valid_report();
+        baseline["network"]["rx_bytes"] = json!(0);
+        baseline["network"]["tx_bytes"] = json!(0);
+        assert_eq!(
+            response(
+                report(
+                    State(context.state.clone()),
+                    ConnectInfo(loopback_peer()),
+                    context.report_request(&baseline.to_string()),
+                )
+                .await
+            )
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let mut near_limit = valid_report();
+        near_limit["network"]["rx_bytes"] = json!(JS_SAFE_INTEGER_MAX - 100);
+        near_limit["network"]["tx_bytes"] = json!(JS_SAFE_INTEGER_MAX - 100);
+        assert_eq!(
+            response(
+                report(
+                    State(context.state.clone()),
+                    ConnectInfo(loopback_peer()),
+                    context.report_request(&near_limit.to_string()),
+                )
+                .await
+            )
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let mut crossing = valid_report();
+        crossing["network"]["rx_bytes"] = json!(JS_SAFE_INTEGER_MAX + 900);
+        crossing["network"]["tx_bytes"] = json!(JS_SAFE_INTEGER_MAX + 900);
+        assert_eq!(
+            response(
+                report(
+                    State(context.state.clone()),
+                    ConnectInfo(loopback_peer()),
+                    context.report_request(&crossing.to_string()),
+                )
+                .await
+            )
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let traffic = context
+            .state
+            .traffic
+            .get(context.node_id)
+            .expect("crossing traffic state");
+        assert!(traffic.rx_total_bytes > JS_SAFE_INTEGER_MAX);
+        assert_eq!(traffic.rx_total_bytes, JS_SAFE_INTEGER_MAX + 900);
+        let snapshot = context.state.snapshots.read().await[&context.node_id].clone();
+        assert!(snapshot.last_seen_at > 0);
+        context.finish().await;
+    }
+
+    #[tokio::test]
+    async fn true_i64_traffic_overflow_is_an_internal_error() {
+        let context = TestContext::new().await;
+        for rx in [0, i64::MAX] {
+            let mut report_body = valid_report();
+            report_body["network"]["rx_bytes"] = json!(rx);
+            report_body["network"]["tx_bytes"] = json!(0);
+            assert_eq!(
+                response(
+                    report(
+                        State(context.state.clone()),
+                        ConnectInfo(loopback_peer()),
+                        context.report_request(&report_body.to_string()),
+                    )
+                    .await
+                )
+                .status(),
+                StatusCode::NO_CONTENT
+            );
+        }
+        let mut overflowing = valid_report();
+        overflowing["network"]["rx_bytes"] = json!(1);
+        overflowing["network"]["tx_bytes"] = json!(0);
+        let response = response(
+            report(
+                State(context.state.clone()),
+                ConnectInfo(loopback_peer()),
+                context.report_request(&overflowing.to_string()),
+            )
+            .await,
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            "internal_error"
+        );
+        assert_eq!(
+            context
+                .state
+                .traffic
+                .get(context.node_id)
+                .expect("overflow state")
+                .rx_total_bytes,
+            i64::MAX
+        );
         context.finish().await;
     }
 

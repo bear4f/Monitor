@@ -14,7 +14,7 @@ use crate::{
     database::NodeMetaRow,
     snapshot::NodeSnapshot,
     time,
-    traffic::{JS_SAFE_INTEGER_MAX, PublicTrafficState},
+    traffic::{JS_SAFE_INTEGER_MAX, PublicTrafficState, browser_safe_counter},
 };
 
 const NETWORK_RATE_POINTS: usize = 60;
@@ -103,7 +103,6 @@ impl NetworkRateRing {
 pub enum PublicSnapshotError {
     Clock,
     Time(jiff::Error),
-    SafeIntegerOverflow,
     Serialize(serde_json::Error),
 }
 
@@ -112,9 +111,6 @@ impl std::fmt::Display for PublicSnapshotError {
         match self {
             Self::Clock => formatter.write_str("system clock is outside the supported range"),
             Self::Time(error) => write!(formatter, "site time calculation failed: {error}"),
-            Self::SafeIntegerOverflow => {
-                formatter.write_str("public summary exceeds the JSON safe integer range")
-            }
             Self::Serialize(error) => write!(formatter, "JSON serialization failed: {error}"),
         }
     }
@@ -125,7 +121,7 @@ impl std::error::Error for PublicSnapshotError {
         match self {
             Self::Time(error) => Some(error),
             Self::Serialize(error) => Some(error),
-            Self::Clock | Self::SafeIntegerOverflow => None,
+            Self::Clock => None,
         }
     }
 }
@@ -172,7 +168,7 @@ async fn generate_locked(state: &AppState, generated_at: i64) -> Result<(), Publ
             &settings.site_timezone,
             current_day_start_utc,
         )?;
-        summary.add(&node_response)?;
+        summary.add(&node_response);
         public_nodes.push(node_response);
     }
 
@@ -356,12 +352,15 @@ fn public_node(
 ) -> Result<PublicNodeResponse, PublicSnapshotError> {
     let current_cycle = time::billing_cycle(generated_at, timezone, node.traffic_reset_day)
         .map_err(PublicSnapshotError::Time)?;
-    let total_rx = traffic.map_or(0, |traffic| traffic.rx_total_bytes);
-    let total_tx = traffic.map_or(0, |traffic| traffic.tx_total_bytes);
+    let total_rx = traffic.map_or(0, |traffic| browser_safe_counter(traffic.rx_total_bytes));
+    let total_tx = traffic.map_or(0, |traffic| browser_safe_counter(traffic.tx_total_bytes));
     let (today_rx, today_tx) = traffic
         .filter(|traffic| traffic.day_start_utc == current_day_start_utc)
         .map_or((0, 0), |traffic| {
-            (traffic.today_rx_bytes, traffic.today_tx_bytes)
+            (
+                browser_safe_counter(traffic.today_rx_bytes),
+                browser_safe_counter(traffic.today_tx_bytes),
+            )
         });
     let (cycle_rx, cycle_tx) = traffic
         .filter(|traffic| {
@@ -369,7 +368,10 @@ fn public_node(
                 && traffic.cycle_end_utc == current_cycle.end_utc
         })
         .map_or((0, 0), |traffic| {
-            (traffic.cycle_rx_bytes, traffic.cycle_tx_bytes)
+            (
+                browser_safe_counter(traffic.cycle_rx_bytes),
+                browser_safe_counter(traffic.cycle_tx_bytes),
+            )
         });
     Ok(PublicNodeResponse {
         id: node.public_id.clone(),
@@ -457,19 +459,19 @@ struct SummaryAccumulator {
 }
 
 impl SummaryAccumulator {
-    fn add(&mut self, node: &PublicNodeResponse) -> Result<(), PublicSnapshotError> {
-        self.total_nodes = checked_add(self.total_nodes, 1)?;
-        self.today_rx = checked_add(self.today_rx, node.traffic.today_rx)?;
-        self.today_tx = checked_add(self.today_tx, node.traffic.today_tx)?;
-        self.total_rx = checked_add(self.total_rx, node.traffic.total_rx)?;
-        self.total_tx = checked_add(self.total_tx, node.traffic.total_tx)?;
+    fn add(&mut self, node: &PublicNodeResponse) {
+        self.total_nodes = self.total_nodes.saturating_add(1);
+        self.today_rx = browser_safe_add(self.today_rx, node.traffic.today_rx);
+        self.today_tx = browser_safe_add(self.today_tx, node.traffic.today_tx);
+        self.total_rx = browser_safe_add(self.total_rx, node.traffic.total_rx);
+        self.total_tx = browser_safe_add(self.total_tx, node.traffic.total_tx);
         if !node.online {
-            return Ok(());
+            return;
         }
-        self.online_nodes = checked_add(self.online_nodes, 1)?;
+        self.online_nodes = self.online_nodes.saturating_add(1);
         if let Some(metrics) = &node.metrics {
-            self.current_rx_rate = checked_add(self.current_rx_rate, metrics.current_rx_rate)?;
-            self.current_tx_rate = checked_add(self.current_tx_rate, metrics.current_tx_rate)?;
+            self.current_rx_rate = browser_safe_add(self.current_rx_rate, metrics.current_rx_rate);
+            self.current_tx_rate = browser_safe_add(self.current_tx_rate, metrics.current_tx_rate);
             if self
                 .busiest_node
                 .as_ref()
@@ -482,7 +484,6 @@ impl SummaryAccumulator {
                 });
             }
         }
-        Ok(())
     }
 
     fn finish(self, network_rate_history: NetworkRateHistoryResponse) -> SummaryResponse {
@@ -501,10 +502,8 @@ impl SummaryAccumulator {
     }
 }
 
-fn checked_add(left: i64, right: i64) -> Result<i64, PublicSnapshotError> {
-    left.checked_add(right)
-        .filter(|value| *value <= JS_SAFE_INTEGER_MAX)
-        .ok_or(PublicSnapshotError::SafeIntegerOverflow)
+fn browser_safe_add(left: i64, right: i64) -> i64 {
+    left.saturating_add(right).clamp(0, JS_SAFE_INTEGER_MAX)
 }
 
 fn etag(body: &[u8]) -> HeaderValue {
@@ -811,16 +810,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn generation_overflow_retains_previous_cache_and_ring() {
+    async fn summary_aggregate_saturates_at_the_browser_safe_boundary() {
         let generated_at = 9_000;
         let context = TestContext::new(
             "overflow",
             vec![node(1, 0), node(2, 1)],
             vec![recovery(
                 1,
-                (JS_SAFE_INTEGER_MAX, 0),
-                (JS_SAFE_INTEGER_MAX, 0),
-                (JS_SAFE_INTEGER_MAX, 0),
+                (JS_SAFE_INTEGER_MAX + 1_000, JS_SAFE_INTEGER_MAX + 2_000),
+                (JS_SAFE_INTEGER_MAX + 3_000, JS_SAFE_INTEGER_MAX + 4_000),
+                (JS_SAFE_INTEGER_MAX + 5_000, JS_SAFE_INTEGER_MAX + 6_000),
                 generated_at,
                 1,
             )],
@@ -829,7 +828,29 @@ mod tests {
         generate(&context.state, generated_at)
             .await
             .expect("last valid snapshot");
-        let previous = context.state.public_snapshot.load().await;
+        let internal = context
+            .state
+            .traffic
+            .read_current()
+            .get(&1)
+            .copied()
+            .expect("internal traffic state");
+        assert_eq!(internal.rx_total_bytes, JS_SAFE_INTEGER_MAX + 1_000);
+        assert_eq!(internal.today_rx_bytes, JS_SAFE_INTEGER_MAX + 3_000);
+        assert_eq!(internal.cycle_rx_bytes, JS_SAFE_INTEGER_MAX + 5_000);
+        let first = cached_json(&context.state).await;
+        assert_eq!(
+            first["nodes"][0]["traffic"]["total_rx"],
+            JS_SAFE_INTEGER_MAX
+        );
+        assert_eq!(
+            first["nodes"][0]["traffic"]["today_rx"],
+            JS_SAFE_INTEGER_MAX
+        );
+        assert_eq!(
+            first["nodes"][0]["traffic"]["cycle_rx"],
+            JS_SAFE_INTEGER_MAX
+        );
         let cycle = time::billing_cycle(9_001, "Asia/Shanghai", 1).expect("cycle");
         let day = time::day_start_utc(9_001, "Asia/Shanghai").expect("day");
         context
@@ -843,14 +864,21 @@ mod tests {
             .update(2, traffic_sample(JS_SAFE_INTEGER_MAX, 0, day, cycle))
             .expect("second node traffic");
 
-        assert!(matches!(
-            generate(&context.state, 9_001).await,
-            Err(PublicSnapshotError::SafeIntegerOverflow)
-        ));
-        let current = context.state.public_snapshot.load().await;
-        assert_eq!(current.body.as_ref(), previous.body.as_ref());
-        assert_eq!(current.etag, previous.etag);
-        assert_eq!(context.state.public_network_rates.lock().len(), 1);
+        generate(&context.state, 9_001)
+            .await
+            .expect("saturated summary snapshot");
+        let current = cached_json(&context.state).await;
+        assert_eq!(current["summary"]["total_rx"], JS_SAFE_INTEGER_MAX);
+        assert_eq!(current["summary"]["today_rx"], JS_SAFE_INTEGER_MAX);
+        assert_eq!(
+            current["nodes"][0]["traffic"]["total_rx"],
+            JS_SAFE_INTEGER_MAX
+        );
+        assert_eq!(
+            current["nodes"][1]["traffic"]["total_rx"],
+            JS_SAFE_INTEGER_MAX
+        );
+        assert_eq!(context.state.public_network_rates.lock().len(), 2);
         context.finish().await;
     }
 

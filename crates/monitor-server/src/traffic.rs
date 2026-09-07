@@ -14,6 +14,10 @@ use crate::{
 
 pub const JS_SAFE_INTEGER_MAX: i64 = 9_007_199_254_740_991;
 
+pub(crate) fn browser_safe_counter(value: i64) -> i64 {
+    value.clamp(0, JS_SAFE_INTEGER_MAX)
+}
+
 #[derive(Clone, Default)]
 pub struct TrafficState {
     inner: Arc<Mutex<HashMap<i64, NodeTrafficState>>>,
@@ -77,7 +81,7 @@ struct TrafficCheckpointAck {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrafficError {
-    SafeIntegerOverflow,
+    IntegerOverflow,
     GenerationOverflow,
 }
 
@@ -166,8 +170,8 @@ impl TrafficState {
         let cycle_changed = next.cycle_start_utc != sample.billing_cycle.start_utc
             || next.cycle_end_utc != sample.billing_cycle.end_utc;
 
-        next.rx_total_bytes = checked_safe_add(next.rx_total_bytes, rx_delta)?;
-        next.tx_total_bytes = checked_safe_add(next.tx_total_bytes, tx_delta)?;
+        next.rx_total_bytes = checked_i64_add(next.rx_total_bytes, rx_delta)?;
+        next.tx_total_bytes = checked_i64_add(next.tx_total_bytes, tx_delta)?;
         if day_changed {
             next.previous_day = Some(TrafficDayCheckpointRow {
                 day_start_utc: next.day_start_utc,
@@ -178,8 +182,8 @@ impl TrafficState {
             next.today_rx_bytes = 0;
             next.today_tx_bytes = 0;
         }
-        next.today_rx_bytes = checked_safe_add(next.today_rx_bytes, rx_delta)?;
-        next.today_tx_bytes = checked_safe_add(next.today_tx_bytes, tx_delta)?;
+        next.today_rx_bytes = checked_i64_add(next.today_rx_bytes, rx_delta)?;
+        next.today_tx_bytes = checked_i64_add(next.today_tx_bytes, tx_delta)?;
         if cycle_changed {
             next.previous_cycle = Some(TrafficCycleCheckpointRow {
                 cycle_start_utc: next.cycle_start_utc,
@@ -192,8 +196,8 @@ impl TrafficState {
             next.cycle_rx_bytes = 0;
             next.cycle_tx_bytes = 0;
         }
-        next.cycle_rx_bytes = checked_safe_add(next.cycle_rx_bytes, rx_delta)?;
-        next.cycle_tx_bytes = checked_safe_add(next.cycle_tx_bytes, tx_delta)?;
+        next.cycle_rx_bytes = checked_i64_add(next.cycle_rx_bytes, rx_delta)?;
+        next.cycle_tx_bytes = checked_i64_add(next.cycle_tx_bytes, tx_delta)?;
         next.last_rx_counter_bytes = Some(sample.rx_counter_bytes);
         next.last_tx_counter_bytes = Some(sample.tx_counter_bytes);
         next.last_boot_id = Some(sample.boot_id.to_owned());
@@ -359,11 +363,10 @@ fn counter_delta(last: Option<i64>, boot_changed: bool, current: i64) -> i64 {
     }
 }
 
-fn checked_safe_add(value: i64, delta: i64) -> Result<i64, TrafficError> {
+fn checked_i64_add(value: i64, delta: i64) -> Result<i64, TrafficError> {
     value
         .checked_add(delta)
-        .filter(|result| *result <= JS_SAFE_INTEGER_MAX)
-        .ok_or(TrafficError::SafeIntegerOverflow)
+        .ok_or(TrafficError::IntegerOverflow)
 }
 
 #[cfg(test)]
@@ -524,10 +527,10 @@ mod tests {
     }
 
     #[test]
-    fn safe_integer_overflow_leaves_entire_state_unchanged() {
+    fn i64_overflow_leaves_entire_state_unchanged() {
         let traffic = TrafficState::from_recovery(vec![TrafficRecoveryRow {
             node_id: 1,
-            rx_total_bytes: JS_SAFE_INTEGER_MAX,
+            rx_total_bytes: i64::MAX,
             tx_total_bytes: 20,
             last_rx_counter_bytes: Some(100),
             last_tx_counter_bytes: Some(100),
@@ -543,9 +546,30 @@ mod tests {
         let before = traffic.get(1).unwrap();
         assert_eq!(
             traffic.update(1, sample(101, 200, "boot-a")),
-            Err(TrafficError::SafeIntegerOverflow)
+            Err(TrafficError::IntegerOverflow)
         );
         assert_eq!(traffic.get(1).unwrap(), before);
+    }
+
+    #[test]
+    fn internal_totals_continue_past_the_browser_safe_boundary() {
+        let traffic = state();
+        let near_limit = JS_SAFE_INTEGER_MAX - 100;
+        traffic
+            .update(1, sample(100, 100, "boot-a"))
+            .expect("baseline");
+        traffic
+            .update(1, sample(near_limit, near_limit, "boot-a"))
+            .expect("reach just below the browser boundary");
+        traffic
+            .update(1, sample(near_limit + 1_000, near_limit + 1_000, "boot-a"))
+            .expect("cross the browser boundary");
+
+        let current = traffic.get(1).expect("node state");
+        assert_eq!(current.rx_total_bytes, near_limit + 1_000 - 100);
+        assert_eq!(current.tx_total_bytes, near_limit + 1_000 - 100);
+        assert!(current.rx_total_bytes > JS_SAFE_INTEGER_MAX);
+        assert!(current.tx_total_bytes > JS_SAFE_INTEGER_MAX);
     }
 
     #[test]
@@ -977,6 +1001,73 @@ mod tests {
             .expect("traffic state");
         assert_eq!(traffic.generation, traffic.persisted_generation);
         context.finish().await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_and_restart_preserve_full_i64_traffic_precision() {
+        let context = TestContext::new("i64-roundtrip").await;
+        let baseline = JS_SAFE_INTEGER_MAX + 123_456;
+        let now = crate::auth::unix_timestamp().expect("clock");
+        context.publish(now, 0, 0, "boot", now, "baseline").await;
+        context
+            .publish(now + 1, baseline, baseline, "boot", now, "large")
+            .await;
+        assert_eq!(
+            checkpoint_once(&context.state).await.expect("checkpoint"),
+            1
+        );
+
+        let connection = Connection::open(&context.path).expect("inspect checkpoint");
+        let persisted: (i64, i64, i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT t.rx_total_bytes, t.tx_total_bytes, d.rx_bytes, d.tx_bytes,
+                        c.rx_bytes, c.tx_bytes
+                 FROM traffic_totals AS t
+                 JOIN traffic_daily AS d ON d.node_id = t.node_id
+                 JOIN traffic_cycles AS c ON c.node_id = t.node_id
+                 WHERE t.node_id = ?1",
+                [context.node_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("full precision checkpoint");
+        assert_eq!(
+            persisted,
+            (baseline, baseline, baseline, baseline, baseline, baseline)
+        );
+        drop(connection);
+
+        context
+            .state
+            .database
+            .clone()
+            .shutdown()
+            .await
+            .expect("shutdown first database");
+        let database = Database::open(&context.path).expect("reopen database");
+        let hydration = hydrate_startup(&database)
+            .await
+            .expect("hydrate full precision");
+        let recovered = &hydration.traffic_recovery[0];
+        assert_eq!(recovered.rx_total_bytes, baseline);
+        assert_eq!(recovered.tx_total_bytes, baseline);
+        assert_eq!(recovered.today_rx_bytes, baseline);
+        assert_eq!(recovered.today_tx_bytes, baseline);
+        assert_eq!(recovered.cycle_rx_bytes, baseline);
+        assert_eq!(recovered.cycle_tx_bytes, baseline);
+        database
+            .shutdown()
+            .await
+            .expect("shutdown reopened database");
+        remove_database_files(&context.path);
     }
 
     #[tokio::test]

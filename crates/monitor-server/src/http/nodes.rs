@@ -10,6 +10,7 @@ use crate::{
     auth::{encode_hex, random_token, sha256, unix_timestamp},
     database::{AdminNodeRow, NewNodeRow, NodeMetaRow, NodePatchRow, UpdateNodeResult},
     time,
+    traffic::browser_safe_counter,
 };
 
 use super::auth::{
@@ -517,8 +518,8 @@ fn admin_node_response(
         last_ip,
         online,
         last_seen_at,
-        cycle_rx: row.cycle_rx_bytes,
-        cycle_tx: row.cycle_tx_bytes,
+        cycle_rx: browser_safe_counter(row.cycle_rx_bytes),
+        cycle_tx: browser_safe_counter(row.cycle_tx_bytes),
         traffic_limit: row.node.traffic_limit_bytes,
         price_micros: row.node.price_micros,
         currency: row.node.currency,
@@ -897,8 +898,15 @@ mod tests {
             .execute(
                 "INSERT INTO traffic_cycles
                     (node_id, cycle_start_utc, cycle_end_utc, rx_bytes, tx_bytes, updated_at)
-                 VALUES (?1, ?2, ?3, 50, 60, ?4)",
-                params![first_internal, now - 60, now + 60, now],
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    first_internal,
+                    now - 60,
+                    now + 60,
+                    crate::traffic::JS_SAFE_INTEGER_MAX + 123,
+                    crate::traffic::JS_SAFE_INTEGER_MAX + 456,
+                    now
+                ],
             )
             .expect("insert cycle traffic");
         drop(connection);
@@ -924,8 +932,8 @@ mod tests {
         assert_eq!(nodes[1]["id"], second.0);
         assert_eq!(nodes[0]["last_ip"], "203.0.113.10");
         assert_eq!(nodes[0]["online"], false);
-        assert_eq!(nodes[0]["cycle_rx"], 50);
-        assert_eq!(nodes[0]["cycle_tx"], 60);
+        assert_eq!(nodes[0]["cycle_rx"], crate::traffic::JS_SAFE_INTEGER_MAX);
+        assert_eq!(nodes[0]["cycle_tx"], crate::traffic::JS_SAFE_INTEGER_MAX);
         for node in nodes {
             for forbidden in [
                 "token_hash",
