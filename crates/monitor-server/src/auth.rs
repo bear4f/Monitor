@@ -12,10 +12,19 @@ use argon2::{
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+#[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
+const ARGON2_MMAP_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
+
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 unsafe extern "C" {
-    fn malloc_trim(pad: usize) -> i32;
+    fn mallopt(option: i32, value: i32) -> i32;
 }
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const M_MMAP_THRESHOLD: i32 = -3;
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+static PASSWORD_ALLOCATOR_PREPARED: std::sync::Once = std::sync::Once::new();
 
 pub const PASSWORD_MIN_BYTES: usize = 1;
 pub const PASSWORD_MAX_BYTES: usize = 1_024;
@@ -67,36 +76,32 @@ pub fn validate_password(password: &str) -> Result<(), AuthError> {
 
 pub async fn hash_password(password: String) -> Result<String, AuthError> {
     validate_password(&password)?;
-    tokio::task::spawn_blocking(move || {
-        let result = hash_password_blocking(&password);
-        release_password_working_set();
-        result
-    })
-    .await
-    .map_err(AuthError::Worker)?
+    prepare_password_allocator();
+    tokio::task::spawn_blocking(move || hash_password_blocking(&password))
+        .await
+        .map_err(AuthError::Worker)?
 }
 
 pub async fn verify_password(password: String, encoded_hash: String) -> Result<bool, AuthError> {
     validate_password(&password)?;
-    tokio::task::spawn_blocking(move || {
-        let result = verify_password_blocking(&password, &encoded_hash);
-        release_password_working_set();
-        result
-    })
-    .await
-    .map_err(AuthError::Worker)?
+    prepare_password_allocator();
+    tokio::task::spawn_blocking(move || verify_password_blocking(&password, &encoded_hash))
+        .await
+        .map_err(AuthError::Worker)?
 }
 
 #[inline]
-fn release_password_working_set() {
+fn prepare_password_allocator() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     {
-        // SAFETY: malloc_trim(0) is the GNU libc allocator API; no pointer is
-        // passed, and this call is compiled only for linux/gnu targets. Its
-        // advisory return value is intentionally ignored.
-        unsafe {
-            malloc_trim(0);
-        }
+        PASSWORD_ALLOCATOR_PREPARED.call_once(|| {
+            // SAFETY: mallopt is the GNU libc allocator API, compiled only for
+            // linux/gnu targets. No pointer ownership is involved; this
+            // process-global setting is made once before password work begins.
+            unsafe {
+                let _ = mallopt(M_MMAP_THRESHOLD, ARGON2_MMAP_THRESHOLD_BYTES as i32);
+            }
+        });
     }
 }
 
@@ -275,6 +280,12 @@ mod tests {
         assert!(!constant_time_token_eq(&token, &different));
         assert_eq!(decode_hex(&encoded.to_uppercase()), None);
         assert_eq!(decode_hex("00"), None);
+    }
+
+    #[test]
+    fn mmap_threshold_stays_below_default_argon2_working_set() {
+        let default_working_set_bytes = argon2::Params::DEFAULT_M_COST as usize * 1024;
+        assert!(ARGON2_MMAP_THRESHOLD_BYTES < default_working_set_bytes);
     }
 
     #[test]
