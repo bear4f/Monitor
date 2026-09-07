@@ -5,6 +5,7 @@ use std::{
 };
 
 const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 25_774);
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -32,6 +33,7 @@ impl Default for Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     HelpRequested,
+    VersionRequested,
     MissingValue(&'static str),
     InvalidListen(String),
     EmptyDatabasePath,
@@ -42,6 +44,7 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::HelpRequested => formatter.write_str(Self::usage()),
+            Self::VersionRequested => write!(formatter, "monitor-server {VERSION}"),
             Self::MissingValue(flag) => write!(formatter, "missing value for {flag}"),
             Self::InvalidListen(value) => write!(formatter, "invalid --listen address: {value}"),
             Self::EmptyDatabasePath => formatter.write_str("--db path must not be empty"),
@@ -102,6 +105,7 @@ impl Config {
                     }
                 }
                 Some("--help" | "-h") => return Err(ConfigError::HelpRequested),
+                Some("--version") => return Err(ConfigError::VersionRequested),
                 _ => {
                     return Err(ConfigError::UnknownArgument(
                         argument.to_string_lossy().into(),
@@ -137,6 +141,13 @@ mod tests {
     fn rejects_unknown_arguments() {
         let error = Config::parse([OsString::from("--health")]).unwrap_err();
         assert_eq!(error, ConfigError::UnknownArgument("--health".into()));
+    }
+
+    #[test]
+    fn recognizes_version_request() {
+        let error = Config::parse([OsString::from("--version")]).unwrap_err();
+        assert_eq!(error, ConfigError::VersionRequested);
+        assert_eq!(error.to_string(), "monitor-server 0.1.0");
     }
 
     #[test]

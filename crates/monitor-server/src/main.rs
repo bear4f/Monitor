@@ -1,6 +1,6 @@
 use monitor_server::{
     admin_cli,
-    config::{Config, ServerCommand},
+    config::{Config, ServerCommand, VERSION},
     run,
 };
 
@@ -15,6 +15,10 @@ async fn main() {
         Ok(config) => config,
         Err(monitor_server::config::ConfigError::HelpRequested) => {
             println!("{}", monitor_server::config::ConfigError::usage());
+            return;
+        }
+        Err(monitor_server::config::ConfigError::VersionRequested) => {
+            println!("monitor-server {VERSION}");
             return;
         }
         Err(error) => {
