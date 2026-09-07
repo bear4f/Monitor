@@ -57,7 +57,7 @@ impl std::error::Error for ConfigError {}
 
 impl ConfigError {
     pub const fn usage() -> &'static str {
-        "Usage:\n  monitor-server [--listen IP:PORT] [--db PATH]\n  monitor-server admin set-password [--db PATH]\n\nThe password is read from one line on stdin; piping stdin is recommended."
+        "Usage:\n  monitor-server [--listen IP:PORT] [--db PATH]\n  monitor-server admin set-password [--db PATH]\n  monitor-server --version\n\nThe password is read from one line on stdin; piping stdin is recommended."
     }
 }
 
@@ -147,7 +147,8 @@ mod tests {
     fn recognizes_version_request() {
         let error = Config::parse([OsString::from("--version")]).unwrap_err();
         assert_eq!(error, ConfigError::VersionRequested);
-        assert_eq!(error.to_string(), "monitor-server 0.1.0");
+        assert_eq!(error.to_string(), format!("monitor-server {VERSION}"));
+        assert!(ConfigError::usage().contains("--version"));
     }
 
     #[test]
