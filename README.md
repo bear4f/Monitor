@@ -8,9 +8,10 @@ multi-user/RBAC, or Docker management.
 
 ## Requirements and build
 
-Production runtime is Linux. The Server listens on loopback by default and
-the Agent makes outbound HTTP(S) connections. Build the embedded web assets and
-Rust binaries from the repository:
+Production runtime is Linux with systemd. Installation also requires `curl`,
+`sha256sum`, and `ss` from iproute2. The Server listens on loopback by default
+and the Agent makes outbound HTTP(S) connections. Build the embedded web assets
+and Rust binaries from the repository:
 
 ```sh
 cd web && npm ci && npm run build

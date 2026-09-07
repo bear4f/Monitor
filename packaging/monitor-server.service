@@ -8,6 +8,7 @@ Type=simple
 User=monitor
 Group=monitor
 StateDirectory=monitor
+StateDirectoryMode=0750
 UMask=0027
 ExecStart=/usr/local/bin/monitor-server --listen 127.0.0.1:25774 --db /var/lib/monitor/monitor.db
 Restart=on-failure

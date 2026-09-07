@@ -20,6 +20,9 @@ require_linux() {
   command -v curl >/dev/null || die "curl is required"
   command -v sha256sum >/dev/null || die "sha256sum is required"
 }
+ensure_service_manager() {
+  systemctl show-environment >/dev/null 2>&1 || die "systemd is not running"
+}
 normalize_version() {
   local value=$1
   if [[ $value == v* ]]; then
@@ -52,7 +55,10 @@ verify_checksum() {
 }
 installed_component() {
   local component=$1 binary=$2 unit=$3
-  [[ -x $binary && -e $unit ]] || die "$component is not installed as a complete Monitor component"
+  [[ -x $binary && -f $unit && -r $unit && ! -L $unit ]] \
+    || die "$component is not installed as a complete Monitor component"
+  grep -Eq "^ExecStart=$binary([[:space:]]|$)" "$unit" \
+    || die "$unit is not a recognized Monitor unit for $component"
 }
 stage_binary() {
   local source=$1 destination=$2
@@ -66,16 +72,30 @@ rollback_binary() {
   install -o root -g root -m 0755 "$backup" "$temporary"
   mv -f -- "$temporary" "$destination"
 }
+service_is_stable() {
+  local unit=$1 attempt
+  for attempt in 1 2 3; do
+    systemctl is-active --quiet "$unit" || return 1
+    [[ $attempt -eq 3 ]] || sleep 1
+  done
+}
 update_component() {
   local component=$1 unit=$2 binary=$3 source=$4
   local backup="$WORK_DIR/$component.previous"
+  local was_active=false
+  if systemctl is-active --quiet "$unit"; then
+    was_active=true
+  fi
   cp -p -- "$binary" "$backup"
   stage_binary "$source" "$binary"
-  if systemctl is-active --quiet "$unit"; then
-    if ! systemctl restart "$unit" || ! systemctl is-active --quiet "$unit"; then
-      rollback_binary "$backup" "$binary"
-      systemctl restart "$unit" >/dev/null 2>&1 || true
-      die "$component restart failed; previous binary restored"
+  if [[ $was_active == true ]]; then
+    if ! systemctl restart "$unit" || ! service_is_stable "$unit"; then
+      rollback_binary "$backup" "$binary" \
+        || die "$component restart failed and previous binary could not be restored"
+      if systemctl restart "$unit" && service_is_stable "$unit"; then
+        die "$component restart failed; previous binary restored and service recovered"
+      fi
+      die "$component restart failed; previous binary was restored but service recovery failed"
     fi
   fi
   printf '%s updated to %s\n' "$component" "$RELEASE_VERSION"
@@ -107,6 +127,7 @@ done
 [[ $COMPONENT == server || $COMPONENT == agent || $COMPONENT == all ]] || die "invalid component"
 require_root
 require_linux
+ensure_service_manager
 normalize_version "$VERSION"
 architecture_asset
 if [[ $COMPONENT == server || $COMPONENT == all ]]; then
