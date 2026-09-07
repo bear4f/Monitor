@@ -1220,6 +1220,26 @@ mod tests {
         server.finish().await;
     }
 
+    #[tokio::test]
+    async fn unknown_api_path_uses_json_not_found_without_spa_fallback() {
+        let server = TestServer::start(None).await;
+
+        let api = server.request("GET", "/api/not-real", &[], "").await;
+        assert_eq!(api.status, 404);
+        assert_eq!(api.header_values("content-type"), vec!["application/json"]);
+        assert_eq!(api.header_values("cache-control"), vec!["no-store"]);
+        assert_eq!(api.error_code(), "not_found");
+        assert!(!api.body.contains("<!doctype html>"));
+
+        let spa = server
+            .request("GET", "/not-a-real-spa-route", &[], "")
+            .await;
+        assert_eq!(spa.status, 200);
+        assert!(spa.body.contains("<!doctype html>"));
+
+        server.finish().await;
+    }
+
     #[test]
     fn cookie_lookup_skips_unrelated_malformed_segments() {
         let session = "a".repeat(64);

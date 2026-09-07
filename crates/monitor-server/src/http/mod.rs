@@ -9,6 +9,8 @@ mod settings;
 
 use axum::{
     Router,
+    extract::Request,
+    response::{IntoResponse, Response},
     routing::{get, patch, post},
 };
 
@@ -47,5 +49,13 @@ pub fn router(state: AppState) -> Router {
             post(nodes::rotate_token),
         )
         .with_state(state)
-        .fallback(static_files::serve)
+        .fallback(fallback)
+}
+
+async fn fallback(request: Request) -> Response {
+    if request.uri().path() == "/api" || request.uri().path().starts_with("/api/") {
+        auth::ApiError::not_found().into_response()
+    } else {
+        static_files::serve(request).await
+    }
 }

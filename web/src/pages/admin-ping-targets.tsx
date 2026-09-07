@@ -292,6 +292,7 @@ function TargetDialog({
   const [formError, setFormError] = useState<string | null>(null);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    setFormError(null);
     const normalizedName = name.trim();
     const normalizedHost = host.trim();
     if (normalizedName.length < 1 || normalizedName.length > 64) {
