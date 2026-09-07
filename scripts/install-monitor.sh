@@ -159,12 +159,28 @@ ensure_binary_path_safe() {
 valid_agent_environment_content() {
   local file=$1
   [[ -f $file && -r $file ]] || return 1
-  local server_count token_count server_value token_value
-  server_count=$(grep -Ec '^MONITOR_SERVER=' "$file" || true)
-  token_count=$(grep -Ec '^MONITOR_TOKEN=' "$file" || true)
+  local line server_count=0 token_count=0 server_value= token_value=
+  while IFS= read -r line || [[ -n $line ]]; do
+    if [[ $line =~ ^[[:space:]]*$ || $line =~ ^[[:space:]]*[#\;] ]]; then
+      continue
+    fi
+    case $line in
+      MONITOR_SERVER=*)
+        server_count=$((server_count + 1))
+        [[ $server_count -eq 1 ]] || return 1
+        server_value=${line#MONITOR_SERVER=}
+        ;;
+      MONITOR_TOKEN=*)
+        token_count=$((token_count + 1))
+        [[ $token_count -eq 1 ]] || return 1
+        token_value=${line#MONITOR_TOKEN=}
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done < "$file"
   [[ $server_count -eq 1 && $token_count -eq 1 ]] || return 1
-  server_value=$(sed -n 's/^MONITOR_SERVER=//p' "$file")
-  token_value=$(sed -n 's/^MONITOR_TOKEN=//p' "$file")
   valid_agent_server_url "$server_value" || return 1
   [[ $token_value =~ ^[0-9a-f]{64}$ ]]
 }
