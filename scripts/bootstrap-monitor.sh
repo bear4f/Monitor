@@ -10,6 +10,8 @@ set -euo pipefail
 readonly REPOSITORY="bear4f/Monitor"
 readonly SERVER_BINARY=/usr/local/bin/monitor-server
 readonly SERVER_DB=/var/lib/monitor/monitor.db
+readonly SERVER_USER=monitor
+readonly MAX_SECRET_BYTES=1024
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -47,11 +49,31 @@ require_tools() {
   done
 }
 
-# GitHub redirects /releases/latest to the newest tag, so the tag can be read
-# from the Location header without jq or any other parser.
+# The administrator CLI has to run as the monitor user so the database keeps its
+# ownership; running it as root and repairing ownership afterwards is not an
+# option. runuser is preferred because minimal root-only systems frequently have
+# no sudo installed at all. This is resolved before the Server is installed
+# whenever a password will be set, so a missing tool cannot surface halfway
+# through.
+resolve_privilege_drop() {
+  if command -v runuser >/dev/null; then
+    PRIVILEGE_DROP=(runuser -u "$SERVER_USER" --)
+  elif command -v sudo >/dev/null; then
+    # -n keeps sudo from ever prompting and swallowing the password on stdin.
+    PRIVILEGE_DROP=(sudo -n -u "$SERVER_USER" --)
+  else
+    die "runuser (util-linux) or sudo is required to set the administrator password as $SERVER_USER"
+  fi
+}
+
+# GitHub redirects /releases/latest to the newest tag. --location makes curl
+# actually follow that redirect, so %{url_effective} reports the tag URL rather
+# than the request URL; the redirect chain is pinned to HTTPS. The result is
+# only ever used after valid_release_tag accepts it.
 resolve_latest_tag() {
   local location tag
-  location=$(curl --fail --silent --show-error --head --proto '=https' --tlsv1.2 \
+  location=$(curl --fail --silent --show-error --location --max-redirs 5 --head \
+    --proto '=https' --proto-redir '=https' --tlsv1.2 \
     -o /dev/null -w '%{url_effective}' \
     "https://github.com/$REPOSITORY/releases/latest") \
     || die "failed to resolve the latest release"
@@ -62,6 +84,24 @@ resolve_latest_tag() {
 
 valid_release_tag() {
   [[ $1 =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+}
+
+# Counts UTF-8 bytes the way the Server does, which validates 1..=1024 bytes.
+# ${#var} counts characters in a UTF-8 locale, so the count is taken with
+# LC_ALL=C; the local assignment restores the caller's locale on return.
+secret_byte_length() {
+  local LC_ALL=C
+  SECRET_BYTES=${#SECRET_VALUE}
+}
+
+# Content is never trimmed; only the CR of a CRLF terminator is removed, and
+# only where read_secret_file already specifies it.
+validate_secret_bytes() {
+  local description=$1
+  secret_byte_length
+  (( SECRET_BYTES >= 1 )) || die "$description must not be empty"
+  (( SECRET_BYTES <= MAX_SECRET_BYTES )) \
+    || die "$description must be at most $MAX_SECRET_BYTES bytes ($SECRET_BYTES given)"
 }
 
 # Reads a secret file that must be root-owned, mode 0600 and a real file, then
@@ -91,8 +131,6 @@ prompt_secret_twice() {
   IFS= read -r -s second < /dev/tty || die "failed to read $prompt"
   printf '\n' > /dev/tty
   [[ $first == "$second" ]] || die "$prompt entries do not match"
-  [[ -n $first ]] || die "$prompt must not be empty"
-  (( ${#first} <= 1024 )) || die "$prompt exceeds 1024 bytes"
   SECRET_VALUE=$first
   first=
   second=
@@ -104,32 +142,67 @@ prompt_secret_once() {
   printf '%s: ' "$prompt" > /dev/tty
   IFS= read -r -s value < /dev/tty || die "failed to read $prompt"
   printf '\n' > /dev/tty
-  [[ -n $value ]] || die "$prompt must not be empty"
   SECRET_VALUE=$value
   value=
 }
 
-# Uses the installer next to this script when run from a checkout, otherwise
-# downloads the source tree for the resolved tag so the installer, packaging
-# and release binaries all come from the same revision.
-prepare_installer() {
-  local local_installer="$SCRIPT_ROOT/install-monitor.sh"
-  if [[ -f $local_installer ]]; then
-    INSTALLER=$local_installer
-    INSTALLER_SOURCE="local checkout"
+forget_secret() {
+  SECRET_VALUE=
+  unset SECRET_VALUE
+}
+
+# Everything that can reject the request is checked here, before a single byte
+# is downloaded or installed: a mistyped confirmation, a world-readable password
+# file, a symlinked token file, an over-long password or a malformed token all
+# fail while the system is still untouched.
+collect_secrets() {
+  if [[ $COMPONENT == server ]]; then
+    if [[ $SET_PASSWORD == true ]]; then
+      prompt_secret_twice "Administrator password"
+    elif [[ -n $PASSWORD_FILE ]]; then
+      SECRET_VALUE=$(read_secret_file "$PASSWORD_FILE" "administrator password file")
+    else
+      return 0
+    fi
+    validate_secret_bytes "administrator password"
+    resolve_privilege_drop
     return 0
   fi
+
+  [[ -n $AGENT_SERVER ]] || die "agent installation requires --server URL"
+  if [[ -n $TOKEN_FILE ]]; then
+    SECRET_VALUE=$(read_secret_file "$TOKEN_FILE" "agent token file")
+  else
+    prompt_secret_once "MONITOR_TOKEN"
+  fi
+  if [[ ! $SECRET_VALUE =~ ^[0-9a-f]{64}$ ]]; then
+    forget_secret
+    die "agent token must be exactly 64 lowercase hexadecimal characters"
+  fi
+}
+
+# The installer, packaging units and release binaries must all come from the
+# same revision, so the source tree for the resolved tag is always downloaded.
+# There is deliberately no lookup next to this script: under
+# "curl ... | sudo bash -s --" BASH_SOURCE[0] is empty, which would resolve to
+# the current working directory and let a ./install-monitor.sh planted there run
+# as root. Developers testing a checkout invoke scripts/install-monitor.sh
+# directly instead.
+prepare_installer() {
   local tarball="$WORK_DIR/source.tar.gz"
-  curl --fail --location --proto '=https' --tlsv1.2 --silent --show-error \
+  curl --fail --location --max-redirs 5 --proto '=https' --proto-redir '=https' \
+    --tlsv1.2 --silent --show-error \
     "https://github.com/$REPOSITORY/archive/refs/tags/$RELEASE_TAG.tar.gz" \
     -o "$tarball" || die "failed to download the $RELEASE_TAG source tree"
   mkdir -p -- "$WORK_DIR/source"
-  tar -xzf "$tarball" -C "$WORK_DIR/source" --strip-components=1 \
+  tar -xzf "$tarball" -C "$WORK_DIR/source" --strip-components=1 --no-same-owner \
     || die "failed to extract the $RELEASE_TAG source tree"
   INSTALLER="$WORK_DIR/source/scripts/install-monitor.sh"
-  [[ -f $INSTALLER ]] || die "$RELEASE_TAG does not contain scripts/install-monitor.sh"
+  [[ -f $INSTALLER && ! -L $INSTALLER ]] \
+    || die "$RELEASE_TAG does not contain scripts/install-monitor.sh"
+  [[ -d $WORK_DIR/source/packaging && ! -L $WORK_DIR/source/packaging ]] \
+    || die "$RELEASE_TAG does not contain packaging/"
   chmod 0755 "$INSTALLER"
-  INSTALLER_SOURCE="release $RELEASE_TAG"
 }
 
 install_server() {
@@ -138,43 +211,26 @@ install_server() {
   [[ -z $SERVER_PORT ]] || install_args+=(--port "$SERVER_PORT")
   "$INSTALLER" "${install_args[@]}"
 
-  if [[ $SET_PASSWORD == true ]]; then
-    prompt_secret_twice "Administrator password"
-  elif [[ -n $PASSWORD_FILE ]]; then
-    SECRET_VALUE=$(read_secret_file "$PASSWORD_FILE" "administrator password file")
-  else
+  if [[ $SET_PASSWORD == false && -z $PASSWORD_FILE ]]; then
     printf '\nAdministrator password was not changed.\n'
     printf 'If this is a fresh installation, set one with:\n'
-    printf '  sudo -u monitor %s --db %s admin set-password\n' "$SERVER_BINARY" "$SERVER_DB"
+    printf '  %s -u %s -- %s --db %s admin set-password\n' \
+      "${PRIVILEGE_HINT}" "$SERVER_USER" "$SERVER_BINARY" "$SERVER_DB"
     return 0
   fi
 
   # The password reaches the Server only through stdin.
   if printf '%s\n' "$SECRET_VALUE" \
-    | sudo -u monitor "$SERVER_BINARY" --db "$SERVER_DB" admin set-password; then
-    SECRET_VALUE=
-    unset SECRET_VALUE
+    | "${PRIVILEGE_DROP[@]}" "$SERVER_BINARY" --db "$SERVER_DB" admin set-password; then
+    forget_secret
     printf 'Administrator password updated.\n'
   else
-    SECRET_VALUE=
-    unset SECRET_VALUE
+    forget_secret
     die "failed to set the administrator password"
   fi
 }
 
 install_agent() {
-  [[ -n $AGENT_SERVER ]] || die "agent installation requires --server URL"
-  if [[ -n $TOKEN_FILE ]]; then
-    SECRET_VALUE=$(read_secret_file "$TOKEN_FILE" "agent token file")
-  else
-    prompt_secret_once "MONITOR_TOKEN"
-  fi
-  [[ $SECRET_VALUE =~ ^[0-9a-f]{64}$ ]] || {
-    SECRET_VALUE=
-    unset SECRET_VALUE
-    die "agent token must be exactly 64 lowercase hexadecimal characters"
-  }
-
   # install-monitor.sh consumes a root-owned 0600 environment file, so the token
   # is written to one inside the private work directory and removed afterwards.
   local staged="$WORK_DIR/monitor-agent.env"
@@ -183,8 +239,7 @@ install_agent() {
   umask 0077
   printf 'MONITOR_SERVER=%s\nMONITOR_TOKEN=%s\n' "$AGENT_SERVER" "$SECRET_VALUE" > "$staged"
   umask "$previous_umask"
-  SECRET_VALUE=
-  unset SECRET_VALUE
+  forget_secret
   chown root:root "$staged"
   chmod 0600 "$staged"
 
@@ -205,6 +260,9 @@ PASSWORD_FILE=
 SET_PASSWORD=false
 RELEASE_TAG=
 SECRET_VALUE=
+SECRET_BYTES=0
+PRIVILEGE_DROP=()
+PRIVILEGE_HINT=runuser
 
 (($#)) || { usage; exit 1; }
 case $1 in
@@ -217,11 +275,13 @@ while (($#)); do
   case $1 in
     --listen)
       (($# >= 2)) || die "--listen requires an address"
+      [[ -n $2 ]] || die "--listen requires a non-empty address"
       LISTEN_ADDRESS=$2
       shift 2
       ;;
     --port)
       (($# >= 2)) || die "--port requires a value"
+      [[ -n $2 ]] || die "--port requires a non-empty value"
       SERVER_PORT=$2
       shift 2
       ;;
@@ -274,8 +334,8 @@ fi
 
 require_root
 require_tools
+command -v runuser >/dev/null || PRIVILEGE_HINT=sudo
 
-SCRIPT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 if [[ -z $RELEASE_TAG ]]; then
   RELEASE_TAG=$(resolve_latest_tag)
 fi
@@ -289,9 +349,10 @@ cleanup() {
 trap cleanup EXIT
 chmod 0700 "$WORK_DIR"
 
+collect_secrets
 prepare_installer
-printf 'Installing Monitor %s (%s, installer from %s).\n' \
-  "$RELEASE_TAG" "$COMPONENT" "$INSTALLER_SOURCE"
+printf 'Installing Monitor %s (%s, installer from release %s).\n' \
+  "$RELEASE_TAG" "$COMPONENT" "$RELEASE_TAG"
 
 if [[ $COMPONENT == server ]]; then
   install_server
