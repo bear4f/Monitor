@@ -19,7 +19,7 @@ cd .. && cargo build --release --workspace
 ```
 
 The binaries are `target/release/monitor-server` and
-`target/release/monitor-agent`; both report `0.1.1` with `--version`.
+`target/release/monitor-agent`; both report `0.1.2` with `--version`.
 
 ## Quick install
 
@@ -72,7 +72,7 @@ curl -fsSL https://raw.githubusercontent.com/bear4f/Monitor/main/scripts/bootstr
   | bash -s -- agent --server https://monitor.example.com
 ```
 
-Pin an exact release instead of the latest with `--version v0.1.1`. For
+Pin an exact release instead of the latest with `--version v0.1.2`. For
 unattended installs, pass a root-owned `0600` file with
 `--admin-password-file PATH` or `--token-file PATH`; the file is read but never
 copied or deleted.
@@ -99,8 +99,8 @@ the `SHA256SUMS` asset from that same release, verifies SHA256, then installs
 atomically:
 
 ```sh
-sudo ./scripts/install-monitor.sh --version v0.1.1 --component server
-sudo ./scripts/install-monitor.sh --version v0.1.1 --component server \
+sudo ./scripts/install-monitor.sh --version v0.1.2 --component server
+sudo ./scripts/install-monitor.sh --version v0.1.2 --component server \
   --listen 0.0.0.0 --port 25776
 ```
 
@@ -147,7 +147,7 @@ Install the exact release and preserve the token outside argv, URLs, logs, and
 shell history:
 
 ```sh
-sudo ./scripts/install-monitor.sh --version v0.1.1 --component agent \
+sudo ./scripts/install-monitor.sh --version v0.1.2 --component agent \
   --agent-env /root/monitor-agent.env
 ```
 
@@ -164,7 +164,7 @@ fails; the database, Agent environment, and a custom Server listener are all
 preserved:
 
 ```sh
-sudo ./scripts/update-monitor.sh --version v0.1.1 --component all
+sudo ./scripts/update-monitor.sh --version v0.1.2 --component all
 ```
 
 Default uninstall stops and removes Monitor units and binaries, removes the
