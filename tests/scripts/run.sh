@@ -31,10 +31,12 @@ CASES=(
   update_preserves_managed_listener
   update_rejects_foreign_execstart
   uninstall_preflight_before_mutation
+  uninstall_rejects_foreign_execstart
   password_file_ownership_and_mode
   password_byte_length
   privilege_drop_without_sudo
   privilege_drop_missing
+  password_hint_matches_available_tools
   agent_secret_not_in_argv
   invalid_token_refused
 )
@@ -232,6 +234,80 @@ case_uninstall_preflight_before_mutation() {
   [[ ! -e $managed_dropin ]] || return $(fail "the managed drop-in survived uninstall")
   [[ -f /etc/systemd/system/monitor-server.service.d/20-unrelated.conf ]] \
     || return $(fail "an unrelated drop-in was removed")
+}
+
+case_uninstall_rejects_foreign_execstart() {
+  install_server --port 25776 >/dev/null || return $(fail "install failed")
+  local binary_hash unit_hash dropin_hash foreign_hash output
+  binary_hash=$(sha256sum /usr/local/bin/monitor-server | cut -d' ' -f1)
+  unit_hash=$(sha256sum /etc/systemd/system/monitor-server.service | cut -d' ' -f1)
+  dropin_hash=$(sha256sum "$managed_dropin" | cut -d' ' -f1)
+
+  local foreign=/etc/systemd/system/monitor-server.service.d/20-foreign.conf
+  printf '[Service]\nExecStart=\nExecStart=/usr/bin/some-foreign-program\n' > "$foreign"
+  foreign_hash=$(sha256sum "$foreign" | cut -d' ' -f1)
+
+  output=$("$REPO_ROOT/scripts/uninstall-monitor.sh" --component server 2>&1) \
+    && return $(fail "uninstall through a foreign ExecStart override was allowed")
+  grep -q 'overrides ExecStart' <<< "$output" || return $(fail "unexpected refusal: $output")
+
+  grep -qx monitor-server.service "$STATE/active" \
+    || return $(fail "the service was stopped before the refusal")
+  grep -qx monitor-server.service "$STATE/enabled" \
+    || return $(fail "the service was disabled before the refusal")
+  [[ $(sha256sum /usr/local/bin/monitor-server | cut -d' ' -f1) == "$binary_hash" ]] \
+    || return $(fail "the binary was touched before the refusal")
+  [[ $(sha256sum /etc/systemd/system/monitor-server.service | cut -d' ' -f1) == "$unit_hash" ]] \
+    || return $(fail "the unit was touched before the refusal")
+  [[ $(sha256sum "$managed_dropin" | cut -d' ' -f1) == "$dropin_hash" ]] \
+    || return $(fail "the managed drop-in was touched before the refusal")
+  [[ $(sha256sum "$foreign" | cut -d' ' -f1) == "$foreign_hash" ]] \
+    || return $(fail "the foreign drop-in was modified")
+  [[ -d /var/lib/monitor ]] || return $(fail "Server data was removed before the refusal")
+
+  # --purge must refuse just as early, before any data is deleted.
+  output=$("$REPO_ROOT/scripts/uninstall-monitor.sh" --component server --purge 2>&1) \
+    && return $(fail "--purge through a foreign ExecStart override was allowed")
+  [[ -d /var/lib/monitor ]] || return $(fail "Server data was purged despite the refusal")
+
+  # A drop-in that leaves ExecStart alone is unrelated: it must neither block
+  # the uninstall nor be removed by it.
+  rm -f -- "$foreign"
+  local unrelated=/etc/systemd/system/monitor-server.service.d/20-unrelated.conf
+  printf '[Service]\nMemoryMax=256M\n' > "$unrelated"
+  "$REPO_ROOT/scripts/uninstall-monitor.sh" --component server >/dev/null \
+    || return $(fail "an unrelated drop-in blocked the uninstall")
+  [[ ! -e /usr/local/bin/monitor-server ]] || return $(fail "the binary survived uninstall")
+  [[ ! -e /etc/systemd/system/monitor-server.service ]] \
+    || return $(fail "the unit survived uninstall")
+  [[ ! -e $managed_dropin ]] || return $(fail "the managed drop-in survived uninstall")
+  [[ -f $unrelated ]] || return $(fail "the unrelated drop-in was removed")
+}
+
+case_password_hint_matches_available_tools() {
+  local output limited
+  # No password requested: the install succeeds and the hint has to name a tool
+  # that exists here.
+  output=$(bootstrap server --version "$TEST_TAG" 2>&1) \
+    || { printf '%s\n' "$output"; return $(fail "install without a password failed"); }
+  grep -q 'runuser -u monitor -- /usr/local/bin/monitor-server' <<< "$output" \
+    || return $(fail "the hint does not name runuser: $output")
+
+  "$REPO_ROOT/scripts/uninstall-monitor.sh" --component server --purge >/dev/null \
+    || return $(fail "cleanup uninstall failed")
+
+  limited=$(path_without sudo runuser)
+  output=$(PATH=$limited bootstrap server --version "$TEST_TAG" 2>&1) \
+    || { printf '%s\n' "$output"; return $(fail "install without runuser or sudo failed"); }
+  grep -q 'Administrator password is not configured' <<< "$output" \
+    || return $(fail "no honest hint without runuser or sudo: $output")
+  grep -q 'Install util-linux (runuser) or sudo' <<< "$output" \
+    || return $(fail "the hint does not say what to install: $output")
+  grep -qE '(^|[^-])\bsudo -u monitor' <<< "$output" \
+    && return $(fail "the hint printed a sudo command that does not exist here")
+  [[ -x /usr/local/bin/monitor-server ]] \
+    || return $(fail "a valid installation was refused for want of a password tool")
+  return 0
 }
 
 case_password_file_ownership_and_mode() {

@@ -4,6 +4,7 @@ set -euo pipefail
 readonly SERVER_BINARY=/usr/local/bin/monitor-server
 readonly AGENT_BINARY=/usr/local/bin/monitor-agent
 readonly SERVER_UNIT=/etc/systemd/system/monitor-server.service
+readonly SERVER_UNIT_NAME=monitor-server.service
 readonly AGENT_UNIT=/etc/systemd/system/monitor-agent.service
 readonly AGENT_ENV=/etc/monitor-agent.env
 readonly SERVER_DATA=/var/lib/monitor
@@ -73,10 +74,51 @@ remove_unit_if_owned() {
   assert_unit_owned "$unit" "$binary"
   rm -f -- "$unit"
 }
+# systemd loads drop-ins from several unit lookup paths, not only from
+# /etc/systemd/system. Its own view is authoritative when it can answer, and the
+# standard directories are scanned as well. Same understanding as install and
+# update.
+server_dropin_files() {
+  local paths dir file
+  {
+    paths=$(systemctl show -p DropInPaths --value "$SERVER_UNIT_NAME" 2>/dev/null || true)
+    if [[ -n $paths ]]; then
+      # DropInPaths is a space separated list and unit paths carry no spaces.
+      # shellcheck disable=SC2086
+      printf '%s\n' $paths
+    fi
+    for dir in /etc/systemd/system /run/systemd/system \
+      /usr/local/lib/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+      for file in "$dir/$SERVER_UNIT_NAME.d"/*.conf; do
+        if [[ -e $file ]]; then
+          printf '%s\n' "$file"
+        fi
+      done
+    done
+  } | sort -u
+}
+# A drop-in we did not write that overrides ExecStart means the unit no longer
+# starts what this uninstaller thinks it owns, so nothing may be stopped or
+# deleted on that assumption. The foreign file is never touched; resolving it is
+# the operator's call. A drop-in that leaves ExecStart alone is unrelated: it
+# neither blocks the uninstall nor gets removed.
+assert_no_foreign_execstart_dropin() {
+  local file
+  while IFS= read -r file; do
+    [[ -n $file && -f $file ]] || continue
+    if [[ $file == "$SERVER_DROPIN" ]]; then
+      continue
+    fi
+    if grep -Eq '^[[:space:]]*ExecStart=' "$file" 2>/dev/null; then
+      die "$file overrides ExecStart for $SERVER_UNIT_NAME; resolve it before uninstalling"
+    fi
+  done < <(server_dropin_files)
+  return 0
+}
 # Validates the drop-in state before anything is stopped or deleted, so an
 # unexpected state never leaves a half-uninstalled Server behind. Only the
 # listener drop-in this project writes is ever a candidate for removal;
-# unrelated drop-ins are not inspected and not touched.
+# unrelated drop-ins are not removed.
 preflight_managed_dropin() {
   [[ ! -L $SERVER_DROPIN_DIR ]] || die "$SERVER_DROPIN_DIR must not be a symbolic link"
   [[ -e $SERVER_DROPIN || -L $SERVER_DROPIN ]] || return 0
@@ -130,6 +172,7 @@ ensure_service_manager
 if [[ $COMPONENT == server || $COMPONENT == all ]]; then
   assert_component_owned "$SERVER_UNIT" "$SERVER_BINARY"
   preflight_managed_dropin
+  assert_no_foreign_execstart_dropin
 fi
 if [[ $COMPONENT == agent || $COMPONENT == all ]]; then
   assert_component_owned "$AGENT_UNIT" "$AGENT_BINARY"

@@ -151,10 +151,12 @@ forget_secret() {
   unset SECRET_VALUE
 }
 
-# Everything that can reject the request is checked here, before a single byte
-# is downloaded or installed: a mistyped confirmation, a world-readable password
-# file, a symlinked token file, an over-long password or a malformed token all
-# fail while the system is still untouched.
+# Secrets and the local conditions around them are validated here, before a
+# single byte is downloaded or installed: a mistyped confirmation, a
+# world-readable password file, a symlinked token file, an over-long password or
+# a malformed token all fail while the system is still untouched. The
+# MONITOR_SERVER URL is not validated here; install-monitor.sh holds the one
+# canonical validator for it and rejects a bad URL during installation.
 collect_secrets() {
   if [[ $COMPONENT == server ]]; then
     if [[ $SET_PASSWORD == true ]]; then
@@ -205,6 +207,28 @@ prepare_installer() {
   chmod 0755 "$INSTALLER"
 }
 
+# Printed when no password change was requested. The command has to name a
+# privilege-drop tool that actually exists on this machine, and when neither is
+# present it says so instead of printing something unrunnable. An installation
+# that did not ask for a password is still a successful installation.
+print_password_hint() {
+  printf '\nAdministrator password was not changed.\n'
+  if command -v runuser >/dev/null; then
+    printf 'If this is a fresh installation, set one with:\n'
+    printf '  runuser -u %s -- %s --db %s admin set-password\n' \
+      "$SERVER_USER" "$SERVER_BINARY" "$SERVER_DB"
+  elif command -v sudo >/dev/null; then
+    printf 'If this is a fresh installation, set one with:\n'
+    printf '  sudo -u %s -- %s --db %s admin set-password\n' \
+      "$SERVER_USER" "$SERVER_BINARY" "$SERVER_DB"
+  else
+    printf 'Administrator password is not configured.\n'
+    printf 'Install util-linux (runuser) or sudo, then run\n'
+    printf '  %s --db %s admin set-password\n' "$SERVER_BINARY" "$SERVER_DB"
+    printf 'as the %s user.\n' "$SERVER_USER"
+  fi
+}
+
 install_server() {
   local -a install_args=(--version "$RELEASE_TAG" --component server)
   [[ -z $LISTEN_ADDRESS ]] || install_args+=(--listen "$LISTEN_ADDRESS")
@@ -212,10 +236,7 @@ install_server() {
   "$INSTALLER" "${install_args[@]}"
 
   if [[ $SET_PASSWORD == false && -z $PASSWORD_FILE ]]; then
-    printf '\nAdministrator password was not changed.\n'
-    printf 'If this is a fresh installation, set one with:\n'
-    printf '  %s -u %s -- %s --db %s admin set-password\n' \
-      "${PRIVILEGE_HINT}" "$SERVER_USER" "$SERVER_BINARY" "$SERVER_DB"
+    print_password_hint
     return 0
   fi
 
@@ -262,7 +283,6 @@ RELEASE_TAG=
 SECRET_VALUE=
 SECRET_BYTES=0
 PRIVILEGE_DROP=()
-PRIVILEGE_HINT=runuser
 
 (($#)) || { usage; exit 1; }
 case $1 in
@@ -334,7 +354,6 @@ fi
 
 require_root
 require_tools
-command -v runuser >/dev/null || PRIVILEGE_HINT=sudo
 
 if [[ -z $RELEASE_TAG ]]; then
   RELEASE_TAG=$(resolve_latest_tag)
