@@ -2,13 +2,19 @@
 set -euo pipefail
 
 readonly REPOSITORY="bear4f/Monitor"
-readonly SERVER_PORT=25774
+readonly DEFAULT_LISTEN_ADDRESS=127.0.0.1
+readonly DEFAULT_SERVER_PORT=25774
 readonly SERVER_BINARY=/usr/local/bin/monitor-server
 readonly AGENT_BINARY=/usr/local/bin/monitor-agent
 readonly SERVER_UNIT=/etc/systemd/system/monitor-server.service
+readonly SERVER_UNIT_NAME=monitor-server.service
 readonly AGENT_UNIT=/etc/systemd/system/monitor-agent.service
 readonly AGENT_ENV=/etc/monitor-agent.env
 readonly SERVER_DATA=/var/lib/monitor
+readonly SERVER_DB=/var/lib/monitor/monitor.db
+readonly SERVER_DROPIN_DIR=/etc/systemd/system/monitor-server.service.d
+readonly SERVER_DROPIN=/etc/systemd/system/monitor-server.service.d/10-monitor-listen.conf
+readonly SERVER_DROPIN_MARKER='# Managed-By: monitor-install (listener)'
 
 die() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -18,10 +24,16 @@ die() {
 usage() {
   cat <<'EOF'
 Usage: install-monitor.sh --version VERSION [--component server|agent|all]
-       [--agent-env PATH]
+       [--listen ADDRESS] [--port PORT] [--agent-env PATH]
 
 Install release binaries and their systemd units. VERSION is required and
 must identify an explicit GitHub Release (for example v0.1.1).
+
+--listen and --port change where the Server listens. The default is
+127.0.0.1:25774. The listener is applied through a managed systemd drop-in so
+the shipped unit stays byte-identical and auditable. When neither flag is
+given an existing managed listener is preserved, so reinstalling never resets
+a customised port.
 EOF
 }
 
@@ -62,8 +74,8 @@ download_asset() {
   local asset=$1
   local destination=$2
   local base_url="https://github.com/$REPOSITORY/releases/download/$RELEASE_TAG"
-  curl --fail --location --proto '=https' --tlsv1.2 --silent --show-error \
-    "$base_url/$asset" -o "$destination"
+  curl --fail --location --max-redirs 5 --proto '=https' --proto-redir '=https' \
+    --tlsv1.2 --silent --show-error "$base_url/$asset" -o "$destination"
 }
 
 verify_checksum() {
@@ -124,18 +136,222 @@ write_unit_safely() {
   install -o root -g root -m 0644 "$source" "$destination"
 }
 
-port_is_listening() {
-  ss -Hln "sport = :$SERVER_PORT" 2>/dev/null | grep -q .
+valid_port() {
+  local value=$1
+  [[ $value =~ ^[0-9]{1,5}$ ]] || return 1
+  (( 10#$value >= 1 && 10#$value <= 65535 ))
 }
 
+# Formats ADDRESS and PORT the way Rust's SocketAddr parses them, bracketing
+# IPv6 literals. Reuses the address validators the Agent URL check already uses
+# so there is only one notion of a valid literal in this script.
+compose_listen_socket() {
+  local address=$1 port=$2
+  if valid_ipv4_literal "$address"; then
+    LISTEN_SOCKET="$address:$port"
+  elif valid_ipv6_literal "$address"; then
+    LISTEN_SOCKET="[$address]:$port"
+  else
+    die "invalid --listen address: $address"
+  fi
+}
+
+dropin_is_managed() {
+  local file=$1
+  [[ -f $file && ! -L $file ]] || return 1
+  [[ $(head -n 1 -- "$file") == "$SERVER_DROPIN_MARKER" ]]
+}
+
+# Reads back the listener from our own drop-in so a reinstall or update without
+# --listen/--port keeps whatever the operator already chose.
+managed_dropin_socket() {
+  local line
+  dropin_is_managed "$SERVER_DROPIN" || return 1
+  line=$(grep -m1 -E "^ExecStart=$SERVER_BINARY[[:space:]]" "$SERVER_DROPIN" 2>/dev/null) || return 1
+  [[ $line =~ --listen[[:space:]]+([^[:space:]]+) ]] || return 1
+  printf '%s' "${BASH_REMATCH[1]}"
+}
+
+split_socket() {
+  local socket=$1
+  if [[ $socket == \[*\]:* ]]; then
+    SOCKET_ADDRESS=${socket%%]:*}
+    SOCKET_ADDRESS=${SOCKET_ADDRESS#[}
+    SOCKET_PORT=${socket##*]:}
+  else
+    SOCKET_ADDRESS=${socket%:*}
+    SOCKET_PORT=${socket##*:}
+  fi
+  valid_port "$SOCKET_PORT" || return 1
+  valid_ipv4_literal "$SOCKET_ADDRESS" || valid_ipv6_literal "$SOCKET_ADDRESS" || return 1
+}
+
+# systemd loads drop-ins from several unit lookup paths, not only from
+# /etc/systemd/system. Its own view is authoritative when it can answer, and the
+# standard directories are scanned as well so a unit systemd has not loaded yet
+# is still covered.
+server_dropin_files() {
+  local paths dir file
+  {
+    paths=$(systemctl show -p DropInPaths --value "$SERVER_UNIT_NAME" 2>/dev/null || true)
+    if [[ -n $paths ]]; then
+      # DropInPaths is a space separated list and unit paths carry no spaces.
+      # shellcheck disable=SC2086
+      printf '%s\n' $paths
+    fi
+    for dir in /etc/systemd/system /run/systemd/system \
+      /usr/local/lib/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+      for file in "$dir/$SERVER_UNIT_NAME.d"/*.conf; do
+        if [[ -e $file ]]; then
+          printf '%s\n' "$file"
+        fi
+      done
+    done
+  } | sort -u
+}
+
+# Any drop-in we did not write that also sets ExecStart would silently fight
+# ours, so refuse rather than guess. Unrelated drop-ins are left untouched.
+assert_no_conflicting_dropin() {
+  local file
+  [[ ! -L $SERVER_DROPIN_DIR ]] || die "$SERVER_DROPIN_DIR must not be a symbolic link"
+  [[ ! -L $SERVER_DROPIN ]] || die "$SERVER_DROPIN must not be a symbolic link"
+  if [[ -e $SERVER_DROPIN ]] && ! dropin_is_managed "$SERVER_DROPIN"; then
+    die "$SERVER_DROPIN exists but was not written by this installer"
+  fi
+  while IFS= read -r file; do
+    [[ -n $file && -f $file ]] || continue
+    if [[ $file == "$SERVER_DROPIN" ]]; then
+      continue
+    fi
+    if grep -Eq '^[[:space:]]*ExecStart=' "$file" 2>/dev/null; then
+      die "$file overrides ExecStart for $SERVER_UNIT_NAME; resolve it before configuring the Monitor listener"
+    fi
+  done < <(server_dropin_files)
+  return 0
+}
+
+resolve_server_listener() {
+  local existing address port
+  address=$LISTEN_ADDRESS_ARG
+  port=$SERVER_PORT_ARG
+  if [[ -z $address || -z $port ]]; then
+    if existing=$(managed_dropin_socket) && split_socket "$existing"; then
+      [[ -n $address ]] || address=$SOCKET_ADDRESS
+      [[ -n $port ]] || port=$SOCKET_PORT
+    fi
+  fi
+  [[ -n $address ]] || address=$DEFAULT_LISTEN_ADDRESS
+  [[ -n $port ]] || port=$DEFAULT_SERVER_PORT
+  valid_port "$port" || die "invalid --port: $port"
+  compose_listen_socket "$address" "$port"
+  EFFECTIVE_ADDRESS=$address
+  EFFECTIVE_PORT=$port
+}
+
+warn_public_listener() {
+  case $EFFECTIVE_ADDRESS in
+    0.0.0.0|::|0:0:0:0:0:0:0:0)
+      cat >&2 <<'EOF'
+WARNING: the Server will accept connections from any address.
+Monitor itself serves HTTP.
+Use HTTPS through a trusted reverse proxy for administrator login.
+Direct public HTTP administrator login is intentionally unsupported.
+EOF
+      ;;
+  esac
+}
+
+apply_server_listener() {
+  assert_no_conflicting_dropin
+  if [[ $LISTEN_SOCKET == "$DEFAULT_LISTEN_ADDRESS:$DEFAULT_SERVER_PORT" ]]; then
+    # The shipped unit already starts on the default socket, so the managed
+    # drop-in is removed instead of restating it.
+    remove_managed_dropin
+    return 0
+  fi
+  [[ ! -L $SERVER_DROPIN ]] || die "$SERVER_DROPIN must not be a symbolic link"
+  if [[ -e $SERVER_DROPIN ]] && ! dropin_is_managed "$SERVER_DROPIN"; then
+    die "$SERVER_DROPIN exists but was not written by this installer"
+  fi
+  install -d -o root -g root -m 0755 "$SERVER_DROPIN_DIR"
+  local temporary="$SERVER_DROPIN.new.$$"
+  cat > "$temporary" <<EOF
+$SERVER_DROPIN_MARKER
+# Regenerated by install-monitor.sh; edit through --listen/--port instead.
+[Service]
+ExecStart=
+ExecStart=$SERVER_BINARY --listen $LISTEN_SOCKET --db $SERVER_DB
+EOF
+  chown root:root "$temporary"
+  chmod 0644 "$temporary"
+  mv -f -- "$temporary" "$SERVER_DROPIN"
+}
+
+remove_managed_dropin() {
+  [[ -e $SERVER_DROPIN || -L $SERVER_DROPIN ]] || return 0
+  dropin_is_managed "$SERVER_DROPIN" \
+    || die "$SERVER_DROPIN exists but was not written by this installer"
+  rm -f -- "$SERVER_DROPIN"
+  rmdir -- "$SERVER_DROPIN_DIR" 2>/dev/null || true
+}
+
+port_is_listening() {
+  ss -Hln "sport = :$EFFECTIVE_PORT" 2>/dev/null | grep -q .
+}
+
+# Pids that hold a listening socket on PORT, one per line. Empty when ss cannot
+# report process information.
+port_listener_pids() {
+  ss -Hlnp "sport = :$1" 2>/dev/null \
+    | grep -o 'pid=[0-9]\+' | cut -d= -f2 | sort -u
+}
+
+# The socket the installed Server is currently configured to use, or failure
+# when no recognized Monitor unit is installed. The managed drop-in wins over
+# the shipped unit because that is how systemd resolves the effective ExecStart.
+configured_monitor_socket() {
+  local socket line
+  if socket=$(managed_dropin_socket); then
+    printf '%s' "$socket"
+    return 0
+  fi
+  # A file at the managed path that we did not write may carry any listener at
+  # all, so the effective socket is unknown rather than the shipped default.
+  [[ ! -e $SERVER_DROPIN ]] || return 1
+  [[ -f $SERVER_UNIT && ! -L $SERVER_UNIT ]] || return 1
+  line=$(grep -m1 -E "^ExecStart=$SERVER_BINARY[[:space:]]" "$SERVER_UNIT" 2>/dev/null) || return 1
+  [[ $line =~ --listen[[:space:]]+([^[:space:]]+) ]] || return 1
+  printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# An occupied port is only acceptable when the listener provably belongs to the
+# Monitor Server that is already configured for that same port. A busy port that
+# Monitor is not currently configured for always refuses, even while
+# monitor-server.service is active somewhere else. Nothing is ever killed and
+# ownership is never inferred from "the service happens to be running".
 check_server_port() {
-  if port_is_listening; then
-    systemctl is-active --quiet monitor-server.service \
-      || die "127.0.0.1:$SERVER_PORT is occupied by an unknown service; refusing to replace it"
-    [[ -f $SERVER_UNIT ]] \
-      || die "127.0.0.1:$SERVER_PORT is occupied but Monitor Server ownership is unrecognized"
-    assert_unit_owned "$SERVER_UNIT" "$SERVER_BINARY" \
-      || die "127.0.0.1:$SERVER_PORT is occupied but Monitor Server ownership is unrecognized"
+  port_is_listening || return 0
+  local current pids main_pid
+  current=$(configured_monitor_socket) \
+    || die "port $EFFECTIVE_PORT is occupied by an unknown service; refusing to replace it"
+  split_socket "$current" \
+    || die "port $EFFECTIVE_PORT is occupied and the installed Monitor listener could not be read"
+  [[ $SOCKET_PORT == "$EFFECTIVE_PORT" ]] \
+    || die "port $EFFECTIVE_PORT is already in use by another service; Monitor Server is configured for $current"
+  systemctl is-active --quiet "$SERVER_UNIT_NAME" \
+    || die "port $EFFECTIVE_PORT is occupied by an unknown service; refusing to replace it"
+  [[ -f $SERVER_UNIT ]] \
+    || die "port $EFFECTIVE_PORT is occupied but Monitor Server ownership is unrecognized"
+  assert_unit_owned "$SERVER_UNIT" "$SERVER_BINARY" \
+    || die "port $EFFECTIVE_PORT is occupied but Monitor Server ownership is unrecognized"
+  main_pid=$(systemctl show -p MainPID --value "$SERVER_UNIT_NAME" 2>/dev/null || true)
+  pids=$(port_listener_pids "$EFFECTIVE_PORT")
+  if [[ -n $pids ]]; then
+    [[ $main_pid =~ ^[0-9]+$ ]] && (( main_pid > 0 )) \
+      || die "port $EFFECTIVE_PORT is occupied but $SERVER_UNIT_NAME has no main process"
+    [[ $pids == "$main_pid" ]] \
+      || die "port $EFFECTIVE_PORT is held by a process outside $SERVER_UNIT_NAME; refusing to continue"
   fi
 }
 
@@ -324,12 +540,33 @@ install_server() {
   [[ -d $SERVER_DATA ]] || die "$SERVER_DATA is not a directory"
   [[ ! -L $SERVER_DATA ]] || die "$SERVER_DATA must not be a symbolic link"
   write_unit_safely "$unit_source" "$SERVER_UNIT"
+  apply_server_listener
   install_binary "$WORK_DIR/monitor-server" "$SERVER_BINARY"
   systemctl daemon-reload
   systemctl enable monitor-server.service >/dev/null
   systemctl restart monitor-server.service
   systemctl is-active --quiet monitor-server.service \
     || die "monitor-server failed to start; inspect journalctl -u monitor-server"
+  cat <<EOF
+
+Monitor Server installed successfully.
+
+Version:
+$RELEASE_VERSION
+
+Listen:
+$LISTEN_SOCKET
+
+Database:
+$SERVER_DB
+
+Service:
+monitor-server.service
+
+Next:
+Configure HTTPS reverse proxy.
+Set administrator password if not already configured.
+EOF
 }
 
 install_agent() {
@@ -352,6 +589,24 @@ install_agent() {
     systemctl restart monitor-agent.service
     systemctl is-active --quiet monitor-agent.service \
       || die "monitor-agent failed to start; inspect journalctl -u monitor-agent"
+    local agent_server
+    agent_server=$(sed -n 's/^MONITOR_SERVER=//p' "$AGENT_ENV" | head -n 1)
+    cat <<EOF
+
+Monitor Agent installed successfully.
+
+Version:
+$RELEASE_VERSION
+
+Server:
+$agent_server
+
+Service:
+monitor-agent.service
+
+Status:
+active
+EOF
   else
     stop_disable_unit monitor-agent.service "$AGENT_UNIT" "$AGENT_BINARY"
     printf 'Monitor Agent installed but not started: configure %s as root:root mode 0600.\n' "$AGENT_ENV"
@@ -361,11 +616,30 @@ install_agent() {
 VERSION=
 COMPONENT=all
 AGENT_ENV_SOURCE=
+LISTEN_ADDRESS_ARG=
+SERVER_PORT_ARG=
+LISTEN_SOCKET=
+EFFECTIVE_ADDRESS=
+EFFECTIVE_PORT=$DEFAULT_SERVER_PORT
+SOCKET_ADDRESS=
+SOCKET_PORT=
 while (($#)); do
   case $1 in
     --version)
       (($# >= 2)) || die "--version requires a value"
       VERSION=$2
+      shift 2
+      ;;
+    --listen)
+      (($# >= 2)) || die "--listen requires an address"
+      [[ -n $2 ]] || die "--listen requires a non-empty address"
+      LISTEN_ADDRESS_ARG=$2
+      shift 2
+      ;;
+    --port)
+      (($# >= 2)) || die "--port requires a value"
+      [[ -n $2 ]] || die "--port requires a non-empty value"
+      SERVER_PORT_ARG=$2
       shift 2
       ;;
     --component)
@@ -387,6 +661,10 @@ while (($#)); do
 done
 
 [[ -n $VERSION ]] || die "--version is required"
+if [[ $COMPONENT == agent ]]; then
+  [[ -z $LISTEN_ADDRESS_ARG && -z $SERVER_PORT_ARG ]] \
+    || die "--listen and --port apply to the Server component"
+fi
 [[ $COMPONENT == server || $COMPONENT == agent || $COMPONENT == all ]] \
   || die "--component must be server, agent, or all"
 require_root
@@ -398,7 +676,13 @@ architecture_asset
 SCRIPT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 if [[ $COMPONENT == server || $COMPONENT == all ]]; then
-  preflight_systemd_unit monitor-server.service "$SERVER_UNIT" "$SERVER_BINARY"
+  resolve_server_listener
+  warn_public_listener
+  # Both of these must run before anything is downloaded or written, so a
+  # foreign ExecStart override or a busy port stops the install untouched.
+  assert_no_conflicting_dropin
+  check_server_port
+  preflight_systemd_unit "$SERVER_UNIT_NAME" "$SERVER_UNIT" "$SERVER_BINARY"
   if [[ -e $SERVER_UNIT ]]; then
     assert_unit_owned "$SERVER_UNIT" "$SERVER_BINARY"
   fi

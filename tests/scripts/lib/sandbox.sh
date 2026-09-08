@@ -1,0 +1,409 @@
+#!/usr/bin/env bash
+# Sandbox helpers for the installer regression tests.
+#
+# Every case runs in its own mount namespace with overlay mounts over /etc,
+# /usr/local/bin and /var/lib, so the real scripts run unmodified at their real
+# absolute paths and nothing on the host is changed. GitHub, systemd, ss and the
+# release binaries are replaced by small fakes on PATH.
+#
+# This is test-only tooling. Nothing here is installed or shipped.
+
+REPO_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)
+readonly REPO_ROOT
+readonly TEST_VERSION=9.9.9
+readonly TEST_TAG=v9.9.9
+readonly LATEST_TAG=v1.2.3
+
+fail() {
+  printf 'ASSERT: %s\n' "$*" >&2
+  return 1
+}
+
+# --- namespace ---------------------------------------------------------------
+
+overlay_mount() {
+  local target=$1 name=$2
+  mkdir -p "$CASE_TMP/ovl/$name/upper" "$CASE_TMP/ovl/$name/work" "$target"
+  mount -t overlay "overlay-$name" \
+    -o "lowerdir=$target,upperdir=$CASE_TMP/ovl/$name/upper,workdir=$CASE_TMP/ovl/$name/work" \
+    "$target"
+}
+
+sandbox_init() {
+  mount --make-rprivate / 2>/dev/null || true
+  # The Server CLI runs as the monitor user, so it has to be able to traverse
+  # into the case directory to reach the fake binary's log.
+  chmod 0755 "$CASE_TMP"
+  overlay_mount /etc etc
+  overlay_mount /usr/local/bin usrlocalbin
+  overlay_mount /var/lib varlib
+  mkdir -p /etc/systemd/system
+
+  # The installer refuses to create a user with an unexpected shape, so the
+  # accounts are pre-created exactly as install-monitor.sh would create them.
+  local user
+  for user in monitor monitor-agent; do
+    if ! getent passwd "$user" >/dev/null; then
+      local uid=31000
+      [[ $user == monitor-agent ]] && uid=31001
+      printf '%s:x:%s:\n' "$user" "$uid" >> /etc/group
+      printf '%s:x:%s:%s::/nonexistent:/usr/sbin/nologin\n' "$user" "$uid" "$uid" >> /etc/passwd
+    fi
+  done
+
+  STATE="$CASE_TMP/state"
+  mkdir -p "$STATE"
+  : > "$STATE/active"
+  : > "$STATE/enabled"
+  : > "$STATE/listeners"
+  : > "$STATE/curl.log"
+  : > "$STATE/exec.log"
+  : > "$STATE/admin.log"
+  echo 1000 > "$STATE/pidseq"
+  # The Server CLI runs as the monitor user, so its log has to be writable by it.
+  chmod 0777 "$STATE"
+  chmod 0666 "$STATE/admin.log"
+
+  build_fakes
+  build_release
+  PATH="$CASE_TMP/bin:$PATH"
+  export PATH STATE
+}
+
+# --- fakes -------------------------------------------------------------------
+
+build_fakes() {
+  mkdir -p "$CASE_TMP/bin"
+
+  cat > "$CASE_TMP/bin/systemctl" <<FAKE
+#!/usr/bin/env bash
+# Minimal systemd stand-in: unit state, drop-in resolution and the listening
+# socket a started unit would own.
+set -uo pipefail
+STATE="$STATE"
+FAKE
+  cat >> "$CASE_TMP/bin/systemctl" <<'FAKE'
+unit_file() { printf '/etc/systemd/system/%s' "$1"; }
+
+dropins() {
+  local f
+  for f in "/etc/systemd/system/$1.d"/*.conf; do
+    [[ -e $f ]] && printf '%s\n' "$f"
+  done
+  return 0
+}
+
+effective_exec() {
+  local unit=$1 file line exec_line=
+  file=$(unit_file "$unit")
+  [[ -f $file ]] || return 1
+  exec_line=$(grep -m1 '^ExecStart=' "$file" 2>/dev/null || true)
+  while IFS= read -r file; do
+    [[ -n $file ]] || continue
+    local candidate=
+    while IFS= read -r line; do
+      candidate=$line
+    done < <(grep '^ExecStart=' "$file" 2>/dev/null || true)
+    [[ -n $candidate ]] && exec_line=$candidate
+  done < <(dropins "$unit")
+  printf '%s' "${exec_line#ExecStart=}"
+}
+
+listen_port() {
+  local exec_line=$1 socket
+  [[ $exec_line =~ --listen[[:space:]]+([^[:space:]]+) ]] || return 1
+  socket=${BASH_REMATCH[1]}
+  printf '%s' "${socket##*:}"
+}
+
+is_active() { grep -qxF "$1" "$STATE/active"; }
+
+set_active() {
+  is_active "$1" || printf '%s\n' "$1" >> "$STATE/active"
+}
+
+clear_active() {
+  local keep
+  keep=$(grep -vxF "$1" "$STATE/active" || true)
+  printf '%s' "$keep" > "$STATE/active"
+  [[ -s $STATE/active ]] && printf '\n' >> "$STATE/active"
+  return 0
+}
+
+next_pid() {
+  local pid
+  pid=$(< "$STATE/pidseq")
+  printf '%s' $((pid + 1)) > "$STATE/pidseq"
+  printf '%s' $((pid + 1))
+}
+
+drop_listeners_for_unit() {
+  local unit=$1 keep
+  keep=$(grep -v " $unit\$" "$STATE/listeners" || true)
+  printf '%s' "$keep" > "$STATE/listeners"
+  [[ -s $STATE/listeners ]] && printf '\n' >> "$STATE/listeners"
+  return 0
+}
+
+start_unit() {
+  local unit=$1 exec_line port pid
+  exec_line=$(effective_exec "$unit") || { printf 'no unit %s\n' "$unit" >&2; exit 1; }
+  drop_listeners_for_unit "$unit"
+  pid=$(next_pid)
+  printf '%s %s\n' "$pid" "$unit" > "$STATE/mainpid.$unit"
+  if port=$(listen_port "$exec_line"); then
+    printf '%s %s %s\n' "$port" "$pid" "$unit" >> "$STATE/listeners"
+  fi
+  printf 'exec %s :: %s\n' "$unit" "$exec_line" >> "$STATE/exec.log"
+  set_active "$unit"
+}
+
+case ${1-} in
+  show-environment) exit 0 ;;
+  daemon-reload) exit 0 ;;
+esac
+
+case ${1-} in
+  show)
+    property=; unit=
+    shift
+    while (($#)); do
+      case $1 in
+        -p) property=$2; shift 2 ;;
+        --value) shift ;;
+        *) unit=$1; shift ;;
+      esac
+    done
+    case $property in
+      LoadState)
+        if [[ -f $(unit_file "$unit") ]]; then echo loaded; else echo not-found; fi ;;
+      FragmentPath)
+        if [[ -f $(unit_file "$unit") ]]; then unit_file "$unit"; echo; else echo; fi ;;
+      DropInPaths)
+        mapfile -t found < <(dropins "$unit")
+        printf '%s\n' "${found[*]-}" ;;
+      MainPID)
+        if [[ -f $STATE/mainpid.$unit ]] && is_active "$unit"; then
+          awk '{print $1}' "$STATE/mainpid.$unit"
+        else
+          echo 0
+        fi ;;
+      *) echo ;;
+    esac
+    exit 0
+    ;;
+  is-active)
+    shift
+    [[ ${1-} == --quiet ]] && shift
+    is_active "${1-}" && exit 0 || exit 3
+    ;;
+  is-enabled)
+    shift
+    if grep -qxF "${1-}" "$STATE/enabled"; then echo enabled; exit 0; fi
+    echo disabled; exit 1
+    ;;
+  enable)
+    shift
+    grep -qxF "${1-}" "$STATE/enabled" || printf '%s\n' "${1-}" >> "$STATE/enabled"
+    exit 0
+    ;;
+  disable)
+    shift
+    keep=$(grep -vxF "${1-}" "$STATE/enabled" || true)
+    printf '%s' "$keep" > "$STATE/enabled"
+    [[ -s $STATE/enabled ]] && printf '\n' >> "$STATE/enabled"
+    exit 0
+    ;;
+  stop)
+    shift
+    clear_active "${1-}"
+    drop_listeners_for_unit "${1-}"
+    exit 0
+    ;;
+  start|restart)
+    shift
+    start_unit "${1-}"
+    exit 0
+    ;;
+esac
+exit 0
+FAKE
+
+  cat > "$CASE_TMP/bin/ss" <<FAKE
+#!/usr/bin/env bash
+set -uo pipefail
+STATE="$STATE"
+FAKE
+  cat >> "$CASE_TMP/bin/ss" <<'FAKE'
+want_pid=false
+port=
+for arg in "$@"; do
+  case $arg in
+    -*p*) want_pid=true ;;
+  esac
+  if [[ $arg == sport\ =\ :* ]]; then port=${arg##*:}; fi
+done
+[[ -n $port ]] || exit 0
+while read -r listen_port listen_pid owner; do
+  [[ -n ${listen_port-} ]] || continue
+  [[ $listen_port == "$port" ]] || continue
+  if [[ $want_pid == true ]]; then
+    printf 'tcp   LISTEN 0 4096 0.0.0.0:%s 0.0.0.0:* users:(("%s",pid=%s,fd=7))\n' \
+      "$listen_port" "${owner:-unknown}" "$listen_pid"
+  else
+    printf 'tcp   LISTEN 0 4096 0.0.0.0:%s 0.0.0.0:*\n' "$listen_port"
+  fi
+done < "$STATE/listeners"
+exit 0
+FAKE
+
+  cat > "$CASE_TMP/bin/curl" <<FAKE
+#!/usr/bin/env bash
+# Faithful enough stand-in for the two ways the scripts call curl: a HEAD that
+# reports %{url_effective}, and a download to -o. Redirects are only followed
+# when --location is present, exactly like the real curl.
+set -uo pipefail
+STATE="$STATE"
+WEB="$CASE_TMP/web"
+FAKE
+  cat >> "$CASE_TMP/bin/curl" <<'FAKE'
+follow=false
+head=false
+output=
+url=
+write_out=
+while (($#)); do
+  case $1 in
+    --location|-L) follow=true; shift ;;
+    --head|-I) head=true; shift ;;
+    -o) output=$2; shift 2 ;;
+    -w) write_out=$2; shift 2 ;;
+    --max-redirs|--proto|--proto-redir) shift 2 ;;
+    --fail|--silent|--show-error|--tlsv1.2|-fsSL) shift ;;
+    -*) shift ;;
+    *) url=$1; shift ;;
+  esac
+done
+printf '%s\n' "$url" >> "$STATE/curl.log"
+[[ -n $url ]] || exit 2
+
+resolved=$url
+if [[ $follow == true && -f $WEB/redirects ]]; then
+  while read -r from to; do
+    [[ $from == "$url" ]] && resolved=$to
+  done < "$WEB/redirects"
+fi
+
+path=${resolved#https://github.com/}
+path=${path#https://raw.githubusercontent.com/}
+asset="$WEB/$path"
+
+if [[ $head == true ]]; then
+  # A HEAD without --location must not resolve the redirect.
+  if [[ $write_out == '%{url_effective}' ]]; then printf '%s' "$resolved"; fi
+  [[ -n $output ]] && : > "$output"
+  exit 0
+fi
+
+[[ -f $asset ]] || exit 22
+if [[ -n $output ]]; then cp -- "$asset" "$output"; else cat -- "$asset"; fi
+exit 0
+FAKE
+
+  chmod 0755 "$CASE_TMP/bin/systemctl" "$CASE_TMP/bin/ss" "$CASE_TMP/bin/curl"
+}
+
+# --- fake release ------------------------------------------------------------
+
+# Builds a release the fake curl can serve: the two binaries, SHA256SUMS, and a
+# source tarball holding the real scripts/ and packaging/ from this checkout.
+build_release() {
+  local web="$CASE_TMP/web"
+  local arch
+  case "$(uname -m)" in
+    x86_64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) arch=amd64 ;;
+  esac
+  ARCH=$arch
+  mkdir -p "$web/bear4f/Monitor/releases/download/$TEST_TAG"
+  mkdir -p "$web/bear4f/Monitor/releases/download/$LATEST_TAG"
+  mkdir -p "$web/bear4f/Monitor/archive/refs/tags"
+
+  printf 'https://github.com/bear4f/Monitor/releases/latest https://github.com/bear4f/Monitor/releases/tag/%s\n' \
+    "$LATEST_TAG" > "$web/redirects"
+
+  local tag
+  for tag in "$TEST_TAG" "$LATEST_TAG"; do
+    local version=${tag#v}
+    make_fake_binary monitor-server "$version" \
+      "$web/bear4f/Monitor/releases/download/$tag/monitor-server-linux-$arch"
+    make_fake_binary monitor-agent "$version" \
+      "$web/bear4f/Monitor/releases/download/$tag/monitor-agent-linux-$arch"
+    (
+      cd "$web/bear4f/Monitor/releases/download/$tag"
+      sha256sum "monitor-server-linux-$arch" "monitor-agent-linux-$arch" > SHA256SUMS
+    )
+    make_source_tarball "$tag" "$web/bear4f/Monitor/archive/refs/tags/$tag.tar.gz"
+  done
+}
+
+make_fake_binary() {
+  local name=$1 version=$2 destination=$3
+  cat > "$destination" <<BINARY
+#!/usr/bin/env bash
+set -uo pipefail
+LOG="$STATE"
+BINARY
+  cat >> "$destination" <<BINARY
+NAME=$name
+VERSION=$version
+BINARY
+  cat >> "$destination" <<'BINARY'
+printf '%s argv: %s\n' "$NAME" "$*" >> "$LOG/admin.log"
+if [[ ${1-} == --version ]]; then
+  printf '%s %s\n' "$NAME" "$VERSION"
+  exit 0
+fi
+if [[ ${*: -2} == "admin set-password" ]]; then
+  secret=$(cat)
+  bytes=$(printf '%s' "$secret" | LC_ALL=C wc -c)
+  digest=$(printf '%s' "$secret" | sha256sum | cut -c1-16)
+  printf 'set-password bytes=%s digest=%s uid=%s\n' "$bytes" "$digest" "$(id -u)" \
+    >> "$LOG/admin.log"
+  exit 0
+fi
+exit 0
+BINARY
+  chmod 0755 "$destination"
+}
+
+make_source_tarball() {
+  local tag=$1 destination=$2
+  local stage="$CASE_TMP/stage/$tag/Monitor-${tag#v}"
+  rm -rf -- "$CASE_TMP/stage/$tag"
+  mkdir -p "$stage"
+  cp -a "$REPO_ROOT/scripts" "$stage/scripts"
+  cp -a "$REPO_ROOT/packaging" "$stage/packaging"
+  tar -czf "$destination" -C "$CASE_TMP/stage/$tag" "Monitor-${tag#v}"
+}
+
+# --- helpers used by cases ---------------------------------------------------
+
+install_server() {
+  "$REPO_ROOT/scripts/install-monitor.sh" --version "$TEST_TAG" --component server "$@"
+}
+
+seed_foreign_listener() {
+  local port=$1
+  sleep 600 &
+  FOREIGN_PID=$!
+  printf '%s %s foreign\n' "$port" "$FOREIGN_PID" >> "$STATE/listeners"
+}
+
+managed_dropin=/etc/systemd/system/monitor-server.service.d/10-monitor-listen.conf
+readonly managed_dropin
+
+dropin_socket() {
+  grep -m1 -o -- '--listen [^ ]*' "$managed_dropin" | cut -d' ' -f2
+}

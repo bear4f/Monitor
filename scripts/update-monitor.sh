@@ -4,6 +4,11 @@ set -euo pipefail
 readonly REPOSITORY="bear4f/Monitor"
 readonly SERVER_BINARY=/usr/local/bin/monitor-server
 readonly AGENT_BINARY=/usr/local/bin/monitor-agent
+readonly SERVER_UNIT=/etc/systemd/system/monitor-server.service
+readonly SERVER_UNIT_NAME=monitor-server.service
+readonly SERVER_DROPIN_DIR=/etc/systemd/system/monitor-server.service.d
+readonly SERVER_DROPIN=/etc/systemd/system/monitor-server.service.d/10-monitor-listen.conf
+readonly SERVER_DROPIN_MARKER='# Managed-By: monitor-install (listener)'
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 usage() {
@@ -43,7 +48,8 @@ architecture_asset() {
 }
 download_asset() {
   local asset=$1 destination=$2
-  curl --fail --location --proto '=https' --tlsv1.2 --silent --show-error \
+  curl --fail --location --max-redirs 5 --proto '=https' --proto-redir '=https' \
+    --tlsv1.2 --silent --show-error \
     "https://github.com/$REPOSITORY/releases/download/$RELEASE_TAG/$asset" -o "$destination"
 }
 verify_checksum() {
@@ -52,6 +58,51 @@ verify_checksum() {
   [[ $expected =~ ^[[:xdigit:]]{64}$ ]] || die "SHA256SUMS has no valid entry for $asset"
   actual=$(sha256sum "$file" | awk '{ print $1 }')
   [[ $actual == "$expected" ]] || die "checksum mismatch for $asset"
+}
+# The listener drop-in is never written or removed here, so a managed listener
+# survives every update untouched. What this must not do is restart the Server
+# through an ExecStart override it does not recognize, so the drop-in state is
+# validated before any binary is downloaded or staged.
+server_dropin_files() {
+  local paths dir file
+  {
+    paths=$(systemctl show -p DropInPaths --value "$SERVER_UNIT_NAME" 2>/dev/null || true)
+    if [[ -n $paths ]]; then
+      # DropInPaths is a space separated list and unit paths carry no spaces.
+      # shellcheck disable=SC2086
+      printf '%s\n' $paths
+    fi
+    for dir in /etc/systemd/system /run/systemd/system \
+      /usr/local/lib/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+      for file in "$dir/$SERVER_UNIT_NAME.d"/*.conf; do
+        if [[ -e $file ]]; then
+          printf '%s\n' "$file"
+        fi
+      done
+    done
+  } | sort -u
+}
+assert_listener_dropin_safe() {
+  local file
+  [[ ! -L $SERVER_DROPIN_DIR ]] || die "$SERVER_DROPIN_DIR must not be a symbolic link"
+  if [[ -e $SERVER_DROPIN || -L $SERVER_DROPIN ]]; then
+    [[ -f $SERVER_DROPIN && ! -L $SERVER_DROPIN ]] \
+      || die "$SERVER_DROPIN is not a regular file; refusing to update through it"
+    [[ $(head -n 1 -- "$SERVER_DROPIN") == "$SERVER_DROPIN_MARKER" ]] \
+      || die "$SERVER_DROPIN was not written by the Monitor installer; refusing to update through it"
+    grep -Eq "^ExecStart=$SERVER_BINARY([[:space:]]|$)" "$SERVER_DROPIN" \
+      || die "$SERVER_DROPIN does not start $SERVER_BINARY; refusing to update through it"
+  fi
+  while IFS= read -r file; do
+    [[ -n $file && -f $file ]] || continue
+    if [[ $file == "$SERVER_DROPIN" ]]; then
+      continue
+    fi
+    if grep -Eq '^[[:space:]]*ExecStart=' "$file" 2>/dev/null; then
+      die "$file overrides ExecStart for $SERVER_UNIT_NAME; resolve it before updating"
+    fi
+  done < <(server_dropin_files)
+  return 0
 }
 installed_component() {
   local component=$1 binary=$2 unit=$3
@@ -131,7 +182,8 @@ ensure_service_manager
 normalize_version "$VERSION"
 architecture_asset
 if [[ $COMPONENT == server || $COMPONENT == all ]]; then
-  installed_component server "$SERVER_BINARY" /etc/systemd/system/monitor-server.service
+  installed_component server "$SERVER_BINARY" "$SERVER_UNIT"
+  assert_listener_dropin_safe
 fi
 if [[ $COMPONENT == agent || $COMPONENT == all ]]; then
   installed_component agent "$AGENT_BINARY" /etc/systemd/system/monitor-agent.service
