@@ -73,15 +73,22 @@ remove_unit_if_owned() {
   assert_unit_owned "$unit" "$binary"
   rm -f -- "$unit"
 }
-# Only the listener drop-in this project writes is removed, identified by its
-# marker line. Unrelated drop-ins and the directory itself are left alone unless
-# the directory is empty afterwards.
-remove_managed_dropin() {
+# Validates the drop-in state before anything is stopped or deleted, so an
+# unexpected state never leaves a half-uninstalled Server behind. Only the
+# listener drop-in this project writes is ever a candidate for removal;
+# unrelated drop-ins are not inspected and not touched.
+preflight_managed_dropin() {
+  [[ ! -L $SERVER_DROPIN_DIR ]] || die "$SERVER_DROPIN_DIR must not be a symbolic link"
   [[ -e $SERVER_DROPIN || -L $SERVER_DROPIN ]] || return 0
-  [[ -f $SERVER_DROPIN && ! -L $SERVER_DROPIN ]] \
-    || die "$SERVER_DROPIN is not a regular file; refusing to remove it"
+  [[ ! -L $SERVER_DROPIN ]] || die "$SERVER_DROPIN is a symbolic link; refusing to remove it"
+  [[ -f $SERVER_DROPIN ]] || die "$SERVER_DROPIN is not a regular file; refusing to remove it"
+  [[ -r $SERVER_DROPIN ]] || die "$SERVER_DROPIN is not readable; refusing to remove it"
   [[ $(head -n 1 -- "$SERVER_DROPIN") == "$SERVER_DROPIN_MARKER" ]] \
     || die "$SERVER_DROPIN was not written by the Monitor installer; refusing to remove it"
+}
+remove_managed_dropin() {
+  preflight_managed_dropin
+  [[ -e $SERVER_DROPIN ]] || return 0
   rm -f -- "$SERVER_DROPIN"
   rmdir -- "$SERVER_DROPIN_DIR" 2>/dev/null || true
 }
@@ -122,6 +129,7 @@ ensure_service_manager
 
 if [[ $COMPONENT == server || $COMPONENT == all ]]; then
   assert_component_owned "$SERVER_UNIT" "$SERVER_BINARY"
+  preflight_managed_dropin
 fi
 if [[ $COMPONENT == agent || $COMPONENT == all ]]; then
   assert_component_owned "$AGENT_UNIT" "$AGENT_BINARY"
