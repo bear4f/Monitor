@@ -138,11 +138,15 @@ a:focus-visible {
 }
 
 .site-name {
+  display: block;
   max-width: min(55vw, 760px);
   overflow: hidden;
+  color: inherit;
+  cursor: pointer;
   font-size: 19px;
   font-weight: 700;
   line-height: 24px;
+  text-decoration: none;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -746,8 +750,48 @@ a:focus-visible {
 }
 
 @media (max-width: 767px) {
+  .public-container,
+  .public-header-inner {
+    padding-inline: 15px;
+  }
+
+  .public-header {
+    height: 58px;
+  }
+
+  .site-name {
+    max-width: 58vw;
+    font-size: 17px;
+    line-height: 22px;
+  }
+
+  .header-actions {
+    gap: 8px;
+  }
+
+  .login-link,
+  .button {
+    min-height: 34px;
+    font-size: 15px;
+  }
+
   .login-link {
     padding-inline: 6px;
+  }
+
+  .login-link svg,
+  .icon-button svg {
+    width: 19px;
+    height: 19px;
+  }
+
+  .icon-button {
+    width: 34px;
+  }
+
+  .overview-main {
+    padding-top: 14px;
+    padding-bottom: 28px;
   }
 
   .summary-card,
@@ -755,17 +799,85 @@ a:focus-visible {
     border-radius: 14px;
   }
 
-  .node-card {
-    padding: 20px;
+  /* Two summary cards per row on phones. The fixed desktop height is dropped so
+     a row grows to its tallest card instead of padding out the short ones. */
+  .summary-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    column-gap: 11px;
+    row-gap: 12px;
   }
-}
 
-@media (max-width: 419px) {
+  .summary-card {
+    height: auto;
+    min-height: 116px;
+    padding: 12px 13px;
+  }
+
+  .summary-label {
+    gap: 6px;
+    font-size: 13px;
+    line-height: 18px;
+  }
+
+  .summary-icon svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  .summary-primary {
+    margin-top: 4px;
+    font-size: 22px;
+    line-height: 28px;
+  }
+
+  .summary-caption {
+    font-size: 13px;
+    line-height: 18px;
+  }
+
+  /* Half-width cards cannot fit two byte values side by side, so stack them. */
+  .summary-pair {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 1px;
+  }
+
+  .summary-pair-primary {
+    margin-top: 4px;
+    font-size: 15px;
+    line-height: 21px;
+  }
+
+  .summary-pair-secondary {
+    font-size: 14px;
+    line-height: 20px;
+  }
+
+  .summary-direction svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  .summary-total-label {
+    font-size: 12px;
+    line-height: 16px;
+  }
+
+  .network-sparkline {
+    height: 30px;
+  }
+
+  .node-grid {
+    margin-top: 16px;
+    gap: 12px;
+  }
+
   .node-card {
-    padding: 18px;
+    min-height: 0;
+    padding: 14px 15px;
   }
 
   .node-heading {
+    min-height: 0;
     gap: 8px;
   }
 
@@ -774,25 +886,126 @@ a:focus-visible {
   }
 
   .node-identity h2 {
-    font-size: 20px;
-    line-height: 27px;
+    font-size: 18px;
+    line-height: 24px;
+  }
+
+  .badge {
+    min-height: 26px;
+    font-size: 13px;
+    line-height: 18px;
+  }
+
+  .region-badge {
+    min-width: 32px;
+    padding-inline: 8px;
   }
 
   .status-badge {
-    max-width: 45%;
+    gap: 6px;
+    padding-inline: 9px;
+  }
+
+  .status-dot {
+    width: 7px;
+    height: 7px;
+  }
+
+  .node-subline {
+    gap: 10px;
+    margin-top: 4px;
+    font-size: 14px;
+    line-height: 20px;
+  }
+
+  .metrics-grid {
+    column-gap: 14px;
+    row-gap: 14px;
+    margin-top: 14px;
+  }
+
+  .metric-heading {
+    font-size: 14px;
+    line-height: 19px;
+  }
+
+  .progress-track {
+    height: 6px;
+    margin-top: 6px;
+  }
+
+  .metric-detail {
+    margin-top: 6px;
+    font-size: 14px;
+    line-height: 20px;
+  }
+
+  .node-footer {
+    column-gap: 14px;
+    row-gap: 7px;
+    margin-top: 14px;
+    padding-top: 12px;
+  }
+
+  .traffic-value {
+    gap: 6px;
+    font-size: 14px;
+    line-height: 20px;
+  }
+
+  .traffic-value svg {
+    width: 14px;
+    height: 14px;
+  }
+}
+
+@media (max-width: 419px) {
+  .public-container,
+  .public-header-inner {
+    padding-inline: 13px;
+  }
+
+  .site-name {
+    max-width: 52vw;
+  }
+
+  .summary-grid {
+    column-gap: 9px;
+  }
+
+  .summary-card {
+    padding: 11px 12px;
+  }
+
+  .summary-primary {
+    font-size: 21px;
+    line-height: 27px;
+  }
+
+  .node-card {
+    padding: 13px;
+  }
+
+  .node-identity h2 {
+    font-size: 17px;
+    line-height: 23px;
+  }
+
+  .status-badge {
+    max-width: 46%;
     padding-inline: 8px;
   }
 
   .metrics-grid,
   .node-footer {
-    column-gap: 14px;
+    column-gap: 11px;
   }
 
   .metric-heading,
   .metric-detail,
   .traffic-value,
   .node-subline {
-    font-size: 16px;
+    font-size: 13px;
   }
 }
 

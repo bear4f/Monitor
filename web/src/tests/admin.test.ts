@@ -21,6 +21,7 @@ import {
   canEnablePingTarget,
   targetSortOrder,
   validatePingTargetHost,
+  trafficLimitToForm,
   trafficUnitBytes,
   AdminSettings,
   buildSettingsPatch,
@@ -203,6 +204,56 @@ describe("admin pure helpers", () => {
     expect(trafficUnitBytes("100", "GB")).toBe(100 * 1024 ** 3);
     expect(trafficUnitBytes("1.5", "GB")).toBe(1.5 * 1024 ** 3);
     expect(trafficUnitBytes("0", "GB")).toBeNull();
+  });
+  it("converts terabyte limits with binary units", () => {
+    expect(trafficUnitBytes("1", "TB")).toBe(1024 ** 4);
+    expect(trafficUnitBytes("2", "TB")).toBe(2 * 1024 ** 4);
+    expect(trafficUnitBytes("1.5", "TB")).toBe(1649267441664);
+    // 1 TB is 1024 GB, never 1000 GB.
+    expect(trafficUnitBytes("1", "TB")).toBe(trafficUnitBytes("1024", "GB"));
+  });
+  it("rejects invalid traffic amounts and units", () => {
+    for (const amount of ["0", "-1", "-1.5", "", " ", "abc", "1e3", "1.", ".5", "0x10", "1,5", "Infinity", "NaN"]) {
+      expect(trafficUnitBytes(amount, "GB")).toBeNull();
+      expect(trafficUnitBytes(amount, "TB")).toBeNull();
+    }
+    for (const unit of ["", "MB", "gb", "tb", "KB", "PB", "B"]) {
+      expect(trafficUnitBytes("100", unit)).toBeNull();
+    }
+    // Beyond the JSON safe integer range there is no exact byte count.
+    expect(trafficUnitBytes("100000000", "TB")).toBeNull();
+  });
+  it("renders a stored traffic limit back into the shortest exact form", () => {
+    expect(trafficLimitToForm(null)).toEqual({ amount: "", unit: "GB" });
+    expect(trafficLimitToForm(107374182400)).toEqual({ amount: "100", unit: "GB" });
+    // Just below 1 TiB stays in GB, exactly 1 TiB switches to TB.
+    expect(trafficLimitToForm(1024 ** 4 - 1024 ** 3)).toEqual({ amount: "1023", unit: "GB" });
+    expect(trafficLimitToForm(1099511627776)).toEqual({ amount: "1", unit: "TB" });
+    expect(trafficLimitToForm(2199023255552)).toEqual({ amount: "2", unit: "TB" });
+    expect(trafficLimitToForm(1649267441664)).toEqual({ amount: "1.5", unit: "TB" });
+    expect(trafficLimitToForm(1024 ** 4 + 1024 ** 3 * 512)).toEqual({ amount: "1.5", unit: "TB" });
+  });
+  it("never writes trailing zeros and always round-trips back to the same bytes", () => {
+    for (const bytes of [
+      1024 ** 3,
+      100 * 1024 ** 3,
+      1024 ** 4,
+      1024 ** 4 * 2,
+      1649267441664,
+      1024 ** 3 * 1536,
+      1024 ** 3 * 10,
+      1024 ** 4 * 30,
+    ]) {
+      const form = trafficLimitToForm(bytes);
+      expect(form.amount).not.toMatch(/\.\d*0$/);
+      expect(form.amount).not.toMatch(/\.$/);
+      expect(trafficUnitBytes(form.amount, form.unit)).toBe(bytes);
+    }
+  });
+  it("treats absent or unusable traffic limits as an empty gigabyte field", () => {
+    for (const bytes of [0, -1, -(1024 ** 3), 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 2]) {
+      expect(trafficLimitToForm(bytes)).toEqual({ amount: "", unit: "GB" });
+    }
   });
   it("builds runtime config only when explicitly given a token", () => {
     const config = buildRuntimeConfig(

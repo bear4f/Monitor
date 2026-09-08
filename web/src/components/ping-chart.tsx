@@ -157,7 +157,7 @@ function pingOptions(
 
   return {
     ms: 1e-3,
-    padding: [4, mobile ? 10 : 68, 0, mobile ? 3 : 18],
+    padding: [4, mobile ? 12 : 68, 0, mobile ? 3 : 18],
     legend: { show: false },
     cursor: {
       x: true,
@@ -189,8 +189,8 @@ function pingOptions(
     axes: [
       {
         stroke: muted,
-        font: `${mobile ? 14 : 15}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`,
-        size: 30,
+        font: `${mobile ? 12 : 15}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`,
+        size: mobile ? 26 : 30,
         splits: (_self, _axis, minimum, maximum) => timeAxisSplits(minimum, maximum, range, element.clientWidth),
         values: (_self, splits) => splits.map((value) => formatAxisTime(value, range)),
         grid: { show: false },
@@ -200,10 +200,10 @@ function pingOptions(
       {
         scale: "y",
         side: 3,
-        size: mobile ? 68 : 96,
-        gap: mobile ? 6 : 10,
+        size: mobile ? 52 : 96,
+        gap: mobile ? 5 : 10,
         stroke: muted,
-        font: `${mobile ? 14 : 15}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`,
+        font: `${mobile ? 12 : 15}px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`,
         splits: (_self, _axis, _minimum, maximum) => [0, 0.25, 0.5, 0.75, 1].map((part) => maximum * part),
         values: (_self, splits) => splits.map((value) => `${Number(value.toFixed(value < 10 ? 1 : 0))}ms`),
         grid: { stroke: grid, width: 1, dash: [4, 4] },

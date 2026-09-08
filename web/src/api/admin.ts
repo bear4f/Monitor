@@ -528,6 +528,33 @@ export function normalizeCode(value: string, length: number): string | null {
   const normalized = value.trim().toUpperCase();
   return isCode(normalized, length) ? normalized : null;
 }
+export type TrafficUnit = "GB" | "TB";
+
+const TRAFFIC_UNIT_BYTES: Record<TrafficUnit, number> = {
+  GB: 1024 ** 3,
+  TB: 1024 ** 4,
+};
+
+/**
+ * Renders a stored byte limit back into the admin form. TB is preferred once the
+ * limit reaches 1 TiB. The amount is the shortest decimal string that converts
+ * back to exactly the same byte count, so reopening and saving a node never
+ * rewrites its traffic limit.
+ */
+export function trafficLimitToForm(
+  bytes: number | null,
+): { amount: string; unit: TrafficUnit } {
+  if (bytes === null || !Number.isSafeInteger(bytes) || bytes <= 0)
+    return { amount: "", unit: "GB" };
+  const unit: TrafficUnit = bytes >= TRAFFIC_UNIT_BYTES.TB ? "TB" : "GB";
+  const exact = bytes / TRAFFIC_UNIT_BYTES[unit];
+  for (let digits = 0; digits <= 9; digits += 1) {
+    const amount = exact.toFixed(digits);
+    if (trafficUnitBytes(amount, unit) === bytes) return { amount, unit };
+  }
+  return { amount: exact.toFixed(9).replace(/\.?0+$/, ""), unit };
+}
+
 export function trafficUnitBytes(value: string, unit: string): number | null {
   const normalized = value.trim();
   const amount = Number(normalized);
