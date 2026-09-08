@@ -7,6 +7,7 @@ readonly DEFAULT_SERVER_PORT=25774
 readonly SERVER_BINARY=/usr/local/bin/monitor-server
 readonly AGENT_BINARY=/usr/local/bin/monitor-agent
 readonly SERVER_UNIT=/etc/systemd/system/monitor-server.service
+readonly SERVER_UNIT_NAME=monitor-server.service
 readonly AGENT_UNIT=/etc/systemd/system/monitor-agent.service
 readonly AGENT_ENV=/etc/monitor-agent.env
 readonly SERVER_DATA=/var/lib/monitor
@@ -73,8 +74,8 @@ download_asset() {
   local asset=$1
   local destination=$2
   local base_url="https://github.com/$REPOSITORY/releases/download/$RELEASE_TAG"
-  curl --fail --location --proto '=https' --tlsv1.2 --silent --show-error \
-    "$base_url/$asset" -o "$destination"
+  curl --fail --location --max-redirs 5 --proto '=https' --proto-redir '=https' \
+    --tlsv1.2 --silent --show-error "$base_url/$asset" -o "$destination"
 }
 
 verify_checksum() {
@@ -185,19 +186,49 @@ split_socket() {
   valid_ipv4_literal "$SOCKET_ADDRESS" || valid_ipv6_literal "$SOCKET_ADDRESS" || return 1
 }
 
+# systemd loads drop-ins from several unit lookup paths, not only from
+# /etc/systemd/system. Its own view is authoritative when it can answer, and the
+# standard directories are scanned as well so a unit systemd has not loaded yet
+# is still covered.
+server_dropin_files() {
+  local paths dir file
+  {
+    paths=$(systemctl show -p DropInPaths --value "$SERVER_UNIT_NAME" 2>/dev/null || true)
+    if [[ -n $paths ]]; then
+      # DropInPaths is a space separated list and unit paths carry no spaces.
+      # shellcheck disable=SC2086
+      printf '%s\n' $paths
+    fi
+    for dir in /etc/systemd/system /run/systemd/system \
+      /usr/local/lib/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+      for file in "$dir/$SERVER_UNIT_NAME.d"/*.conf; do
+        if [[ -e $file ]]; then
+          printf '%s\n' "$file"
+        fi
+      done
+    done
+  } | sort -u
+}
+
 # Any drop-in we did not write that also sets ExecStart would silently fight
 # ours, so refuse rather than guess. Unrelated drop-ins are left untouched.
 assert_no_conflicting_dropin() {
   local file
-  [[ -d $SERVER_DROPIN_DIR ]] || return 0
   [[ ! -L $SERVER_DROPIN_DIR ]] || die "$SERVER_DROPIN_DIR must not be a symbolic link"
-  for file in "$SERVER_DROPIN_DIR"/*.conf; do
-    [[ -e $file ]] || continue
-    [[ $file == "$SERVER_DROPIN" ]] && continue
-    if grep -Eq '^[[:space:]]*ExecStart=' "$file" 2>/dev/null; then
-      die "$file already overrides ExecStart; resolve it before configuring the Monitor listener"
+  [[ ! -L $SERVER_DROPIN ]] || die "$SERVER_DROPIN must not be a symbolic link"
+  if [[ -e $SERVER_DROPIN ]] && ! dropin_is_managed "$SERVER_DROPIN"; then
+    die "$SERVER_DROPIN exists but was not written by this installer"
+  fi
+  while IFS= read -r file; do
+    [[ -n $file && -f $file ]] || continue
+    if [[ $file == "$SERVER_DROPIN" ]]; then
+      continue
     fi
-  done
+    if grep -Eq '^[[:space:]]*ExecStart=' "$file" 2>/dev/null; then
+      die "$file overrides ExecStart for $SERVER_UNIT_NAME; resolve it before configuring the Monitor listener"
+    fi
+  done < <(server_dropin_files)
+  return 0
 }
 
 resolve_server_listener() {
@@ -269,14 +300,58 @@ port_is_listening() {
   ss -Hln "sport = :$EFFECTIVE_PORT" 2>/dev/null | grep -q .
 }
 
+# Pids that hold a listening socket on PORT, one per line. Empty when ss cannot
+# report process information.
+port_listener_pids() {
+  ss -Hlnp "sport = :$1" 2>/dev/null \
+    | grep -o 'pid=[0-9]\+' | cut -d= -f2 | sort -u
+}
+
+# The socket the installed Server is currently configured to use, or failure
+# when no recognized Monitor unit is installed. The managed drop-in wins over
+# the shipped unit because that is how systemd resolves the effective ExecStart.
+configured_monitor_socket() {
+  local socket line
+  if socket=$(managed_dropin_socket); then
+    printf '%s' "$socket"
+    return 0
+  fi
+  # A file at the managed path that we did not write may carry any listener at
+  # all, so the effective socket is unknown rather than the shipped default.
+  [[ ! -e $SERVER_DROPIN ]] || return 1
+  [[ -f $SERVER_UNIT && ! -L $SERVER_UNIT ]] || return 1
+  line=$(grep -m1 -E "^ExecStart=$SERVER_BINARY[[:space:]]" "$SERVER_UNIT" 2>/dev/null) || return 1
+  [[ $line =~ --listen[[:space:]]+([^[:space:]]+) ]] || return 1
+  printf '%s' "${BASH_REMATCH[1]}"
+}
+
+# An occupied port is only acceptable when the listener provably belongs to the
+# Monitor Server that is already configured for that same port. A busy port that
+# Monitor is not currently configured for always refuses, even while
+# monitor-server.service is active somewhere else. Nothing is ever killed and
+# ownership is never inferred from "the service happens to be running".
 check_server_port() {
-  if port_is_listening; then
-    systemctl is-active --quiet monitor-server.service \
-      || die "port $EFFECTIVE_PORT is occupied by an unknown service; refusing to replace it"
-    [[ -f $SERVER_UNIT ]] \
-      || die "port $EFFECTIVE_PORT is occupied but Monitor Server ownership is unrecognized"
-    assert_unit_owned "$SERVER_UNIT" "$SERVER_BINARY" \
-      || die "port $EFFECTIVE_PORT is occupied but Monitor Server ownership is unrecognized"
+  port_is_listening || return 0
+  local current pids main_pid
+  current=$(configured_monitor_socket) \
+    || die "port $EFFECTIVE_PORT is occupied by an unknown service; refusing to replace it"
+  split_socket "$current" \
+    || die "port $EFFECTIVE_PORT is occupied and the installed Monitor listener could not be read"
+  [[ $SOCKET_PORT == "$EFFECTIVE_PORT" ]] \
+    || die "port $EFFECTIVE_PORT is already in use by another service; Monitor Server is configured for $current"
+  systemctl is-active --quiet "$SERVER_UNIT_NAME" \
+    || die "port $EFFECTIVE_PORT is occupied by an unknown service; refusing to replace it"
+  [[ -f $SERVER_UNIT ]] \
+    || die "port $EFFECTIVE_PORT is occupied but Monitor Server ownership is unrecognized"
+  assert_unit_owned "$SERVER_UNIT" "$SERVER_BINARY" \
+    || die "port $EFFECTIVE_PORT is occupied but Monitor Server ownership is unrecognized"
+  main_pid=$(systemctl show -p MainPID --value "$SERVER_UNIT_NAME" 2>/dev/null || true)
+  pids=$(port_listener_pids "$EFFECTIVE_PORT")
+  if [[ -n $pids ]]; then
+    [[ $main_pid =~ ^[0-9]+$ ]] && (( main_pid > 0 )) \
+      || die "port $EFFECTIVE_PORT is occupied but $SERVER_UNIT_NAME has no main process"
+    [[ $pids == "$main_pid" ]] \
+      || die "port $EFFECTIVE_PORT is held by a process outside $SERVER_UNIT_NAME; refusing to continue"
   fi
 }
 
@@ -603,7 +678,11 @@ SCRIPT_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 if [[ $COMPONENT == server || $COMPONENT == all ]]; then
   resolve_server_listener
   warn_public_listener
-  preflight_systemd_unit monitor-server.service "$SERVER_UNIT" "$SERVER_BINARY"
+  # Both of these must run before anything is downloaded or written, so a
+  # foreign ExecStart override or a busy port stops the install untouched.
+  assert_no_conflicting_dropin
+  check_server_port
+  preflight_systemd_unit "$SERVER_UNIT_NAME" "$SERVER_UNIT" "$SERVER_BINARY"
   if [[ -e $SERVER_UNIT ]]; then
     assert_unit_owned "$SERVER_UNIT" "$SERVER_BINARY"
   fi
