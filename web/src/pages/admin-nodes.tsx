@@ -25,6 +25,8 @@ import {
   parseMoneyToMicros,
   RENEWAL_CYCLES,
   rotateToken,
+  trafficLimitToForm,
+  type TrafficUnit,
   trafficUnitBytes,
   updateNode,
 } from "../api/admin";
@@ -393,14 +395,11 @@ function NodeDialog({
   onClose: () => void;
   onSubmit: (body: Record<string, unknown>) => void;
 }) {
-  const unit = "GB";
+  const storedLimit = trafficLimitToForm(node?.traffic_limit ?? null);
   const [name, setName] = useState(node?.name ?? "");
   const [region, setRegion] = useState(node?.region_code ?? "");
-  const [limit, setLimit] = useState(
-    node?.traffic_limit === null || node?.traffic_limit === undefined
-      ? ""
-      : String(node.traffic_limit / 1024 ** 3),
-  );
+  const [limit, setLimit] = useState(storedLimit.amount);
+  const [unit, setUnit] = useState<TrafficUnit>(storedLimit.unit);
   const [resetDay, setResetDay] = useState("");
   const [price, setPrice] = useState(
     node?.price_micros === null || node?.price_micros === undefined
@@ -480,8 +479,13 @@ function NodeDialog({
               onChange={(e) => setLimit(e.target.value)}
               placeholder="无限"
             />
-            <select value={unit} disabled>
-              <option>GB</option>
+            <select
+              value={unit}
+              aria-label="流量额度单位"
+              onChange={(e) => setUnit(e.target.value as TrafficUnit)}
+            >
+              <option value="GB">GB</option>
+              <option value="TB">TB</option>
             </select>
           </div>
         </label>

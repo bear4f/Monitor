@@ -498,34 +498,66 @@
 
 @media (max-width: 767px) {
   .node-detail-main {
-    padding-top: 22px;
+    padding-top: 14px;
+    padding-bottom: 32px;
   }
 
+  .detail-heading {
+    min-height: 0;
+    gap: 7px;
+  }
+
+  /* The heading wraps as a group; forcing the name onto its own full-width row
+     cost a whole line of vertical space on a phone. */
   .detail-heading h1 {
-    width: 100%;
+    max-width: 100%;
+    font-size: 21px;
+    line-height: 28px;
+  }
+
+  .detail-heading .badge {
+    min-height: 27px;
+    font-size: 13px;
+    line-height: 18px;
+  }
+
+  .agent-badge {
+    padding-inline: 9px;
   }
 
   .detail-facts {
-    gap: 16px;
-    margin-top: 24px;
+    gap: 13px;
+    margin-top: 16px;
+  }
+
+  .detail-fact dt {
+    font-size: 14px;
+    line-height: 20px;
   }
 
   .detail-fact dd {
-    font-size: 18px;
-    line-height: 25px;
+    font-size: 16px;
+    font-weight: 500;
+    line-height: 22px;
   }
 
-  .resource-chart-section + .resource-chart-section {
-    margin-top: 42px;
+  .detail-controls {
+    margin-top: 16px;
+    padding-top: 16px;
   }
 
-  .resource-plot,
-  .resource-chart-placeholder {
-    height: 170px;
+  .detail-tab,
+  .detail-range {
+    min-height: 33px;
+    padding: 0 11px;
+    border-radius: 9px;
+    font-size: 14px;
+    line-height: 19px;
   }
 
   .detail-range-row {
     max-width: 100%;
+    margin-top: 8px;
     overflow-x: auto;
     scrollbar-width: none;
   }
@@ -535,31 +567,96 @@
   }
 
   .detail-cut-peak {
-    margin-left: 13px;
+    min-height: 33px;
+    gap: 6px;
+    margin-left: 10px;
+    font-size: 14px;
+  }
+
+  .detail-cut-peak input {
+    width: 16px;
+    height: 16px;
+  }
+
+  .resource-charts,
+  .latency-content {
+    margin-top: 14px;
+  }
+
+  .resource-chart-section h2 {
+    margin-bottom: 7px;
+    font-size: 15px;
+    line-height: 21px;
+  }
+
+  .resource-chart-section + .resource-chart-section {
+    margin-top: 20px;
+  }
+
+  .resource-plot,
+  .resource-chart-placeholder {
+    height: 158px;
   }
 
   .ping-plot,
   .ping-placeholder {
-    height: 280px;
+    height: 232px;
   }
 
   .ping-navigator {
+    height: 26px;
     margin-right: 10px;
-    margin-left: 68px;
+    margin-left: 56px;
   }
 
-  .ping-tooltip {
-    width: min(270px, calc(100% - 8px));
-    font-size: 14px;
+  /* Thinner track, but the grab handle stays wide enough for a fingertip. */
+  .ping-navigator-handle {
+    top: -3px;
+    width: 16px;
+    height: 32px;
+  }
+
+  .ping-navigator-handle::after {
+    inset: 8px 5px;
   }
 
   .ping-legend {
     justify-content: flex-start;
+    gap: 6px;
+    margin-top: 14px;
+  }
+
+  .ping-legend-item {
+    min-height: 30px;
+    gap: 6px;
+    padding: 4px 9px;
+    border-radius: 8px;
+    font-size: 13px;
+    line-height: 18px;
+  }
+
+  .ping-legend-line {
+    width: 17px;
+  }
+
+  .ping-tooltip {
+    width: min(250px, calc(100% - 8px));
+    font-size: 13px;
   }
 
   .chart-tooltip {
-    width: min(185px, calc(100% - 8px));
-    font-size: 15px;
+    width: min(170px, calc(100% - 8px));
+    padding: 9px 10px;
+    font-size: 13px;
+    line-height: 19px;
+  }
+
+  .chart-tooltip-time {
+    margin-bottom: 5px;
+  }
+
+  .chart-tooltip-row + .chart-tooltip-row {
+    margin-top: 3px;
   }
 }
 

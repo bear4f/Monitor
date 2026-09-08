@@ -27,10 +27,18 @@ export function PublicHeader({ siteName, serverTheme = "system" }: { siteName: s
     navigate("/login");
   };
 
+  // Same guard as the node cards: modifier clicks and middle clicks keep the
+  // native anchor behaviour so "open in new tab" still works.
+  const handleHome = (event: MouseEvent<HTMLAnchorElement>) => {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    navigate("/");
+  };
+
   return (
     <header className="public-header">
       <div className="public-header-inner">
-        <div className="site-name" title={siteName}>{siteName}</div>
+        <a className="site-name" href="/" title={siteName} onClick={handleHome}>{siteName}</a>
         <nav className="header-actions" aria-label="页面操作">
           <a className="login-link" href="/login" onClick={handleLogin}>
             <LogIn size={21} strokeWidth={2} aria-hidden="true" />
