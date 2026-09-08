@@ -233,6 +233,31 @@ describe("admin pure helpers", () => {
     expect(trafficLimitToForm(1649267441664)).toEqual({ amount: "1.5", unit: "TB" });
     expect(trafficLimitToForm(1024 ** 4 + 1024 ** 3 * 512)).toEqual({ amount: "1.5", unit: "TB" });
   });
+  it("round-trips an arbitrary safe-integer byte count exactly", () => {
+    // Regression: the amount used to be produced by rounding to a fixed number
+    // of decimals, which cannot represent bytes that are not a whole multiple of
+    // the unit. A GB amount needs up to 30 decimal places and a TB amount up to
+    // 40, so a rounded value converted back to null or to a different limit.
+    const bytes = 1802465118929447;
+    const form = trafficLimitToForm(bytes);
+    expect(trafficUnitBytes(form.amount, form.unit)).toBe(bytes);
+  });
+  it("round-trips awkward safe integers on both sides of the terabyte boundary", () => {
+    const samples = [
+      1, 3, 1023, 1025, 999999937,
+      1024 ** 3 + 1, 1024 ** 3 - 1, 107374182401, 549755813887,
+      1024 ** 4 - 1, 1024 ** 4 + 1, 1802465118929447, 1319413953331201,
+      4503599627370497, 7036874417766401,
+      Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER - 1, Number.MAX_SAFE_INTEGER - 12345,
+    ];
+    for (const bytes of samples) {
+      const form = trafficLimitToForm(bytes);
+      expect(form.unit).toBe(bytes >= 1024 ** 4 ? "TB" : "GB");
+      // The regex in trafficUnitBytes rejects scientific notation.
+      expect(form.amount).toMatch(/^(?:\d+|\d+\.\d+)$/);
+      expect(trafficUnitBytes(form.amount, form.unit)).toBe(bytes);
+    }
+  });
   it("never writes trailing zeros and always round-trips back to the same bytes", () => {
     for (const bytes of [
       1024 ** 3,

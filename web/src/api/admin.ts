@@ -530,29 +530,37 @@ export function normalizeCode(value: string, length: number): string | null {
 }
 export type TrafficUnit = "GB" | "TB";
 
-const TRAFFIC_UNIT_BYTES: Record<TrafficUnit, number> = {
-  GB: 1024 ** 3,
-  TB: 1024 ** 4,
-};
+const TRAFFIC_UNIT_SHIFT: Record<TrafficUnit, number> = { GB: 30, TB: 40 };
+const TERABYTE_BYTES = 1024 ** 4;
 
 /**
  * Renders a stored byte limit back into the admin form. TB is preferred once the
- * limit reaches 1 TiB. The amount is the shortest decimal string that converts
- * back to exactly the same byte count, so reopening and saving a node never
- * rewrites its traffic limit.
+ * limit reaches 1 TiB.
+ *
+ * Both divisors are powers of two, so `bytes / 2**shift` always has a finite
+ * decimal expansion: the fraction is `remainder * 5**shift` over `10**shift`.
+ * Building that with integers keeps the string exact — a GB amount needs up to
+ * 30 decimal places and a TB amount up to 40, which no fixed rounding can
+ * reach — so `trafficUnitBytes` always converts it back to the original byte
+ * count and reopening a node never rewrites its traffic limit.
  */
 export function trafficLimitToForm(
   bytes: number | null,
 ): { amount: string; unit: TrafficUnit } {
   if (bytes === null || !Number.isSafeInteger(bytes) || bytes <= 0)
     return { amount: "", unit: "GB" };
-  const unit: TrafficUnit = bytes >= TRAFFIC_UNIT_BYTES.TB ? "TB" : "GB";
-  const exact = bytes / TRAFFIC_UNIT_BYTES[unit];
-  for (let digits = 0; digits <= 9; digits += 1) {
-    const amount = exact.toFixed(digits);
-    if (trafficUnitBytes(amount, unit) === bytes) return { amount, unit };
-  }
-  return { amount: exact.toFixed(9).replace(/\.?0+$/, ""), unit };
+  const unit: TrafficUnit = bytes >= TERABYTE_BYTES ? "TB" : "GB";
+  const shift = BigInt(TRAFFIC_UNIT_SHIFT[unit]);
+  const scale = 1n << shift;
+  const value = BigInt(bytes);
+  const whole = (value >> shift).toString();
+  const remainder = value & (scale - 1n);
+  if (remainder === 0n) return { amount: whole, unit };
+  const fraction = (remainder * 5n ** shift)
+    .toString()
+    .padStart(TRAFFIC_UNIT_SHIFT[unit], "0")
+    .replace(/0+$/, "");
+  return { amount: `${whole}.${fraction}`, unit };
 }
 
 export function trafficUnitBytes(value: string, unit: string): number | null {
