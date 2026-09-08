@@ -7,6 +7,9 @@ readonly SERVER_UNIT=/etc/systemd/system/monitor-server.service
 readonly AGENT_UNIT=/etc/systemd/system/monitor-agent.service
 readonly AGENT_ENV=/etc/monitor-agent.env
 readonly SERVER_DATA=/var/lib/monitor
+readonly SERVER_DROPIN_DIR=/etc/systemd/system/monitor-server.service.d
+readonly SERVER_DROPIN=/etc/systemd/system/monitor-server.service.d/10-monitor-listen.conf
+readonly SERVER_DROPIN_MARKER='# Managed-By: monitor-install (listener)'
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 usage() {
@@ -70,6 +73,19 @@ remove_unit_if_owned() {
   assert_unit_owned "$unit" "$binary"
   rm -f -- "$unit"
 }
+# Only the listener drop-in this project writes is removed, identified by its
+# marker line. Unrelated drop-ins and the directory itself are left alone unless
+# the directory is empty afterwards.
+remove_managed_dropin() {
+  [[ -e $SERVER_DROPIN || -L $SERVER_DROPIN ]] || return 0
+  [[ -f $SERVER_DROPIN && ! -L $SERVER_DROPIN ]] \
+    || die "$SERVER_DROPIN is not a regular file; refusing to remove it"
+  [[ $(head -n 1 -- "$SERVER_DROPIN") == "$SERVER_DROPIN_MARKER" ]] \
+    || die "$SERVER_DROPIN was not written by the Monitor installer; refusing to remove it"
+  rm -f -- "$SERVER_DROPIN"
+  rmdir -- "$SERVER_DROPIN_DIR" 2>/dev/null || true
+}
+
 remove_binary_if_owned() {
   local binary=$1 unit=$2
   [[ -e $binary ]] || return 0
@@ -115,6 +131,7 @@ if [[ $COMPONENT == server || $COMPONENT == all ]]; then
   stop_disable_unit monitor-server.service "$SERVER_UNIT" "$SERVER_BINARY"
   remove_binary_if_owned "$SERVER_BINARY" "$SERVER_UNIT"
   remove_unit_if_owned "$SERVER_UNIT" "$SERVER_BINARY"
+  remove_managed_dropin
   if [[ $PURGE == true && -e $SERVER_DATA ]]; then
     [[ $SERVER_DATA == /var/lib/monitor && -d $SERVER_DATA ]] || die "unexpected Server data path"
     rm -rf -- "$SERVER_DATA"
