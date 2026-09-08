@@ -21,7 +21,48 @@ cd .. && cargo build --release --workspace
 The binaries are `target/release/monitor-server` and
 `target/release/monitor-agent`; both report `0.1.1` with `--version`.
 
-## Server installation
+## Quick install
+
+The bootstrap script resolves the latest release, verifies the release
+checksums through `install-monitor.sh`, and prompts for secrets on the
+terminal. Secrets are never accepted as command-line arguments, so nothing
+sensitive reaches your shell history, `ps`, or the process environment.
+
+Server, listening on `127.0.0.1:25774` by default:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bear4f/Monitor/main/scripts/bootstrap-monitor.sh \
+  | sudo bash -s -- server --set-admin-password
+```
+
+A custom port, or a custom address and port:
+
+```sh
+curl -fsSL .../bootstrap-monitor.sh | sudo bash -s -- server --port 25776
+curl -fsSL .../bootstrap-monitor.sh | sudo bash -s -- server --listen 0.0.0.0 --port 25776
+```
+
+`--listen` accepts IPv4 and IPv6 literals; `::1` and `::` are bracketed
+automatically. Binding to `0.0.0.0` or `::` prints a warning: Monitor serves
+plain HTTP and expects a trusted HTTPS reverse proxy in front of it.
+
+Agent, which prompts for the token with echo disabled:
+
+```sh
+curl -fsSL .../bootstrap-monitor.sh \
+  | sudo bash -s -- agent --server https://monitor.example.com
+```
+
+Pin an exact release instead of the latest with `--version v0.1.1`. For
+unattended installs, pass a root-owned `0600` file with
+`--admin-password-file PATH` or `--token-file PATH`; the file is read but never
+copied or deleted.
+
+Reinstalling preserves a custom listener and never changes an existing
+administrator password unless `--set-admin-password` or
+`--admin-password-file` is given.
+
+## Server installation (explicit release)
 
 Install an explicit GitHub Release version. The installer downloads the
 matching `monitor-server-linux-amd64` or `monitor-server-linux-arm64` asset and
@@ -30,14 +71,23 @@ atomically:
 
 ```sh
 sudo ./scripts/install-monitor.sh --version v0.1.1 --component server
+sudo ./scripts/install-monitor.sh --version v0.1.1 --component server \
+  --listen 0.0.0.0 --port 25776
 ```
 
 The unit runs as the dedicated `monitor:monitor` user with no capabilities,
-and executes:
+and by default executes:
 
 ```text
 /usr/local/bin/monitor-server --listen 127.0.0.1:25774 --db /var/lib/monitor/monitor.db
 ```
+
+The shipped unit file is never rewritten. A non-default listener is applied
+through a managed drop-in at
+`/etc/systemd/system/monitor-server.service.d/10-monitor-listen.conf`, which
+carries a marker line so uninstall removes only that file and leaves any
+drop-in you added yourself untouched. A drop-in you own that also sets
+`ExecStart` makes the installer refuse rather than guess.
 
 The database and WAL files persist under `/var/lib/monitor`. A first admin
 password is set through stdin as the service user; do not put it in a command
@@ -54,7 +104,7 @@ Monitor. For Nginx, proxy to `http://127.0.0.1:25774`, preserve `Host`, and set
 and may explicitly set `X-Real-IP {remote_host}`. Never trust a client-supplied
 `X-Real-IP` on a public listener.
 
-## Agent installation
+## Agent installation (explicit release)
 
 Create a root-owned environment file with mode `0600` containing the Server
 URL and the one-time agent token:
@@ -81,7 +131,8 @@ stopped and prints only the file path.
 
 Updates require an explicit version and verify the same-release checksum before
 staging a binary. The old binary is restored if restart or health verification
-fails; the database and Agent environment are preserved:
+fails; the database, Agent environment, and a custom Server listener are all
+preserved:
 
 ```sh
 sudo ./scripts/update-monitor.sh --version v0.1.1 --component all
@@ -100,9 +151,9 @@ Uninstall never changes reverse-proxy configuration or unrelated services.
 
 ## Troubleshooting and data safety
 
-If installation reports that port `25774` is occupied by an unknown service,
-stop and identify that service yourself; the installer never kills or replaces
-it. Inspect service state with `systemctl status monitor-server` or
+If installation reports that the chosen port is occupied by an unknown
+service, stop and identify that service yourself; the installer never kills or
+replaces it. Inspect service state with `systemctl status monitor-server` or
 `journalctl -u monitor-server` and `journalctl -u monitor-agent`.
 
 Because the Server uses SQLite WAL mode, stop `monitor-server` before making a
