@@ -35,11 +35,23 @@ curl -fsSL https://raw.githubusercontent.com/bear4f/Monitor/main/scripts/bootstr
   | sudo bash -s -- server --set-admin-password
 ```
 
+Already root, so no `sudo` is involved:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bear4f/Monitor/main/scripts/bootstrap-monitor.sh \
+  | bash -s -- server --set-admin-password
+```
+
 A custom port, or a custom address and port:
 
 ```sh
-curl -fsSL .../bootstrap-monitor.sh | sudo bash -s -- server --port 25776
-curl -fsSL .../bootstrap-monitor.sh | sudo bash -s -- server --listen 0.0.0.0 --port 25776
+curl -fsSL https://raw.githubusercontent.com/bear4f/Monitor/main/scripts/bootstrap-monitor.sh \
+  | sudo bash -s -- server --port 25776
+```
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bear4f/Monitor/main/scripts/bootstrap-monitor.sh \
+  | sudo bash -s -- server --listen 0.0.0.0 --port 25776
 ```
 
 `--listen` accepts IPv4 and IPv6 literals; `::1` and `::` are bracketed
@@ -49,8 +61,15 @@ plain HTTP and expects a trusted HTTPS reverse proxy in front of it.
 Agent, which prompts for the token with echo disabled:
 
 ```sh
-curl -fsSL .../bootstrap-monitor.sh \
+curl -fsSL https://raw.githubusercontent.com/bear4f/Monitor/main/scripts/bootstrap-monitor.sh \
   | sudo bash -s -- agent --server https://monitor.example.com
+```
+
+Already root:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/bear4f/Monitor/main/scripts/bootstrap-monitor.sh \
+  | bash -s -- agent --server https://monitor.example.com
 ```
 
 Pin an exact release instead of the latest with `--version v0.1.1`. For
@@ -61,6 +80,16 @@ copied or deleted.
 Reinstalling preserves a custom listener and never changes an existing
 administrator password unless `--set-admin-password` or
 `--admin-password-file` is given.
+
+The bootstrap always fetches `scripts/install-monitor.sh` and `packaging/` from
+the release it resolved. It never runs an `install-monitor.sh` found in the
+current directory, so piping it into a shell from an arbitrary working
+directory is safe. To test a checkout, run `scripts/install-monitor.sh`
+directly.
+
+Setting the administrator password runs the Server CLI as the `monitor` user
+through `runuser`, falling back to `sudo` when `runuser` is absent; one of the
+two must exist, and that is checked before anything is installed.
 
 ## Server installation (explicit release)
 
