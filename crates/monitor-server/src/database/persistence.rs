@@ -429,7 +429,7 @@ pub(super) fn load_enabled_ping_targets(
 ) -> Result<Vec<EnabledPingTargetRow>, DatabaseError> {
     let mut statement = connection
         .prepare(
-            "SELECT id, name, host, ip_family
+            "SELECT id, name, host, ip_family, probe_kind, port
              FROM ping_targets WHERE enabled = 1 ORDER BY sort_order, id",
         )
         .map_err(|source| DatabaseError::Sql {
@@ -443,6 +443,8 @@ pub(super) fn load_enabled_ping_targets(
                 name: row.get(1)?,
                 host: row.get(2)?,
                 ip_family: row.get(3)?,
+                probe_kind: row.get(4)?,
+                port: row.get(5)?,
             })
         })
         .map_err(|source| DatabaseError::Sql {
@@ -486,14 +488,17 @@ pub(super) fn create_ping_target(
     let inserted = transaction
         .execute(
             "INSERT INTO ping_targets (
-                id, name, host, ip_family, enabled, sort_order, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+                id, name, host, ip_family, probe_kind, port, enabled, sort_order,
+                created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
              ON CONFLICT(id) DO NOTHING",
             params![
                 target.id,
                 target.name,
                 target.host,
                 target.ip_family,
+                target.probe_kind,
+                target.port,
                 target.enabled,
                 sort_order,
                 now,
@@ -514,6 +519,8 @@ pub(super) fn create_ping_target(
         name: target.name.clone(),
         host: target.host.clone(),
         ip_family: target.ip_family,
+        probe_kind: target.probe_kind.clone(),
+        port: target.port,
         enabled: target.enabled,
         sort_order,
     };
@@ -553,15 +560,35 @@ pub(super) fn update_ping_target(
     if new_order < 0 || new_order >= target_count {
         return Ok(UpdatePingTargetResult::InvalidSortOrder);
     }
+    // The patch is validated as a final state, not field by field: the endpoint
+    // text can only be parsed once the resulting probe kind is known, and a patch
+    // that changes only the kind must fail when the retained port no longer suits
+    // it.
+    let ip_family = patch.ip_family.unwrap_or(existing.ip_family);
+    let Some(kind) = crate::ping_target::probe_kind_from_str(
+        patch.probe_kind.as_deref().unwrap_or(&existing.probe_kind),
+    ) else {
+        return Ok(UpdatePingTargetResult::InvalidConfiguration);
+    };
+    let (host, port) = match patch.target.as_deref() {
+        Some(target) => match crate::ping_target::parse_endpoint(kind, target, ip_family) {
+            Some(parsed) => (parsed.host, parsed.port),
+            None => return Ok(UpdatePingTargetResult::InvalidConfiguration),
+        },
+        None => (existing.host, existing.port),
+    };
     let updated = PingTargetRow {
         id,
         name: patch.name.clone().unwrap_or(existing.name),
-        host: patch.host.clone().unwrap_or(existing.host),
-        ip_family: patch.ip_family.unwrap_or(existing.ip_family),
+        host,
+        ip_family,
+        probe_kind: crate::ping_target::probe_kind_as_str(kind).to_owned(),
+        port,
         enabled: patch.enabled.unwrap_or(existing.enabled),
         sort_order: new_order,
     };
-    if !crate::ping_target::valid_host_for_family(&updated.host, updated.ip_family) {
+    if !crate::ping_target::endpoint_is_valid(kind, &updated.host, updated.port, updated.ip_family)
+    {
         return Ok(UpdatePingTargetResult::InvalidConfiguration);
     }
 
@@ -591,12 +618,15 @@ pub(super) fn update_ping_target(
     transaction
         .execute(
             "UPDATE ping_targets SET name = ?1, host = ?2, ip_family = ?3,
-                    enabled = ?4, sort_order = ?5, updated_at = ?6
-             WHERE id = ?7",
+                    probe_kind = ?4, port = ?5, enabled = ?6, sort_order = ?7,
+                    updated_at = ?8
+             WHERE id = ?9",
             params![
                 updated.name,
                 updated.host,
                 updated.ip_family,
+                updated.probe_kind,
+                updated.port,
                 updated.enabled,
                 updated.sort_order,
                 now,
@@ -692,7 +722,7 @@ fn select_ping_target(
 ) -> Result<Option<PingTargetRow>, DatabaseError> {
     transaction
         .query_row(
-            "SELECT id, name, host, ip_family, enabled, sort_order
+            "SELECT id, name, host, ip_family, probe_kind, port, enabled, sort_order
              FROM ping_targets WHERE id = ?1",
             [id],
             ping_target_from_row,
@@ -709,10 +739,10 @@ fn select_ping_targets(
     enabled_only: bool,
 ) -> Result<Vec<PingTargetRow>, DatabaseError> {
     let sql = if enabled_only {
-        "SELECT id, name, host, ip_family, enabled, sort_order
+        "SELECT id, name, host, ip_family, probe_kind, port, enabled, sort_order
          FROM ping_targets WHERE enabled = 1 ORDER BY sort_order, id"
     } else {
-        "SELECT id, name, host, ip_family, enabled, sort_order
+        "SELECT id, name, host, ip_family, probe_kind, port, enabled, sort_order
          FROM ping_targets ORDER BY sort_order, id"
     };
     let mut statement = connection
@@ -745,6 +775,8 @@ fn select_enabled_ping_targets(
                 name: target.name,
                 host: target.host,
                 ip_family: target.ip_family,
+                probe_kind: target.probe_kind,
+                port: target.port,
             })
             .collect()
     })
@@ -756,8 +788,10 @@ fn ping_target_from_row(row: &Row<'_>) -> rusqlite::Result<PingTargetRow> {
         name: row.get(1)?,
         host: row.get(2)?,
         ip_family: row.get(3)?,
-        enabled: row.get(4)?,
-        sort_order: row.get(5)?,
+        probe_kind: row.get(4)?,
+        port: row.get(5)?,
+        enabled: row.get(6)?,
+        sort_order: row.get(7)?,
     })
 }
 

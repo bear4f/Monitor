@@ -46,6 +46,8 @@ pub struct EnabledPingTargetRow {
     pub name: String,
     pub host: String,
     pub ip_family: i64,
+    pub probe_kind: String,
+    pub port: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +56,8 @@ pub struct PingTargetRow {
     pub name: String,
     pub host: String,
     pub ip_family: i64,
+    pub probe_kind: String,
+    pub port: Option<i64>,
     pub enabled: bool,
     pub sort_order: i64,
 }
@@ -64,13 +68,18 @@ pub struct NewPingTargetRow {
     pub name: String,
     pub host: String,
     pub ip_family: i64,
+    pub probe_kind: String,
+    pub port: Option<i64>,
     pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PingTargetPatchRow {
     pub name: Option<String>,
-    pub host: Option<String>,
+    /// Raw endpoint text. Parsing needs the final probe kind, so it happens where
+    /// the existing row is known rather than field by field.
+    pub target: Option<String>,
+    pub probe_kind: Option<String>,
     pub ip_family: Option<i64>,
     pub enabled: Option<bool>,
     pub sort_order: Option<i64>,

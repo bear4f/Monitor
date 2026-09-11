@@ -3,16 +3,17 @@ use axum::{
     http::StatusCode,
     response::Response,
 };
+use monitor_common::ProbeKind;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    app::{AgentPingTarget, AppState},
+    app::AppState,
     auth::unix_timestamp,
     database::{
         CreatePingTargetResult, EnabledPingTargetRow, NewPingTargetRow, PingTargetPatchRow,
         PingTargetRow, UpdatePingTargetResult,
     },
-    ping_target::valid_host_for_family,
+    ping_target::{parse_endpoint, probe_kind_as_str, probe_kind_from_str},
 };
 
 use super::{
@@ -31,7 +32,11 @@ const JS_SAFE_INTEGER_MAX: u64 = 9_007_199_254_740_991;
 #[serde(deny_unknown_fields)]
 struct CreatePingTargetRequest {
     name: String,
-    host: String,
+    /// One endpoint string, parsed authoritatively on this side. For ICMP a bare
+    /// host including a bare IPv6 literal; for TCP `host:port`, with an IPv6
+    /// literal bracketed.
+    target: String,
+    probe_kind: String,
     ip_family: i64,
     enabled: bool,
 }
@@ -42,7 +47,9 @@ struct PatchPingTargetRequest {
     #[serde(default)]
     name: PatchField<String>,
     #[serde(default)]
-    host: PatchField<String>,
+    target: PatchField<String>,
+    #[serde(default)]
+    probe_kind: PatchField<String>,
     #[serde(default)]
     ip_family: PatchField<i64>,
     #[serde(default)]
@@ -66,7 +73,9 @@ struct PingTargetObject {
     id: i64,
     name: String,
     host: String,
+    port: Option<i64>,
     ip_family: i64,
+    probe_kind: String,
     enabled: bool,
     sort_order: i64,
 }
@@ -77,7 +86,9 @@ impl From<PingTargetRow> for PingTargetObject {
             id: target.id,
             name: target.name,
             host: target.host,
+            port: target.port,
             ip_family: target.ip_family,
+            probe_kind: target.probe_kind,
             enabled: target.enabled,
             sort_order: target.sort_order,
         }
@@ -111,8 +122,15 @@ pub(super) async fn create(
     validate_csrf(request.headers())?;
     let request: CreatePingTargetRequest = parse_json(request, JSON_BODY_LIMIT).await?;
     let name = valid_name(request.name)?;
-    let host = valid_host(request.host, request.ip_family)?;
     let ip_family = valid_ip_family(request.ip_family)?;
+    let kind = valid_probe_kind(request.probe_kind)?;
+    // Untrimmed input is refused rather than silently trimmed, matching how the
+    // other target fields have always been validated.
+    if request.target.trim() != request.target {
+        return Err(ApiError::invalid_request());
+    }
+    let endpoint =
+        parse_endpoint(kind, &request.target, ip_family).ok_or_else(ApiError::invalid_request)?;
 
     let _mutation_guard = state.ping_target_mutation_lock.lock().await;
     let now = unix_timestamp().map_err(|_| ApiError::internal())?;
@@ -121,8 +139,10 @@ pub(super) async fn create(
         let target = NewPingTargetRow {
             id: random_target_id().map_err(|_| ApiError::internal())?,
             name: name.clone(),
-            host: host.clone(),
+            host: endpoint.host.clone(),
             ip_family,
+            probe_kind: probe_kind_as_str(kind).to_owned(),
+            port: endpoint.port,
             enabled: request.enabled,
         };
         match state
@@ -214,7 +234,12 @@ fn validate_patch(request: PatchPingTargetRequest) -> Result<PingTargetPatchRow,
     }
     Ok(PingTargetPatchRow {
         name: required_patch(request.name, valid_name)?,
-        host: required_patch(request.host, valid_host_syntax)?,
+        // Kept raw: parsing needs the resulting probe kind, which update_ping_target
+        // resolves against the stored row so the final state is what gets validated.
+        target: required_patch(request.target, valid_target_syntax)?,
+        probe_kind: required_patch(request.probe_kind, |value| {
+            valid_probe_kind(value).map(|kind| probe_kind_as_str(kind).to_owned())
+        })?,
         ip_family: required_patch(request.ip_family, valid_ip_family)?,
         enabled: required_patch(request.enabled, Ok)?,
         sort_order: required_patch(request.sort_order, |value| {
@@ -228,7 +253,8 @@ fn validate_patch(request: PatchPingTargetRequest) -> Result<PingTargetPatchRow,
 impl PatchPingTargetRequest {
     fn is_empty(&self) -> bool {
         self.name.is_missing()
-            && self.host.is_missing()
+            && self.target.is_missing()
+            && self.probe_kind.is_missing()
             && self.ip_family.is_missing()
             && self.enabled.is_missing()
             && self.sort_order.is_missing()
@@ -254,16 +280,20 @@ fn valid_name(value: String) -> Result<String, ApiError> {
         .ok_or_else(ApiError::invalid_request)
 }
 
-fn valid_host(value: String, family: i64) -> Result<String, ApiError> {
-    let value = valid_host_syntax(value)?;
-    valid_host_for_family(&value, family)
-        .then_some(value)
-        .ok_or_else(ApiError::invalid_request)
+fn valid_probe_kind(value: String) -> Result<ProbeKind, ApiError> {
+    probe_kind_from_str(&value).ok_or_else(ApiError::invalid_request)
 }
 
-fn valid_host_syntax(value: String) -> Result<String, ApiError> {
+/// Only checks that the text could be an endpoint at all. Whether it suits the
+/// resulting probe kind is decided against the stored row, so a patch is judged
+/// by its final state rather than field by field.
+fn valid_target_syntax(value: String) -> Result<String, ApiError> {
     let trimmed = value.trim();
-    if trimmed != value || !valid_host_for_family(trimmed, 4) && !valid_host_for_family(trimmed, 6)
+    if trimmed != value
+        || (parse_endpoint(ProbeKind::Icmp, trimmed, 4).is_none()
+            && parse_endpoint(ProbeKind::Icmp, trimmed, 6).is_none()
+            && parse_endpoint(ProbeKind::Tcp, trimmed, 4).is_none()
+            && parse_endpoint(ProbeKind::Tcp, trimmed, 6).is_none())
     {
         return Err(ApiError::invalid_request());
     }
@@ -297,12 +327,7 @@ fn random_target_id() -> Result<i64, getrandom::Error> {
 async fn publish_enabled_targets(state: &AppState, rows: Vec<EnabledPingTargetRow>) {
     state.agent_config.write().await.targets = rows
         .into_iter()
-        .map(|target| AgentPingTarget {
-            id: target.id,
-            name: target.name,
-            host: target.host,
-            ip_family: target.ip_family,
-        })
+        .map(crate::app::agent_config_target)
         .collect();
 }
 
@@ -425,7 +450,8 @@ mod tests {
     ) -> (StatusCode, Value) {
         let body = json!({
             "name": name,
-            "host": host,
+            "target": host,
+            "probe_kind": "icmp",
             "ip_family": family,
             "enabled": enabled,
         })
@@ -491,7 +517,7 @@ mod tests {
     #[tokio::test]
     async fn request_and_host_validation_are_strict() {
         let context = TestContext::new().await;
-        let valid_body = r#"{"name":"Target","host":"example.com","ip_family":4,"enabled":true}"#;
+        let valid_body = r#"{"name":"Target","target":"example.com","probe_kind":"icmp","ip_family":4,"enabled":true}"#;
         assert_eq!(
             response(
                 create(
@@ -532,8 +558,8 @@ mod tests {
             );
         }
         for body in [
-            r#"{"name":"Target","host":"example.com","ip_family":4,"enabled":true,"extra":1}"#,
-            r#"{"name":"Target","host":"example.com","ip_family":"4","enabled":true}"#,
+            r#"{"name":"Target","target":"example.com","probe_kind":"icmp","ip_family":4,"enabled":true,"extra":1}"#,
+            r#"{"name":"Target","target":"example.com","probe_kind":"icmp","ip_family":"4","enabled":true}"#,
         ] {
             assert_eq!(
                 response(
@@ -548,7 +574,8 @@ mod tests {
             );
         }
         let oversized = json!({
-            "name": "x".repeat(8_300), "host": "example.com", "ip_family": 4, "enabled": true
+            "name": "x".repeat(8_300), "target": "example.com", "probe_kind": "icmp",
+            "ip_family": 4, "enabled": true
         })
         .to_string();
         assert_eq!(
@@ -563,7 +590,7 @@ mod tests {
             StatusCode::PAYLOAD_TOO_LARGE
         );
         let mut wrong_type = context.request(
-            r#"{"name":"T","host":"example.com","ip_family":4,"enabled":true}"#,
+            r#"{"name":"T","target":"example.com","probe_kind":"icmp","ip_family":4,"enabled":true}"#,
             true,
             true,
         );
@@ -649,6 +676,8 @@ mod tests {
                     name: "Collision".to_owned(),
                     host: "collision.example".to_owned(),
                     ip_family: 4,
+                    probe_kind: "icmp".to_owned(),
+                    port: None,
                     enabled: true,
                 },
                 unix_timestamp().unwrap(),
@@ -722,7 +751,7 @@ mod tests {
         let edited = response(
             patch_request(
                 ids[0],
-                r#"{"name":"Renamed","host":"ipv6.example","ip_family":6}"#,
+                r#"{"name":"Renamed","target":"ipv6.example","ip_family":6}"#,
             )
             .await,
         );

@@ -605,7 +605,7 @@ mod tests {
         let cookie = context.cookie.clone();
         let csrf = context.csrf.clone();
         let ping_task = tokio::spawn(async move {
-            let body = r#"{"name":"Concurrent Target","host":"target.example","ip_family":4,"enabled":true}"#;
+            let body = r#"{"name":"Concurrent Target","target":"target.example","probe_kind":"icmp","ip_family":4,"enabled":true}"#;
             response(
                 ping_targets::create(State(state), request(&cookie, &csrf, body, true, true)).await,
             )

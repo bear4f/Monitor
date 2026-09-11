@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-pub use monitor_common::AgentPingTarget;
+pub use monitor_common::{AgentPingTarget, AgentPingTargetV2};
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 
 use crate::auth::LoginLimiter;
@@ -15,11 +15,29 @@ pub type NodeMetaCache = Arc<RwLock<HashMap<i64, NodeMetaRow>>>;
 pub type NodeTokenCache = Arc<RwLock<HashMap<[u8; 32], i64>>>;
 pub type AgentConfigCache = Arc<RwLock<AgentConfig>>;
 
+/// Maps a stored enabled target to the cached config shape. An unrecognised
+/// probe kind cannot occur -- the schema CHECK forbids it -- and is treated as
+/// ICMP with no port rather than dropping the target silently.
+pub fn agent_config_target(target: crate::database::EnabledPingTargetRow) -> AgentPingTargetV2 {
+    let probe_kind = crate::ping_target::probe_kind_from_str(&target.probe_kind)
+        .unwrap_or(monitor_common::ProbeKind::Icmp);
+    AgentPingTargetV2 {
+        id: target.id,
+        name: target.name,
+        host: target.host,
+        ip_family: target.ip_family,
+        probe_kind,
+        port: target.port,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub report_interval_seconds: i64,
     pub ping_interval_seconds: i64,
-    pub targets: Vec<AgentPingTarget>,
+    /// One cache, holding the richer shape. The protocol 1 view is derived from
+    /// it when an old Agent asks, so there is no second config-target cache.
+    pub targets: Vec<AgentPingTargetV2>,
 }
 
 #[derive(Clone)]
@@ -73,12 +91,7 @@ impl AppState {
             targets: hydration
                 .enabled_ping_targets
                 .into_iter()
-                .map(|target| AgentPingTarget {
-                    id: target.id,
-                    name: target.name,
-                    host: target.host,
-                    ip_family: target.ip_family,
-                })
+                .map(agent_config_target)
                 .collect(),
         };
 

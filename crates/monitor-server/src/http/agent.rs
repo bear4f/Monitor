@@ -5,7 +5,7 @@ use axum::{
     http::{HeaderMap, HeaderName, StatusCode, header::AUTHORIZATION},
     response::Response,
 };
-use monitor_common::{AgentConfigPayload, AgentReport};
+use monitor_common::{AgentConfigPayload, AgentConfigPayloadV2, AgentReport};
 
 use crate::{
     app::{AgentConfig, AppState},
@@ -28,20 +28,61 @@ struct AgentIdentity {
     token_hash: [u8; 32],
 }
 
+/// Config protocol negotiation. A v0.1.2 Agent sends no version header and must
+/// receive the byte-identical protocol 1 payload -- it parses targets with
+/// `deny_unknown_fields`, so a single extra field would make it reject the whole
+/// configuration. It therefore also only sees ICMP targets, since it cannot
+/// probe TCP. The report protocol is unrelated and stays at version 1 for both.
+fn requested_config_version(headers: &HeaderMap) -> i64 {
+    // Matched as exact text, not parsed: "02" and "2 " are not the header this
+    // protocol defines, and anything unrecognised falls back to protocol 1 so a
+    // confused Agent still receives a configuration it can parse.
+    let requested_v2 = headers
+        .get(monitor_common::CONFIG_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "2");
+    if requested_v2 {
+        monitor_common::CONFIG_VERSION_V2
+    } else {
+        monitor_common::CONFIG_VERSION_V1
+    }
+}
+
 pub(super) async fn config(
     State(state): State<AppState>,
     request: Request,
 ) -> Result<Response, ApiError> {
     authenticate_agent(&state, request.headers()).await?;
+    let version = requested_config_version(request.headers());
     let config = state.agent_config.read().await;
-    let response = AgentConfigPayload {
-        protocol_version: 1,
-        report_interval_seconds: config.report_interval_seconds,
-        ping_interval_seconds: config.ping_interval_seconds,
-        targets: config.targets.clone(),
-    };
+    let report_interval_seconds = config.report_interval_seconds;
+    let ping_interval_seconds = config.ping_interval_seconds;
+    if version == monitor_common::CONFIG_VERSION_V2 {
+        let response = AgentConfigPayloadV2 {
+            protocol_version: monitor_common::CONFIG_VERSION_V2,
+            report_interval_seconds,
+            ping_interval_seconds,
+            targets: config.targets.clone(),
+        };
+        drop(config);
+        return Ok(json_response(StatusCode::OK, response));
+    }
+    let targets = config
+        .targets
+        .iter()
+        .filter(|target| target.probe_kind == monitor_common::ProbeKind::Icmp)
+        .map(monitor_common::AgentPingTargetV2::to_legacy)
+        .collect();
     drop(config);
-    Ok(json_response(StatusCode::OK, response))
+    Ok(json_response(
+        StatusCode::OK,
+        AgentConfigPayload {
+            protocol_version: monitor_common::CONFIG_VERSION_V1,
+            report_interval_seconds,
+            ping_interval_seconds,
+            targets,
+        },
+    ))
 }
 
 pub(super) async fn report(
@@ -413,17 +454,19 @@ mod tests {
             database.shutdown().await.expect("close fixture database");
 
             let connection = Connection::open(&path).expect("open agent fixture connection");
-            for (id, name, host, family, enabled, order) in [
-                (1, "Enabled second", "203.0.113.1", 4, 1, 1),
-                (2, "Disabled", "203.0.113.2", 4, 0, 0),
-                (3, "Enabled first", "2001:db8::1", 6, 1, 0),
+            for (id, name, host, family, kind, port, enabled, order) in [
+                (1, "Enabled second", "203.0.113.1", 4, "icmp", None, 1, 1),
+                (2, "Disabled", "203.0.113.2", 4, "icmp", None, 0, 0),
+                (3, "Enabled first", "2001:db8::1", 6, "icmp", None, 1, 0),
+                (4, "Enabled tcp", "example.com", 4, "tcp", Some(443), 1, 2),
             ] {
                 connection
                     .execute(
                         "INSERT INTO ping_targets
-                            (id, name, host, ip_family, enabled, sort_order, created_at, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 1)",
-                        params![id, name, host, family, enabled, order],
+                            (id, name, host, ip_family, probe_kind, port, enabled,
+                             sort_order, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, 1)",
+                        params![id, name, host, family, kind, port, enabled, order],
                     )
                     .expect("insert ping target fixture");
             }
@@ -536,6 +579,140 @@ mod tests {
         assert_eq!(
             response(config(State(context.state.clone()), duplicate).await).status(),
             StatusCode::UNAUTHORIZED
+        );
+        context.finish().await;
+    }
+
+    /// A v0.1.2 Agent sends no version header. It must receive the protocol 1
+    /// payload byte for byte -- it parses targets with deny_unknown_fields -- and
+    /// only the ICMP targets, because it cannot probe TCP.
+    #[tokio::test]
+    async fn config_without_a_version_header_returns_the_frozen_protocol_one_shape() {
+        let context = TestContext::new().await;
+        let response = response(
+            config(
+                State(context.state.clone()),
+                agent_read_request(Some(&format!("Bearer {}", encode_hex(&TOKEN_RAW)))),
+            )
+            .await,
+        );
+        assert_eq!(response.status(), StatusCode::OK);
+        // Compared as raw bytes: re-serializing a serde_json::Value sorts keys and
+        // would not prove the wire shape an old Agent actually receives.
+        let text = response_text(response).await;
+        assert_eq!(
+            text,
+            concat!(
+                r#"{"protocol_version":1,"report_interval_seconds":2,"ping_interval_seconds":15,"targets":["#,
+                r#"{"id":3,"name":"Enabled first","host":"2001:db8::1","ip_family":6},"#,
+                r#"{"id":1,"name":"Enabled second","host":"203.0.113.1","ip_family":4}]}"#
+            ),
+            "the TCP target must not be offered and protocol 1 target keys are frozen"
+        );
+        assert!(!text.contains("probe_kind"));
+        // Keyed, not substring: "report_interval_seconds" contains "port".
+        assert!(!text.contains(r#""port":"#));
+        // And the body parses as the struct a v0.1.2 Agent uses.
+        let legacy: monitor_common::AgentConfigPayload =
+            serde_json::from_str(&text).expect("a v0.1.2 Agent must accept this body");
+        assert_eq!(legacy.protocol_version, 1);
+        assert_eq!(legacy.targets.len(), 2);
+        context.finish().await;
+    }
+
+    #[tokio::test]
+    async fn config_with_version_two_returns_both_probe_kinds() {
+        let context = TestContext::new().await;
+        let request = HttpRequest::builder()
+            .header(AUTHORIZATION, format!("Bearer {}", encode_hex(&TOKEN_RAW)))
+            .header(monitor_common::CONFIG_VERSION_HEADER, "2")
+            .body(Body::empty())
+            .expect("build versioned config request");
+        let response = response(config(State(context.state.clone()), request).await);
+        assert_eq!(response.status(), StatusCode::OK);
+        let text = response_text(response).await;
+        assert_eq!(
+            text,
+            concat!(
+                r#"{"protocol_version":2,"report_interval_seconds":2,"ping_interval_seconds":15,"targets":["#,
+                r#"{"id":3,"name":"Enabled first","host":"2001:db8::1","ip_family":6,"probe_kind":"icmp","port":null},"#,
+                r#"{"id":1,"name":"Enabled second","host":"203.0.113.1","ip_family":4,"probe_kind":"icmp","port":null},"#,
+                r#"{"id":4,"name":"Enabled tcp","host":"example.com","ip_family":4,"probe_kind":"tcp","port":443}]}"#
+            )
+        );
+        // A config-protocol-2 Agent parses it, and the round trip is exact.
+        let parsed = monitor_common::AgentConfigPayloadV2::from_json(&text)
+            .expect("a v0.1.3 Agent must accept this body");
+        assert_eq!(parsed.targets.len(), 3);
+        assert_eq!(parsed.targets[2].probe_kind, monitor_common::ProbeKind::Tcp);
+        assert_eq!(parsed.targets[2].port, Some(443));
+        context.finish().await;
+    }
+
+    /// An unusable or hostile header value falls back to protocol 1 rather than
+    /// erroring, so a confused Agent still gets a configuration it can parse.
+    #[tokio::test]
+    async fn an_unrecognised_config_version_header_falls_back_to_protocol_one() {
+        let context = TestContext::new().await;
+        for header in [
+            "1",
+            "3",
+            "0",
+            "",
+            "two",
+            "2 ",
+            "02",
+            "-2",
+            "99999999999999999999",
+        ] {
+            let request = HttpRequest::builder()
+                .header(AUTHORIZATION, format!("Bearer {}", encode_hex(&TOKEN_RAW)))
+                .header(monitor_common::CONFIG_VERSION_HEADER, header)
+                .body(Body::empty())
+                .expect("build config request");
+            let response = response(config(State(context.state.clone()), request).await);
+            assert_eq!(response.status(), StatusCode::OK, "header {header:?}");
+            let body = response_json(response).await;
+            assert_eq!(body["protocol_version"], 1, "header {header:?}");
+            assert_eq!(
+                body["targets"].as_array().expect("targets").len(),
+                2,
+                "header {header:?}"
+            );
+        }
+        context.finish().await;
+    }
+
+    /// The report protocol is independent of the config protocol and stays at 1.
+    #[tokio::test]
+    async fn the_report_protocol_stays_at_version_one_for_both_config_versions() {
+        let context = TestContext::new().await;
+        let accepted = valid_report().to_string();
+        assert_eq!(
+            response(
+                report(
+                    State(context.state.clone()),
+                    ConnectInfo(loopback_peer()),
+                    agent_request(&encode_hex(&TOKEN_RAW), &accepted),
+                )
+                .await
+            )
+            .status(),
+            StatusCode::NO_CONTENT
+        );
+        let rejected = with_value("protocol_version", json!(2)).to_string();
+        assert_eq!(
+            response(
+                report(
+                    State(context.state.clone()),
+                    ConnectInfo(loopback_peer()),
+                    agent_request(&encode_hex(&TOKEN_RAW), &rejected),
+                )
+                .await
+            )
+            .status(),
+            StatusCode::BAD_REQUEST,
+            "the report protocol must not follow the config protocol"
         );
         context.finish().await;
     }
@@ -1299,6 +1476,13 @@ mod tests {
 
     fn response(result: Result<Response, ApiError>) -> Response {
         result.unwrap_or_else(IntoResponse::into_response)
+    }
+
+    async fn response_text(response: Response) -> String {
+        let bytes = to_bytes(response.into_body(), 64 * 1_024)
+            .await
+            .expect("read response body");
+        String::from_utf8(bytes.to_vec()).expect("response body is UTF-8")
     }
 
     async fn response_json(response: Response) -> Value {
