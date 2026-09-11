@@ -5,8 +5,15 @@ readonly REPOSITORY="bear4f/Monitor"
 readonly SERVER_BINARY=/usr/local/bin/monitor-server
 readonly AGENT_BINARY=/usr/local/bin/monitor-agent
 readonly SERVER_DB=/var/lib/monitor/monitor.db
-readonly SERVER_DB_BACKUP=/var/lib/monitor/monitor.db.pre-update
-readonly SERVER_DB_BACKUP_WAL=/var/lib/monitor/monitor.db.pre-update-wal
+# Deliberately outside /var/lib/monitor: the shipped unit gives the monitor
+# service account StateDirectory=monitor and ReadWritePaths=/var/lib/monitor, so
+# a fixed rollback path in there would be both a path the service user can
+# replace under a root writer and a copy the freshly upgraded Server could
+# delete after startup. This directory is root:root 0700, so the service account
+# can neither traverse nor modify it.
+readonly BACKUP_ROOT=/var/lib/monitor-update-backup
+readonly BACKUP_GENERATION=/var/lib/monitor-update-backup/current
+readonly BACKUP_STAGING=/var/lib/monitor-update-backup/staging
 readonly SERVER_UNIT=/etc/systemd/system/monitor-server.service
 readonly SERVER_UNIT_NAME=monitor-server.service
 readonly SERVER_DROPIN_DIR=/etc/systemd/system/monitor-server.service.d
@@ -125,35 +132,81 @@ installed_component() {
 # WAL mode the main file alone is not a complete database: committed frames may
 # still sit in -wal, so the pair is copied and restored together. -shm is a
 # rebuildable index into -wal and is deliberately not copied.
+# Refuses a tampered backup root rather than writing into it.
+prepare_backup_root() {
+  [[ ! -L $BACKUP_ROOT ]] || die "$BACKUP_ROOT must not be a symbolic link"
+  if [[ -e $BACKUP_ROOT ]]; then
+    [[ -d $BACKUP_ROOT ]] || die "$BACKUP_ROOT is not a directory"
+    [[ $(stat -c '%u:%g:%a' -- "$BACKUP_ROOT") == 0:0:700 ]] \
+      || die "$BACKUP_ROOT must be owned by root:root with mode 0700"
+  else
+    install -d -o root -g root -m 0700 "$BACKUP_ROOT" || return 1
+  fi
+  [[ ! -L $BACKUP_GENERATION ]] || die "$BACKUP_GENERATION must not be a symbolic link"
+}
+
+# One backup is one generation, held in its own directory. The whole directory is
+# replaced, so a WAL copied by an earlier update cannot survive next to a newer
+# main database: a generation taken from a database with no -wal simply has no
+# -wal file in it. The generation is staged completely and only then published,
+# so a failed copy never destroys the generation already on disk.
 backup_database() {
   BACKUP_TAKEN=false
   [[ -e $SERVER_DB ]] || return 0
   [[ -f $SERVER_DB && ! -L $SERVER_DB ]] || die "$SERVER_DB is not a regular file"
-  rm -f -- "$SERVER_DB_BACKUP" "$SERVER_DB_BACKUP_WAL"
-  cp -p -- "$SERVER_DB" "$SERVER_DB_BACKUP.new.$$" || return 1
+  prepare_backup_root || return 1
+
+  rm -rf -- "$BACKUP_STAGING" || return 1
+  install -d -o root -g root -m 0700 "$BACKUP_STAGING" || return 1
+  cp -p -- "$SERVER_DB" "$BACKUP_STAGING/monitor.db" || return 1
   if [[ -f ${SERVER_DB}-wal ]]; then
-    cp -p -- "${SERVER_DB}-wal" "$SERVER_DB_BACKUP_WAL.new.$$" || return 1
+    cp -p -- "${SERVER_DB}-wal" "$BACKUP_STAGING/monitor.db-wal" || return 1
   fi
-  mv -f -- "$SERVER_DB_BACKUP.new.$$" "$SERVER_DB_BACKUP" || return 1
-  if [[ -f $SERVER_DB_BACKUP_WAL.new.$$ ]]; then
-    mv -f -- "$SERVER_DB_BACKUP_WAL.new.$$" "$SERVER_DB_BACKUP_WAL" || return 1
+  # The live ownership and mode are recorded so a restore reinstates exactly what
+  # the service account needs, instead of trusting the copy to have kept it.
+  stat -c '%u:%g:%a' -- "$SERVER_DB" > "$BACKUP_STAGING/database-owner" || return 1
+
+  local replaced="$BACKUP_GENERATION.replaced"
+  rm -rf -- "$replaced" || return 1
+  if [[ -d $BACKUP_GENERATION ]]; then
+    mv -- "$BACKUP_GENERATION" "$replaced" || return 1
   fi
+  mv -- "$BACKUP_STAGING" "$BACKUP_GENERATION" || return 1
+  rm -rf -- "$replaced"
   BACKUP_TAKEN=true
 }
 
-# Any -wal left by the new Server describes the migrated schema, so it must be
+# Any -wal left by the new Server describes the migrated schema, so it is
 # discarded before the pre-update files go back; replaying it onto the restored
-# main file would reintroduce the migration this is undoing.
+# main file would reintroduce the migration this is undoing. -shm is removed too
+# so SQLite rebuilds it from whatever the restored generation actually is.
 restore_database() {
   [[ ${BACKUP_TAKEN-false} == true ]] || return 0
-  rm -f -- "${SERVER_DB}-wal" "${SERVER_DB}-shm"
-  cp -p -- "$SERVER_DB_BACKUP" "$SERVER_DB.restore.$$" \
+  [[ -f $BACKUP_GENERATION/monitor.db ]] \
+    || die "$BACKUP_GENERATION/monitor.db is missing; cannot restore"
+
+  rm -f -- "${SERVER_DB}-wal" "${SERVER_DB}-shm" || return 1
+  cp -p -- "$BACKUP_GENERATION/monitor.db" "$SERVER_DB.restore.$$" \
     && mv -f -- "$SERVER_DB.restore.$$" "$SERVER_DB" \
     || return 1
-  if [[ -f $SERVER_DB_BACKUP_WAL ]]; then
-    cp -p -- "$SERVER_DB_BACKUP_WAL" "${SERVER_DB}-wal.restore.$$" \
+  if [[ -f $BACKUP_GENERATION/monitor.db-wal ]]; then
+    cp -p -- "$BACKUP_GENERATION/monitor.db-wal" "${SERVER_DB}-wal.restore.$$" \
       && mv -f -- "${SERVER_DB}-wal.restore.$$" "${SERVER_DB}-wal" \
       || return 1
+  fi
+  # A generation taken without a WAL must leave no live WAL behind.
+  if [[ ! -f $BACKUP_GENERATION/monitor.db-wal && -e ${SERVER_DB}-wal ]]; then
+    die "a stale ${SERVER_DB}-wal survived a WAL-less rollback"
+  fi
+
+  local owner
+  if owner=$(< "$BACKUP_GENERATION/database-owner"); then
+    chown -- "${owner%:*}" "$SERVER_DB" || return 1
+    chmod -- "${owner##*:}" "$SERVER_DB" || return 1
+    if [[ -f ${SERVER_DB}-wal ]]; then
+      chown -- "${owner%:*}" "${SERVER_DB}-wal" || return 1
+      chmod -- "${owner##*:}" "${SERVER_DB}-wal" || return 1
+    fi
   fi
 }
 
@@ -202,7 +255,7 @@ update_component() {
     if [[ $was_active == true ]]; then
       systemctl start "$unit" >/dev/null 2>&1 || true
     fi
-    die "failed to copy $SERVER_DB before the update; nothing was changed"
+    die "failed to stage a rollback copy of $SERVER_DB; nothing was changed"
   fi
   stage_binary "$source" "$binary"
 
@@ -212,7 +265,7 @@ update_component() {
       rollback_binary "$backup" "$binary" \
         || die "$component start failed and the previous binary could not be restored"
       if [[ $is_server == true ]] && ! restore_database; then
-        die "$component start failed and the pre-update database could not be restored from $SERVER_DB_BACKUP"
+        die "$component start failed and the pre-update database could not be restored from $BACKUP_GENERATION"
       fi
       if systemctl start "$unit" && service_is_stable "$unit"; then
         die "$component start failed; the $restored were restored and the service recovered"
@@ -289,6 +342,6 @@ fi
 printf 'Monitor %s update complete (%s).\n' "$RELEASE_TAG" "$COMPONENT"
 if [[ ${BACKUP_TAKEN-false} == true ]]; then
   printf 'Pre-update database kept at %s; it matches the previously installed Server.\n' \
-    "$SERVER_DB_BACKUP"
+    "$BACKUP_GENERATION"
   printf 'Downgrading the Server later requires restoring it, because an older Server refuses a newer schema.\n'
 fi

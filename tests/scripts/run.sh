@@ -30,7 +30,9 @@ CASES=(
   foreign_execstart_dropin_refused
   update_preserves_managed_listener
   update_rejects_foreign_execstart
-  update_rolls_back_schema_change
+  update_rollback_restores_wal_generation
+  update_rollback_without_wal_generation
+  update_backup_is_root_only
   update_applies_schema_change
   uninstall_preflight_before_mutation
   uninstall_rejects_foreign_execstart
@@ -211,8 +213,11 @@ case_update_rejects_foreign_execstart() {
 # updater's stability check. Restoring just the binary would leave an older
 # Server in front of a newer schema, which it refuses to open -- the rollback
 # has to restore the database too.
+#
+# generation is "wal" for a pre-update database that still has an uncheckpointed
+# -wal, or "nowal" for one that was stopped cleanly and has no sidecars.
 prepare_schema_update() {
-  local fail_flag=$1
+  local fail_flag=$1 generation=$2
   install_server >/dev/null || return $(fail "install failed")
   # Replace the installed Server with one that supports schema 1 only, and give
   # it a v0.1.2-shaped database.
@@ -221,6 +226,15 @@ prepare_schema_update() {
   seed_legacy_database /var/lib/monitor/monitor.db
   systemctl restart monitor-server.service >/dev/null \
     || return $(fail "the schema 1 Server could not start on its own database")
+  if [[ $generation == wal ]]; then
+    leave_uncheckpointed_wal /var/lib/monitor/monitor.db
+    [[ -f /var/lib/monitor/monitor.db-wal ]] \
+      || return $(fail "the fixture was supposed to leave a -wal behind")
+  else
+    drop_wal_sidecars /var/lib/monitor/monitor.db
+    [[ ! -e /var/lib/monitor/monitor.db-wal ]] \
+      || return $(fail "the fixture was supposed to have no -wal")
+  fi
   # The release the updater will fetch supports schema 2.
   local asset="$CASE_TMP/web/bear4f/Monitor/releases/download/$TEST_TAG/monitor-server-linux-$ARCH"
   make_schema_binary "$asset" 9.9.9 2 "$fail_flag"
@@ -230,25 +244,51 @@ prepare_schema_update() {
   )
 }
 
-case_update_rolls_back_schema_change() {
+backup_generation=/var/lib/monitor-update-backup/current
+readonly backup_generation
+
+run_failing_update() {
+  local output
+  output=$("$REPO_ROOT/scripts/update-monitor.sh" --version "$TEST_TAG" --component server 2>&1) \
+    && { printf '%s\n' "$output"; return 1; }
+  printf '%s' "$output"
+  return 0
+}
+
+# A. pre-update database has a WAL: the generation carries both files, the failed
+#    Server's own sidecars are discarded, and the old pair comes back intact.
+case_update_rollback_restores_wal_generation() {
   local fail_flag="$CASE_TMP/fail_start"
   : > "$fail_flag"
-  prepare_schema_update "$fail_flag" || return 1
+  prepare_schema_update "$fail_flag" wal || return 1
 
   local before_schema before_digest before_binary output
   before_schema=$(schema_version_of /var/lib/monitor/monitor.db)
   before_digest=$(database_digest /var/lib/monitor/monitor.db)
   before_binary=$(sha256sum /usr/local/bin/monitor-server | cut -d' ' -f1)
   [[ $before_schema == 1 ]] || return $(fail "fixture schema is $before_schema, expected 1")
+  grep -q nagoya <<< "$before_digest" \
+    || return $(fail "the row committed into the -wal is not visible before the update")
 
-  output=$("$REPO_ROOT/scripts/update-monitor.sh" --version "$TEST_TAG" --component server 2>&1) \
-    && return $(fail "the update reported success even though the new Server failed to start")
+  output=$(run_failing_update) \
+    || return $(fail "the update reported success even though the new Server failed to start")
   grep -q 'previous binary and pre-update database were restored and the service recovered' <<< "$output" \
     || return $(fail "unexpected failure message: $output")
 
-  # The migration really did run before the failure.
+  # The new Server really did migrate and then fail, so this case has something
+  # to roll back.
+  grep -q 'simulated post-migration startup failure' "$STATE/exec.log" \
+    || return $(fail "the new Server never reached its failure point")
   grep -q 'migrated-marker' <<< "$(database_digest /var/lib/monitor/monitor.db)" \
-    && return $(fail "the new Server never migrated, so this case proves nothing")
+    && return $(fail "the row the migration committed is still present after rollback")
+
+  [[ -f $backup_generation/monitor.db && -f $backup_generation/monitor.db-wal ]] \
+    || return $(fail "the generation does not hold both pre-update files")
+  # 'nagoya' was committed into the -wal and never checkpointed, so it exists
+  # only in that sidecar. Seeing it after the rollback is what proves the WAL
+  # half of the generation was restored and not merely the main file.
+  grep -q nagoya <<< "$(database_digest /var/lib/monitor/monitor.db)" \
+    || return $(fail "the row that lived only in the pre-update -wal is gone")
 
   [[ $(schema_version_of /var/lib/monitor/monitor.db) == 1 ]] \
     || return $(fail "schema stayed at $(schema_version_of /var/lib/monitor/monitor.db) after rollback")
@@ -256,10 +296,10 @@ case_update_rolls_back_schema_change() {
     || return $(fail "pre-upgrade rows changed: $(database_digest /var/lib/monitor/monitor.db)")
   [[ $(sha256sum /usr/local/bin/monitor-server | cut -d' ' -f1) == "$before_binary" ]] \
     || return $(fail "the previous binary was not restored")
+  [[ $(stat -c '%U:%G' /var/lib/monitor/monitor.db) == monitor:monitor ]] \
+    || return $(fail "restored database is owned by $(stat -c '%U:%G' /var/lib/monitor/monitor.db)")
   grep -qx monitor-server.service "$STATE/active" \
     || return $(fail "the service did not recover after rollback")
-  [[ -f /var/lib/monitor/monitor.db.pre-update ]] \
-    || return $(fail "the pre-update database copy is missing")
 
   # The restored pair must be usable by the restored binary, not merely present.
   systemctl restart monitor-server.service >/dev/null \
@@ -267,8 +307,94 @@ case_update_rolls_back_schema_change() {
   return 0
 }
 
+# B. pre-update database has no WAL, and the persistent location still holds a
+#    WAL from an earlier generation. That stale file must not become part of the
+#    new generation and must never be replayed onto the restored database.
+case_update_rollback_without_wal_generation() {
+  local fail_flag="$CASE_TMP/fail_start"
+  : > "$fail_flag"
+  prepare_schema_update "$fail_flag" nowal || return 1
+
+  # An earlier update left a complete generation, WAL included.
+  install -d -o root -g root -m 0700 /var/lib/monitor-update-backup
+  install -d -o root -g root -m 0700 "$backup_generation"
+  printf 'stale main from an earlier generation\n' > "$backup_generation/monitor.db"
+  printf 'stale wal from an earlier generation\n' > "$backup_generation/monitor.db-wal"
+
+  local before_digest before_binary output
+  before_digest=$(database_digest /var/lib/monitor/monitor.db)
+  before_binary=$(sha256sum /usr/local/bin/monitor-server | cut -d' ' -f1)
+
+  output=$(run_failing_update) \
+    || return $(fail "the update reported success even though the new Server failed to start")
+  grep -q 'previous binary and pre-update database were restored and the service recovered' <<< "$output" \
+    || return $(fail "unexpected failure message: $output")
+
+  [[ -f $backup_generation/monitor.db ]] || return $(fail "the new generation has no main file")
+  [[ ! -e $backup_generation/monitor.db-wal ]] \
+    || return $(fail "the stale WAL survived into a generation taken without one")
+  grep -q 'stale main' "$backup_generation/monitor.db" \
+    && return $(fail "the generation still holds the earlier main file")
+  [[ ! -e /var/lib/monitor/monitor.db-wal ]] \
+    || return $(fail "a WAL was restored even though the generation had none")
+  [[ ! -e /var/lib/monitor/monitor.db-shm ]] \
+    || return $(fail "the failed Server's -shm was not removed")
+
+  [[ $(schema_version_of /var/lib/monitor/monitor.db) == 1 ]] \
+    || return $(fail "schema is $(schema_version_of /var/lib/monitor/monitor.db), expected 1")
+  [[ $(database_digest /var/lib/monitor/monitor.db) == "$before_digest" ]] \
+    || return $(fail "rows changed: $(database_digest /var/lib/monitor/monitor.db)")
+  [[ $(sha256sum /usr/local/bin/monitor-server | cut -d' ' -f1) == "$before_binary" ]] \
+    || return $(fail "the previous binary was not restored")
+  grep -qx monitor-server.service "$STATE/active" || return $(fail "the service did not recover")
+  systemctl restart monitor-server.service >/dev/null \
+    || return $(fail "the restored binary and database cannot start together")
+  return 0
+}
+
+# C. after a successful update the service account must not be able to read or
+#    alter the rollback copy it would be restored from.
+case_update_backup_is_root_only() {
+  prepare_schema_update "$CASE_TMP/never_created" wal || return 1
+  "$REPO_ROOT/scripts/update-monitor.sh" --version "$TEST_TAG" --component server >/dev/null \
+    || return $(fail "a healthy schema update failed")
+
+  local root=/var/lib/monitor-update-backup
+  [[ $(stat -c '%U:%G:%a' "$root") == root:root:700 ]] \
+    || return $(fail "$root is $(stat -c '%U:%G:%a' "$root"), expected root:root:700")
+  [[ ! -L $root ]] || return $(fail "$root is a symbolic link")
+  [[ -f $backup_generation/monitor.db ]] || return $(fail "the generation is missing")
+
+  runuser -u monitor -- test -r "$root" \
+    && return $(fail "the monitor account can read $root")
+  runuser -u monitor -- ls "$backup_generation" >/dev/null 2>&1 \
+    && return $(fail "the monitor account can list the generation")
+  runuser -u monitor -- touch "$root/planted" 2>/dev/null \
+    && return $(fail "the monitor account can create files in $root")
+  runuser -u monitor -- rm -f "$backup_generation/monitor.db" 2>/dev/null
+  [[ -f $backup_generation/monitor.db ]] \
+    || return $(fail "the monitor account deleted the rollback copy")
+  [[ ! -e $root/planted ]] || return $(fail "a file planted by the monitor account exists")
+
+  # Nothing about the rollback copy lives under the Server's own state directory.
+  compgen -G '/var/lib/monitor/*pre-update*' >/dev/null \
+    && return $(fail "a rollback file was left inside the service-writable state directory")
+
+  # A plain uninstall keeps the rollback copy; --purge removes it through the
+  # same ownership-guarded path that removes Server data.
+  "$REPO_ROOT/scripts/uninstall-monitor.sh" --component server >/dev/null \
+    || return $(fail "uninstall failed")
+  [[ -d $root ]] || return $(fail "a non-purging uninstall removed the rollback copy")
+  [[ -d /var/lib/monitor ]] || return $(fail "a non-purging uninstall removed Server data")
+  "$REPO_ROOT/scripts/uninstall-monitor.sh" --component server --purge >/dev/null \
+    || return $(fail "purging uninstall failed")
+  [[ ! -e $root ]] || return $(fail "--purge left the rollback copy behind")
+  [[ ! -e /var/lib/monitor ]] || return $(fail "--purge left Server data behind")
+  return 0
+}
+
 case_update_applies_schema_change() {
-  prepare_schema_update "$CASE_TMP/never_created" || return 1
+  prepare_schema_update "$CASE_TMP/never_created" wal || return 1
 
   local before_digest output
   before_digest=$(database_digest /var/lib/monitor/monitor.db)
@@ -278,10 +404,10 @@ case_update_applies_schema_change() {
     || return $(fail "schema is $(schema_version_of /var/lib/monitor/monitor.db), expected 2")
   grep -q 'migrated-marker' <<< "$(database_digest /var/lib/monitor/monitor.db)" \
     || return $(fail "the migration did not run")
-  grep -q "tokyo" <<< "$(database_digest /var/lib/monitor/monitor.db)" \
+  grep -q tokyo <<< "$(database_digest /var/lib/monitor/monitor.db)" \
     || return $(fail "pre-upgrade rows were lost by a successful update")
   grep -qx monitor-server.service "$STATE/active" || return $(fail "the Server is not active")
-  grep -q 'Pre-update database kept at /var/lib/monitor/monitor.db.pre-update' <<< "$output" \
+  grep -q 'Pre-update database kept at /var/lib/monitor-update-backup/current' <<< "$output" \
     || return $(fail "the updater did not report where the pre-update copy is: $output")
   [[ $before_digest != "$(database_digest /var/lib/monitor/monitor.db)" ]] \
     || return $(fail "nothing changed, so this case proves nothing")

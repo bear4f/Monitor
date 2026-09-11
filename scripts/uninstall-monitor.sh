@@ -8,6 +8,7 @@ readonly SERVER_UNIT_NAME=monitor-server.service
 readonly AGENT_UNIT=/etc/systemd/system/monitor-agent.service
 readonly AGENT_ENV=/etc/monitor-agent.env
 readonly SERVER_DATA=/var/lib/monitor
+readonly UPDATE_BACKUP_ROOT=/var/lib/monitor-update-backup
 readonly SERVER_DROPIN_DIR=/etc/systemd/system/monitor-server.service.d
 readonly SERVER_DROPIN=/etc/systemd/system/monitor-server.service.d/10-monitor-listen.conf
 readonly SERVER_DROPIN_MARKER='# Managed-By: monitor-install (listener)'
@@ -186,6 +187,16 @@ if [[ $COMPONENT == server || $COMPONENT == all ]]; then
   if [[ $PURGE == true && -e $SERVER_DATA ]]; then
     [[ $SERVER_DATA == /var/lib/monitor && -d $SERVER_DATA ]] || die "unexpected Server data path"
     rm -rf -- "$SERVER_DATA"
+  fi
+  # The rollback copies written by update-monitor.sh live in their own root-owned
+  # directory, so purging Server data has to remove them too. Guarded the same
+  # way as the data directory: the literal path, and a real directory only.
+  if [[ $PURGE == true && -e $UPDATE_BACKUP_ROOT ]]; then
+    [[ $UPDATE_BACKUP_ROOT == /var/lib/monitor-update-backup ]] \
+      || die "unexpected update backup path"
+    [[ -d $UPDATE_BACKUP_ROOT && ! -L $UPDATE_BACKUP_ROOT ]] \
+      || die "$UPDATE_BACKUP_ROOT is not a directory; refusing to remove it"
+    rm -rf -- "$UPDATE_BACKUP_ROOT"
   fi
 fi
 if [[ $COMPONENT == agent || $COMPONENT == all ]]; then

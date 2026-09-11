@@ -472,12 +472,50 @@ SEED
   chown monitor:monitor "$path" "$path-wal" "$path-shm" 2>/dev/null || true
 }
 
+# Leaves committed frames in -wal by exiting without closing the connection, the
+# way a Server killed mid-life does. A cleanly stopped SQLite deletes its -wal,
+# so this is how a pre-update database ends up with one.
+leave_uncheckpointed_wal() {
+  local path=$1
+  python3 - "$path" <<'WAL'
+import os, sqlite3, sys
+connection = sqlite3.connect(sys.argv[1])
+connection.execute("PRAGMA journal_mode=WAL")
+connection.execute("INSERT INTO nodes VALUES (3, 'nagoya')")
+connection.commit()
+os._exit(0)
+WAL
+  chown monitor:monitor "$path" "$path-wal" "$path-shm" 2>/dev/null || true
+}
+
+# A cleanly stopped database has no sidecars at all.
+drop_wal_sidecars() {
+  rm -f -- "$1-wal" "$1-shm"
+}
+
+# Every SQLite connection to a WAL database touches its sidecars: it recreates a
+# missing -wal and rewrites -shm, and a read-write connection closing as the last
+# one checkpoints and deletes -wal. Inspecting the live database would therefore
+# destroy the very generation these cases are about, so readers work on a copy.
+copy_database_for_reading() {
+  local source=$1 destination
+  destination=$(mktemp -d)/monitor.db
+  cp -- "$source" "$destination"
+  [[ -f $source-wal ]] && cp -- "$source-wal" "$destination-wal"
+  printf '%s' "$destination"
+}
+
 schema_version_of() {
-  python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('PRAGMA user_version').fetchone()[0])" "$1"
+  local copy
+  copy=$(copy_database_for_reading "$1")
+  python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('PRAGMA user_version').fetchone()[0])" "$copy"
+  rm -rf -- "$(dirname -- "$copy")"
 }
 
 database_digest() {
-  python3 - "$1" <<'DIGEST'
+  local copy
+  copy=$(copy_database_for_reading "$1")
+  python3 - "$copy" <<'DIGEST'
 import sqlite3, sys
 connection = sqlite3.connect(sys.argv[1])
 parts = []
@@ -489,6 +527,7 @@ parts.append("totals:" + repr(connection.execute("SELECT * FROM traffic_totals O
 parts.append("ping:" + repr(connection.execute("SELECT * FROM ping_history ORDER BY node_id, bucket_ts").fetchall()))
 print(" | ".join(parts))
 DIGEST
+  rm -rf -- "$(dirname -- "$copy")"
 }
 
 make_source_tarball() {

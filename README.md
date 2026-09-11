@@ -175,11 +175,17 @@ it refuses to open. The update stops the Server, copies `monitor.db` and its
 fails to start or to stay up, the previous binary **and** that pre-update
 database are both restored and the Server is started again.
 
-The copy stays at `/var/lib/monitor/monitor.db.pre-update` after a successful
-update and is replaced by the next one. Keep it: once a schema has been raised,
-downgrading the Server means restoring that copy first, because an older Server
-will not open a newer schema. `uninstall-monitor.sh --purge` removes it with the
-rest of `/var/lib/monitor`.
+That copy is kept in `/var/lib/monitor-update-backup/current/`, which is
+`root:root` mode `0700` and deliberately outside `/var/lib/monitor`: the unit
+gives the `monitor` service account write access to its own state directory, so a
+rollback copy kept there would be both replaceable under the root updater and
+deletable by the very Server being rolled back. Each update replaces the whole
+directory, so `monitor.db` and `monitor.db-wal` there always belong to the same
+generation — a database backed up without a WAL leaves no WAL behind.
+
+Keep that copy: once a schema has been raised, downgrading the Server means
+restoring it first, because an older Server will not open a newer schema.
+`uninstall-monitor.sh --purge` removes it along with `/var/lib/monitor`.
 
 Default uninstall stops and removes Monitor units and binaries, removes the
 Agent secret file, and preserves Server data. To delete only the explicitly
