@@ -171,7 +171,7 @@ enum Command {
     },
     ListAdminNodes {
         day_start_utc: i64,
-        now: i64,
+        cycle_starts: Box<[i64; crate::time::RESET_DAY_COUNT]>,
         response: oneshot::Sender<Result<Vec<AdminNodeRow>, DatabaseError>>,
     },
     CreateNode {
@@ -202,7 +202,7 @@ enum Command {
     LoadNodeMetadata(oneshot::Sender<Result<Vec<NodeMetaRow>, DatabaseError>>),
     LoadTrafficRecovery {
         day_start_utc: i64,
-        now: i64,
+        cycle_starts: Box<[i64; crate::time::RESET_DAY_COUNT]>,
         response: oneshot::Sender<Result<Vec<TrafficRecoveryRow>, DatabaseError>>,
     },
     PersistTrafficBatch {
@@ -403,11 +403,11 @@ impl Database {
     pub async fn list_admin_nodes(
         &self,
         day_start_utc: i64,
-        now: i64,
+        cycle_starts: [i64; crate::time::RESET_DAY_COUNT],
     ) -> Result<Vec<AdminNodeRow>, DatabaseError> {
         self.request(|response| Command::ListAdminNodes {
             day_start_utc,
-            now,
+            cycle_starts: Box::new(cycle_starts),
             response,
         })
         .await
@@ -487,11 +487,11 @@ impl Database {
     pub async fn load_traffic_recovery(
         &self,
         day_start_utc: i64,
-        now: i64,
+        cycle_starts: [i64; crate::time::RESET_DAY_COUNT],
     ) -> Result<Vec<TrafficRecoveryRow>, DatabaseError> {
         self.request(|response| Command::LoadTrafficRecovery {
             day_start_utc,
-            now,
+            cycle_starts: Box::new(cycle_starts),
             response,
         })
         .await
@@ -653,7 +653,14 @@ pub async fn hydrate_startup(database: &Database) -> Result<StartupHydration, Da
                 source,
             }
         })?;
-    let mut traffic_recovery = database.load_traffic_recovery(day_start_utc, now).await?;
+    let cycle_starts = crate::time::cycle_starts_by_reset_day(now, &settings.site_timezone)
+        .map_err(|source| DatabaseError::Time {
+            operation: "calculate startup billing cycle starts",
+            source,
+        })?;
+    let mut traffic_recovery = database
+        .load_traffic_recovery(day_start_utc, cycle_starts)
+        .await?;
     let reset_days: HashMap<i64, i64> = nodes
         .iter()
         .map(|node| (node.id, node.traffic_reset_day))
@@ -809,13 +816,13 @@ fn database_worker(
             }
             Command::ListAdminNodes {
                 day_start_utc,
-                now,
+                cycle_starts,
                 response,
             } => {
                 let _ = response.send(persistence::list_admin_nodes(
                     &connection,
                     day_start_utc,
-                    now,
+                    &cycle_starts,
                 ));
             }
             Command::CreateNode {
@@ -878,13 +885,13 @@ fn database_worker(
             }
             Command::LoadTrafficRecovery {
                 day_start_utc,
-                now,
+                cycle_starts,
                 response,
             } => {
                 let _ = response.send(persistence::load_traffic_recovery(
                     &connection,
                     day_start_utc,
-                    now,
+                    &cycle_starts,
                 ));
             }
             Command::PersistTrafficBatch {

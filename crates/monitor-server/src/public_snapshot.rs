@@ -982,6 +982,7 @@ mod tests {
             sort_order,
             traffic_limit_bytes: None,
             traffic_reset_day: 1,
+            traffic_reset_mode: "monthly".to_owned(),
             price_micros: None,
             currency: None,
             renewal_cycle: None,

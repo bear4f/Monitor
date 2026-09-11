@@ -58,6 +58,27 @@ pub fn billing_cycle(
     })
 }
 
+/// The number of distinct `traffic_reset_day` values a node may carry.
+pub const RESET_DAY_COUNT: usize = 31;
+
+/// Cycle start for every possible reset day, indexed by `reset_day - 1`.
+///
+/// Which `traffic_cycles` row is current is decided by the node's configuration,
+/// not by which stored window happens to contain `now`: after a reset-day change
+/// two stored windows can both contain `now`, and picking between them by start
+/// time chooses the old configuration. Queries therefore join on the start this
+/// produces, so `billing_cycle` stays the single definition of a cycle boundary.
+pub fn cycle_starts_by_reset_day(
+    timestamp: i64,
+    timezone: &str,
+) -> Result<[i64; RESET_DAY_COUNT], jiff::Error> {
+    let mut starts = [0_i64; RESET_DAY_COUNT];
+    for (index, start) in starts.iter_mut().enumerate() {
+        *start = billing_cycle(timestamp, timezone, index as i64 + 1)?.start_utc;
+    }
+    Ok(starts)
+}
+
 fn boundary_date((year, month): (i16, i8), reset_day: i64) -> Result<Date, jiff::Error> {
     let first = Date::new(year, month, 1)?;
     let day = reset_day.min(i64::from(first.days_in_month())) as i8;

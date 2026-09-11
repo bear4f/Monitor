@@ -33,3 +33,7 @@
 @media (min-width: 1280px) and (max-width: 1599px) { .admin-layout { grid-template-columns: 184px minmax(0, 1fr); } }
 @media (min-width: 1024px) and (max-width: 1279px) { .admin-layout { grid-template-columns: 168px minmax(0, 1fr); } }
 @media (min-width: 768px) and (max-width: 1023px) { .admin-layout { display: block; }.admin-sidebar { flex-direction: row; overflow-x: auto; padding-bottom: 14px; }.admin-nav-item { width: auto; min-width: 150px; } }
+.node-form .field-note { color: var(--muted-foreground); font-size: 12px; line-height: 1.5; }
+.node-form input:disabled { background: var(--muted); color: var(--muted-foreground); cursor: default; }
+.field-readonly { display: grid; gap: 6px; margin-top: 14px; color: var(--muted-foreground); font-size: 14px; }
+.field-readonly strong { color: var(--foreground); font-size: 15px; font-variant-numeric: tabular-nums; }

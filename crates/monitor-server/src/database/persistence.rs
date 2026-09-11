@@ -1,6 +1,8 @@
 use std::io;
 
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, types::Type};
+use rusqlite::{
+    Connection, OptionalExtension, Row, Transaction, params, params_from_iter, types::Type,
+};
 
 use super::{
     DatabaseError,
@@ -301,8 +303,8 @@ pub(super) fn load_node_metadata(
     let mut statement = connection
         .prepare(
             "SELECT id, public_id, name, region_code, sort_order,
-                    traffic_limit_bytes, traffic_reset_day, price_micros,
-                    currency, renewal_cycle, expires_at, first_seen_at
+                    traffic_limit_bytes, traffic_reset_day, traffic_reset_mode,
+                    price_micros, currency, renewal_cycle, expires_at, first_seen_at
              FROM nodes ORDER BY sort_order, id",
         )
         .map_err(|source| DatabaseError::Sql {
@@ -759,18 +761,34 @@ fn ping_target_from_row(row: &Row<'_>) -> rusqlite::Result<PingTargetRow> {
     })
 }
 
+/// `WITH cycle_start(reset_day, start_utc)` bound from `cycle_starts_by_reset_day`.
+///
+/// Joining a node to its cycle through this table makes the current cycle the one
+/// the node is *configured* for. Matching "the stored window that contains now"
+/// is ambiguous after a reset-day change, because two stored windows can both
+/// contain now: the old window wins on start time, which duplicates the node in a
+/// LEFT JOIN and resurrects the previous configuration on restart.
+fn cycle_start_cte(first_parameter: usize) -> String {
+    let values: Vec<String> = (1..=crate::time::RESET_DAY_COUNT)
+        .map(|day| format!("({day},?{})", first_parameter + day - 1))
+        .collect();
+    format!(
+        "WITH cycle_start(reset_day, start_utc) AS (VALUES {}) ",
+        values.join(",")
+    )
+}
+
 pub(super) fn list_admin_nodes(
     connection: &Connection,
     day_start_utc: i64,
-    now: i64,
+    cycle_starts: &[i64; crate::time::RESET_DAY_COUNT],
 ) -> Result<Vec<AdminNodeRow>, DatabaseError> {
-    let mut statement = connection
-        .prepare(
-            "SELECT
+    let sql = format!(
+        "{}SELECT
                 n.id, n.public_id, n.name, n.region_code, n.sort_order,
-                n.traffic_limit_bytes, n.traffic_reset_day, n.price_micros,
-                n.currency, n.renewal_cycle, n.expires_at, n.first_seen_at,
-                s.last_ip, s.last_seen_at,
+                n.traffic_limit_bytes, n.traffic_reset_day, n.traffic_reset_mode,
+                n.price_micros, n.currency, n.renewal_cycle, n.expires_at,
+                n.first_seen_at, s.last_ip, s.last_seen_at,
                 COALESCE(t.rx_total_bytes, 0), COALESCE(t.tx_total_bytes, 0),
                 COALESCE(d.rx_bytes, 0), COALESCE(d.tx_bytes, 0),
                 COALESCE(c.rx_bytes, 0), COALESCE(c.tx_bytes, 0)
@@ -779,28 +797,35 @@ pub(super) fn list_admin_nodes(
              LEFT JOIN traffic_totals AS t ON t.node_id = n.id
              LEFT JOIN traffic_daily AS d
                ON d.node_id = n.id AND d.day_start_utc = ?1
+             LEFT JOIN cycle_start AS w ON w.reset_day = n.traffic_reset_day
              LEFT JOIN traffic_cycles AS c
-               ON c.node_id = n.id AND c.cycle_start_utc <= ?2 AND c.cycle_end_utc > ?2
+               ON c.node_id = n.id AND c.cycle_start_utc = w.start_utc
              ORDER BY n.sort_order, n.id",
-        )
+        cycle_start_cte(2)
+    );
+    let mut statement = connection
+        .prepare(&sql)
         .map_err(|source| DatabaseError::Sql {
             operation: "prepare administrator node list query",
             source,
         })?;
     let rows = statement
-        .query_map(params![day_start_utc, now], |row| {
-            Ok(AdminNodeRow {
-                node: node_meta_from_row(row)?,
-                last_ip: row.get(12)?,
-                last_seen_at: row.get(13)?,
-                total_rx_bytes: row.get(14)?,
-                total_tx_bytes: row.get(15)?,
-                today_rx_bytes: row.get(16)?,
-                today_tx_bytes: row.get(17)?,
-                cycle_rx_bytes: row.get(18)?,
-                cycle_tx_bytes: row.get(19)?,
-            })
-        })
+        .query_map(
+            params_from_iter(std::iter::once(day_start_utc).chain(cycle_starts.iter().copied())),
+            |row| {
+                Ok(AdminNodeRow {
+                    node: node_meta_from_row(row)?,
+                    last_ip: row.get(13)?,
+                    last_seen_at: row.get(14)?,
+                    total_rx_bytes: row.get(15)?,
+                    total_tx_bytes: row.get(16)?,
+                    today_rx_bytes: row.get(17)?,
+                    today_tx_bytes: row.get(18)?,
+                    cycle_rx_bytes: row.get(19)?,
+                    cycle_tx_bytes: row.get(20)?,
+                })
+            },
+        )
         .map_err(|source| DatabaseError::Sql {
             operation: "query administrator node list",
             source,
@@ -838,9 +863,9 @@ pub(super) fn create_node(
         .execute(
             "INSERT INTO nodes (
                 public_id, name, region_code, sort_order, traffic_limit_bytes,
-                traffic_reset_day, price_micros, currency, renewal_cycle,
-                expires_at, first_seen_at, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL, ?11, ?11)",
+                traffic_reset_day, traffic_reset_mode, price_micros, currency,
+                renewal_cycle, expires_at, first_seen_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, NULL, ?12, ?12)",
             params![
                 node.public_id,
                 node.name,
@@ -848,6 +873,7 @@ pub(super) fn create_node(
                 sort_order,
                 node.traffic_limit_bytes,
                 node.traffic_reset_day,
+                node.traffic_reset_mode,
                 node.price_micros,
                 node.currency,
                 node.renewal_cycle,
@@ -889,6 +915,7 @@ pub(super) fn create_node(
         sort_order,
         traffic_limit_bytes: node.traffic_limit_bytes,
         traffic_reset_day: node.traffic_reset_day,
+        traffic_reset_mode: node.traffic_reset_mode.clone(),
         price_micros: node.price_micros,
         currency: node.currency.clone(),
         renewal_cycle: node.renewal_cycle.clone(),
@@ -964,6 +991,10 @@ pub(super) fn update_node(
         traffic_reset_day: patch
             .traffic_reset_day
             .unwrap_or(existing.traffic_reset_day),
+        traffic_reset_mode: patch
+            .traffic_reset_mode
+            .clone()
+            .unwrap_or(existing.traffic_reset_mode),
         price_micros: patch.price_micros.unwrap_or(existing.price_micros),
         currency: patch.currency.clone().unwrap_or(existing.currency),
         renewal_cycle: patch
@@ -981,15 +1012,16 @@ pub(super) fn update_node(
             "UPDATE nodes SET
                 name = ?1, region_code = ?2, sort_order = ?3,
                 traffic_limit_bytes = ?4, traffic_reset_day = ?5,
-                price_micros = ?6, currency = ?7, renewal_cycle = ?8,
-                expires_at = ?9, updated_at = ?10
-             WHERE id = ?11",
+                traffic_reset_mode = ?6, price_micros = ?7, currency = ?8,
+                renewal_cycle = ?9, expires_at = ?10, updated_at = ?11
+             WHERE id = ?12",
             params![
                 updated.name,
                 updated.region_code,
                 updated.sort_order,
                 updated.traffic_limit_bytes,
                 updated.traffic_reset_day,
+                updated.traffic_reset_mode,
                 updated.price_micros,
                 updated.currency,
                 updated.renewal_cycle,
@@ -1130,8 +1162,8 @@ fn select_node_by_public_id(
     transaction
         .query_row(
             "SELECT id, public_id, name, region_code, sort_order,
-                    traffic_limit_bytes, traffic_reset_day, price_micros,
-                    currency, renewal_cycle, expires_at, first_seen_at
+                    traffic_limit_bytes, traffic_reset_day, traffic_reset_mode,
+                    price_micros, currency, renewal_cycle, expires_at, first_seen_at
              FROM nodes WHERE public_id = ?1",
             [public_id],
             node_meta_from_row,
@@ -1180,11 +1212,12 @@ fn node_meta_from_row(row: &Row<'_>) -> rusqlite::Result<NodeMetaRow> {
         sort_order: row.get(4)?,
         traffic_limit_bytes: row.get(5)?,
         traffic_reset_day: row.get(6)?,
-        price_micros: row.get(7)?,
-        currency: row.get(8)?,
-        renewal_cycle: row.get(9)?,
-        expires_at: row.get(10)?,
-        first_seen_at: row.get(11)?,
+        traffic_reset_mode: row.get(7)?,
+        price_micros: row.get(8)?,
+        currency: row.get(9)?,
+        renewal_cycle: row.get(10)?,
+        expires_at: row.get(11)?,
+        first_seen_at: row.get(12)?,
     })
 }
 
@@ -1205,11 +1238,10 @@ fn hash_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<[u8; 32]> {
 pub(super) fn load_traffic_recovery(
     connection: &Connection,
     day_start_utc: i64,
-    now: i64,
+    cycle_starts: &[i64; crate::time::RESET_DAY_COUNT],
 ) -> Result<Vec<TrafficRecoveryRow>, DatabaseError> {
-    let mut statement = connection
-        .prepare(
-            "SELECT t.node_id, t.rx_total_bytes, t.tx_total_bytes,
+    let sql = format!(
+        "{}SELECT t.node_id, t.rx_total_bytes, t.tx_total_bytes,
                     t.last_rx_counter_bytes, t.last_tx_counter_bytes, t.last_boot_id,
                     ?1, COALESCE(d.rx_bytes, 0), COALESCE(d.tx_bytes, 0),
                     COALESCE(c.cycle_start_utc, -1), COALESCE(c.cycle_end_utc, -1),
@@ -1218,40 +1250,40 @@ pub(super) fn load_traffic_recovery(
              JOIN nodes AS n ON n.id = t.node_id
              LEFT JOIN traffic_daily AS d
                ON d.node_id = t.node_id AND d.day_start_utc = ?1
+             LEFT JOIN cycle_start AS w ON w.reset_day = n.traffic_reset_day
              LEFT JOIN traffic_cycles AS c
-               ON c.node_id = t.node_id
-              AND c.cycle_start_utc = (
-                  SELECT MAX(c2.cycle_start_utc)
-                  FROM traffic_cycles AS c2
-                  WHERE c2.node_id = t.node_id
-                    AND c2.cycle_start_utc <= ?2
-                    AND c2.cycle_end_utc > ?2
-              )
+               ON c.node_id = t.node_id AND c.cycle_start_utc = w.start_utc
              ORDER BY t.node_id",
-        )
+        cycle_start_cte(2)
+    );
+    let mut statement = connection
+        .prepare(&sql)
         .map_err(|source| DatabaseError::Sql {
             operation: "prepare startup traffic recovery query",
             source,
         })?;
 
     let rows = statement
-        .query_map(params![day_start_utc, now], |row| {
-            Ok(TrafficRecoveryRow {
-                node_id: row.get(0)?,
-                rx_total_bytes: row.get(1)?,
-                tx_total_bytes: row.get(2)?,
-                last_rx_counter_bytes: row.get(3)?,
-                last_tx_counter_bytes: row.get(4)?,
-                last_boot_id: row.get(5)?,
-                day_start_utc: row.get(6)?,
-                today_rx_bytes: row.get(7)?,
-                today_tx_bytes: row.get(8)?,
-                cycle_start_utc: row.get(9)?,
-                cycle_end_utc: row.get(10)?,
-                cycle_rx_bytes: row.get(11)?,
-                cycle_tx_bytes: row.get(12)?,
-            })
-        })
+        .query_map(
+            params_from_iter(std::iter::once(day_start_utc).chain(cycle_starts.iter().copied())),
+            |row| {
+                Ok(TrafficRecoveryRow {
+                    node_id: row.get(0)?,
+                    rx_total_bytes: row.get(1)?,
+                    tx_total_bytes: row.get(2)?,
+                    last_rx_counter_bytes: row.get(3)?,
+                    last_tx_counter_bytes: row.get(4)?,
+                    last_boot_id: row.get(5)?,
+                    day_start_utc: row.get(6)?,
+                    today_rx_bytes: row.get(7)?,
+                    today_tx_bytes: row.get(8)?,
+                    cycle_start_utc: row.get(9)?,
+                    cycle_end_utc: row.get(10)?,
+                    cycle_rx_bytes: row.get(11)?,
+                    cycle_tx_bytes: row.get(12)?,
+                })
+            },
+        )
         .map_err(|source| DatabaseError::Sql {
             operation: "query startup traffic recovery state",
             source,

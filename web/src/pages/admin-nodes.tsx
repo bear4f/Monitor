@@ -26,8 +26,11 @@ import {
   RENEWAL_CYCLES,
   rotateToken,
   trafficLimitToForm,
+  type TrafficResetMode,
+  TRAFFIC_RESET_MODES,
   type TrafficUnit,
   trafficUnitBytes,
+  trafficUsedBytes,
   updateNode,
 } from "../api/admin";
 import {
@@ -265,7 +268,8 @@ function NodeRow({
   onDelete: () => void;
   onRotate: () => void;
 }) {
-  const used = safeAdd(node.cycle_rx, node.cycle_tx);
+  // Monthly shows the current billing cycle, never shows the lifetime totals.
+  const used = trafficUsedBytes(node);
   const percent =
     used !== null && node.traffic_limit
       ? Math.min(100, (used / node.traffic_limit) * 100)
@@ -400,7 +404,14 @@ function NodeDialog({
   const [region, setRegion] = useState(node?.region_code ?? "");
   const [limit, setLimit] = useState(storedLimit.amount);
   const [unit, setUnit] = useState<TrafficUnit>(storedLimit.unit);
-  const [resetDay, setResetDay] = useState("");
+  // An existing node opens with its stored reset day, and keeps it even while the
+  // mode is never, so switching back to monthly reuses the operator's choice.
+  const [resetDay, setResetDay] = useState(
+    node ? String(node.traffic_reset_day) : "",
+  );
+  const [resetMode, setResetMode] = useState<TrafficResetMode>(
+    node?.traffic_reset_mode ?? "monthly",
+  );
   const [price, setPrice] = useState(
     node?.price_micros === null || node?.price_micros === undefined
       ? ""
@@ -424,14 +435,12 @@ function NodeDialog({
     if (!normalized) return setFormError("地区必须是两个字母");
     if (price !== "" && micros === null) return setFormError("价格格式无效");
     if (limit !== "" && traffic === null) return setFormError("流量额度无效");
-    if (
-      !node &&
-      resetDay !== "" &&
-      (!Number.isInteger(day) || day! < 1 || day! > 31)
-    )
+    if (resetDay !== "" && (!Number.isInteger(day) || day! < 1 || day! > 31))
       return setFormError("重置日需为 1–31");
+    if (node && day === null) return setFormError("重置日需为 1–31");
+
     if (expires !== "" && expiry === null) return setFormError("日期格式无效");
-    const form = {
+    const shared = {
       name: name.trim(),
       region_code: normalized,
       traffic_limit: traffic,
@@ -441,14 +450,24 @@ function NodeDialog({
         renewal === "" ? null : (renewal as AdminNode["renewal_cycle"]),
       expires_at: expiry,
     };
-    if (form.price_micros !== null && !form.currency)
+    if (shared.price_micros !== null && !shared.currency)
       return setFormError("货币必须是三个字母");
-    if (node) onSubmit(buildNodePatch(node, form));
-    else
-      onSubmit({
-        ...form,
-        ...(day === null ? {} : { traffic_reset_day: day }),
-      });
+    if (node) {
+      onSubmit(
+        buildNodePatch(node, {
+          ...shared,
+          traffic_reset_day: day ?? node.traffic_reset_day,
+          traffic_reset_mode: resetMode,
+        }),
+      );
+      return;
+    }
+    // Creation keeps its existing contract: no reset mode, and an empty reset
+    // day still means "use the server default".
+    onSubmit({
+      ...shared,
+      ...(day === null ? {} : { traffic_reset_day: day }),
+    });
   };
   return (
     <Dialog title={title} onClose={onClose}>
@@ -489,18 +508,51 @@ function NodeDialog({
             </select>
           </div>
         </label>
-        {!node && (
+        {node && (
           <label>
-            流量重置日
-            <input
-              type="number"
-              min="1"
-              max="31"
-              value={resetDay}
-              onChange={(e) => setResetDay(e.target.value)}
-              placeholder="使用服务器默认"
-            />
+            流量重置方式
+            <select
+              value={resetMode}
+              onChange={(e) =>
+                setResetMode(e.target.value as TrafficResetMode)
+              }
+            >
+              {TRAFFIC_RESET_MODES.map((mode) => (
+                <option value={mode} key={mode}>
+                  {mode === "monthly" ? "每月重置" : "不重置（累计）"}
+                </option>
+              ))}
+            </select>
           </label>
+        )}
+        <label>
+          流量重置日
+          <input
+            type="number"
+            min="1"
+            max="31"
+            value={resetDay}
+            onChange={(e) => setResetDay(e.target.value)}
+            placeholder={node ? undefined : "使用服务器默认"}
+            disabled={resetMode === "never"}
+          />
+          {node && resetMode === "never" && (
+            <small className="field-note">
+              仅在每月重置时生效，切回每月重置会沿用这里保存的日期
+            </small>
+          )}
+        </label>
+        {node && (
+          <div className="field-readonly">
+            <span>累计流量</span>
+            <strong>
+              {(() => {
+                const lifetime = safeAdd(node.total_rx, node.total_tx);
+                return lifetime === null ? "—" : formatBytes(lifetime);
+              })()}
+            </strong>
+            <small className="field-note">自节点创建以来的累计用量，只读</small>
+          </div>
         )}
         <label>
           价格

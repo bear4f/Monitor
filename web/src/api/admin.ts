@@ -1,4 +1,6 @@
 export type ThemePreference = "light" | "dark" | "system";
+export type TrafficResetMode = "monthly" | "never";
+export const TRAFFIC_RESET_MODES = ["monthly", "never"] as const;
 export type RenewalCycle =
   | "monthly"
   | "quarterly"
@@ -30,7 +32,11 @@ export interface AdminNode {
   last_seen_at: number | null;
   cycle_rx: number;
   cycle_tx: number;
+  total_rx: number;
+  total_tx: number;
   traffic_limit: number | null;
+  traffic_reset_day: number;
+  traffic_reset_mode: TrafficResetMode;
   price_micros: number | null;
   currency: string | null;
   renewal_cycle: RenewalCycle | null;
@@ -43,6 +49,7 @@ export interface NodeConfig {
   sort_order: number;
   traffic_limit: number | null;
   traffic_reset_day: number;
+  traffic_reset_mode: TrafficResetMode;
   price_micros: number | null;
   currency: string | null;
   renewal_cycle: RenewalCycle | null;
@@ -284,7 +291,12 @@ export function parseAdminNode(value: unknown): AdminNode {
     !nullable(item.last_seen_at, isSafeInt) ||
     !isSafeInt(item.cycle_rx) ||
     !isSafeInt(item.cycle_tx) ||
+    !isSafeInt(item.total_rx) ||
+    !isSafeInt(item.total_tx) ||
     !nullable(item.traffic_limit, (v) => isSafeInt(v, true)) ||
+    !isSafeInt(item.traffic_reset_day, true) ||
+    item.traffic_reset_day > 31 ||
+    !isResetMode(item.traffic_reset_mode) ||
     !nullable(item.price_micros, isSafeInt) ||
     !nullable(item.currency, (v) => isCode(v, 3)) ||
     !nullable(item.renewal_cycle, isRenewal) ||
@@ -309,6 +321,7 @@ export function parseNodeConfig(value: unknown): NodeConfig {
     !nullable(item.traffic_limit, (v) => isSafeInt(v, true)) ||
     !isSafeInt(item.traffic_reset_day, true) ||
     item.traffic_reset_day > 31 ||
+    !isResetMode(item.traffic_reset_mode) ||
     !nullable(item.price_micros, isSafeInt) ||
     !nullable(item.currency, (v) => isCode(v, 3)) ||
     !nullable(item.renewal_cycle, isRenewal) ||
@@ -596,10 +609,38 @@ export interface NodeEditForm {
   name: string;
   region_code: string;
   traffic_limit: number | null;
+  traffic_reset_day: number;
+  traffic_reset_mode: TrafficResetMode;
   price_micros: number | null;
   currency: string | null;
   renewal_cycle: RenewalCycle | null;
   expires_at: number | null;
+}
+function isResetMode(value: unknown): value is TrafficResetMode {
+  return value === "monthly" || value === "never";
+}
+/**
+ * Quota usage for a node. The mode only selects which already-stored
+ * accumulation is presented: the current billing cycle, or the lifetime totals.
+ * Both counter pairs stay available independently.
+ */
+export function trafficUsedBytes(node: {
+  traffic_reset_mode: TrafficResetMode;
+  cycle_rx: number;
+  cycle_tx: number;
+  total_rx: number;
+  total_tx: number;
+}): number | null {
+  const [left, right] =
+    node.traffic_reset_mode === "never"
+      ? [node.total_rx, node.total_tx]
+      : [node.cycle_rx, node.cycle_tx];
+  const sum = left + right;
+  return Number.isSafeInteger(left) &&
+    Number.isSafeInteger(right) &&
+    Number.isSafeInteger(sum)
+    ? sum
+    : null;
 }
 export function buildNodePatch(
   original: AdminNode,
@@ -612,6 +653,10 @@ export function buildNodePatch(
   if (region !== original.region_code) patch.region_code = region;
   if (form.traffic_limit !== original.traffic_limit)
     patch.traffic_limit = form.traffic_limit;
+  if (form.traffic_reset_day !== original.traffic_reset_day)
+    patch.traffic_reset_day = form.traffic_reset_day;
+  if (form.traffic_reset_mode !== original.traffic_reset_mode)
+    patch.traffic_reset_mode = form.traffic_reset_mode;
   const currency = form.price_micros === null ? null : form.currency;
   if (form.price_micros !== original.price_micros)
     patch.price_micros = form.price_micros;

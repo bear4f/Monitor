@@ -931,6 +931,155 @@ mod tests {
         remove_database_files(&context.path);
     }
 
+    /// A reset-day change leaves two `traffic_cycles` rows that both contain
+    /// `now`, so "the stored window containing now" cannot identify the current
+    /// cycle. Picking the greatest start resurrects the previous configuration,
+    /// after which startup hydration sees a window mismatch and zeroes the
+    /// bytes -- silently discarding the real usage of the new cycle. The current
+    /// cycle is therefore the one the node is configured for.
+    ///
+    /// The reset days are assigned by which one yields the later start, so the
+    /// old window always sorts above the new one whatever today's date is; both
+    /// windows contain `now` because any two distinct reset days produce two
+    /// distinct windows around it.
+    #[tokio::test]
+    async fn reset_day_change_keeps_the_configured_cycle_across_restart() {
+        let now = crate::auth::unix_timestamp().expect("clock");
+        let start_of = |day: i64| {
+            time::billing_cycle(now, "Asia/Shanghai", day)
+                .expect("candidate cycle")
+                .start_utc
+        };
+        let (old_day, new_day) = if start_of(15) > start_of(1) {
+            (15, 1)
+        } else {
+            (1, 15)
+        };
+        let old_start = start_of(old_day);
+        let new_start = start_of(new_day);
+        assert!(
+            old_start > new_start,
+            "the old window must sort above the new"
+        );
+        let old_end = time::billing_cycle(now, "Asia/Shanghai", old_day)
+            .expect("old cycle")
+            .end_utc;
+        assert!(
+            old_start <= now && now < old_end,
+            "both windows contain now"
+        );
+
+        let context = TestContext::with_reset_day("cycle-overlap", old_day).await;
+
+        // Accumulate real traffic under the old billing configuration.
+        context
+            .publish(now, 1_000, 2_000, "boot", now, "baseline")
+            .await;
+        context
+            .publish(now + 1, 1_500, 2_600, "boot", now, "old-cycle")
+            .await;
+        checkpoint_once(&context.state)
+            .await
+            .expect("checkpoint old cycle");
+        let before = context.state.traffic.get(context.node_id).expect("state");
+        assert_eq!((before.rx_total_bytes, before.tx_total_bytes), (500, 600));
+        assert_eq!((before.cycle_rx_bytes, before.cycle_tx_bytes), (500, 600));
+        assert_eq!(before.cycle_start_utc, old_start);
+
+        // An explicit billing configuration change, not a reboot.
+        assert!(matches!(
+            context
+                .state
+                .database
+                .update_node(
+                    context.public_id.clone(),
+                    NodePatchRow {
+                        traffic_reset_day: Some(new_day),
+                        ..NodePatchRow::default()
+                    },
+                    now + 2,
+                )
+                .await
+                .expect("change reset day"),
+            UpdateNodeResult::Updated(_)
+        ));
+
+        // Traffic now reported under the new cycle finalises the old one and
+        // starts the new one; lifetime totals only take the genuine delta.
+        let mut moved = TestContext {
+            state: context.state.clone(),
+            path: context.path.clone(),
+            node_id: context.node_id,
+            public_id: context.public_id.clone(),
+            reset_day: new_day,
+        };
+        moved.reset_day = new_day;
+        moved
+            .publish(now + 3, 1_900, 3_100, "boot", now, "new-cycle")
+            .await;
+        checkpoint_once(&moved.state)
+            .await
+            .expect("checkpoint new cycle");
+
+        let after = moved.state.traffic.get(moved.node_id).expect("state");
+        assert_eq!(
+            (after.rx_total_bytes, after.tx_total_bytes),
+            (900, 1_100),
+            "lifetime totals moved by more than the reported delta"
+        );
+        assert_eq!((after.cycle_rx_bytes, after.cycle_tx_bytes), (400, 500));
+        assert_eq!(after.cycle_start_utc, new_start);
+
+        // Both windows are on disk: the old one is finalised history, not deleted.
+        let connection = rusqlite::Connection::open(&context.path).expect("inspect cycles");
+        let stored: Vec<(i64, i64, i64)> = connection
+            .prepare("SELECT cycle_start_utc, rx_bytes, tx_bytes FROM traffic_cycles ORDER BY cycle_start_utc")
+            .expect("prepare cycles")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query cycles")
+            .collect::<Result<_, _>>()
+            .expect("read cycles");
+        assert_eq!(
+            stored,
+            vec![(new_start, 400, 500), (old_start, 500, 600)],
+            "both the finalised old cycle and the new cycle must be preserved"
+        );
+        drop(connection);
+
+        // Restart: the recovered current cycle must be the configured one with its
+        // bytes intact, not the old overlapping row and not zero.
+        moved
+            .state
+            .database
+            .clone()
+            .shutdown()
+            .await
+            .expect("stop before recovery");
+        let database = Database::open(&context.path).expect("restart database");
+        let hydration = hydrate_startup(&database).await.expect("hydrate");
+        let recovered = AppState::new(database, hydration);
+        let traffic = recovered.traffic.get(context.node_id).expect("recovered");
+        assert_eq!(
+            (
+                traffic.cycle_start_utc,
+                traffic.cycle_rx_bytes,
+                traffic.cycle_tx_bytes
+            ),
+            (new_start, 400, 500),
+            "restart selected the wrong cycle or discarded the new one"
+        );
+        assert_eq!(
+            (traffic.rx_total_bytes, traffic.tx_total_bytes),
+            (900, 1_100)
+        );
+        recovered
+            .database
+            .shutdown()
+            .await
+            .expect("shutdown database");
+        remove_database_files(&context.path);
+    }
+
     #[tokio::test]
     async fn failed_checkpoint_retains_dirty_generation() {
         let context = TestContext::new("checkpoint-failure").await;
@@ -1129,10 +1278,15 @@ mod tests {
         path: PathBuf,
         node_id: i64,
         public_id: String,
+        reset_day: i64,
     }
 
     impl TestContext {
         async fn new(label: &str) -> Self {
+            Self::with_reset_day(label, 1).await
+        }
+
+        async fn with_reset_day(label: &str, reset_day: i64) -> Self {
             let id = TEST_ID.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "monitor-traffic-{label}-{}-{id}.db",
@@ -1148,7 +1302,8 @@ mod tests {
                         name: "Traffic node".into(),
                         region_code: "US".into(),
                         traffic_limit_bytes: None,
-                        traffic_reset_day: 1,
+                        traffic_reset_day: reset_day,
+                        traffic_reset_mode: "monthly".to_owned(),
                         price_micros: None,
                         currency: None,
                         renewal_cycle: None,
@@ -1167,6 +1322,7 @@ mod tests {
                 path,
                 node_id: node.id,
                 public_id,
+                reset_day,
             }
         }
 
@@ -1180,7 +1336,8 @@ mod tests {
             hostname: &str,
         ) {
             let day_start_utc = time::day_start_utc(timestamp, "Asia/Shanghai").expect("day");
-            let billing_cycle = time::billing_cycle(timestamp, "Asia/Shanghai", 1).expect("cycle");
+            let billing_cycle =
+                time::billing_cycle(timestamp, "Asia/Shanghai", self.reset_day).expect("cycle");
             self.state
                 .traffic
                 .update(

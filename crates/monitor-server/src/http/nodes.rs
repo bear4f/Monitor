@@ -18,6 +18,10 @@ use super::auth::{
 };
 use super::patch::PatchField;
 
+/// The two values `nodes.traffic_reset_mode` accepts, matching the schema CHECK.
+const MONTHLY_RESET_MODE: &str = "monthly";
+const NEVER_RESET_MODE: &str = "never";
+
 const JSON_BODY_LIMIT: usize = 8 * 1_024;
 const JS_SAFE_INTEGER_MAX: i64 = 9_007_199_254_740_991;
 
@@ -52,6 +56,8 @@ struct PatchNodeRequest {
     #[serde(default)]
     traffic_reset_day: PatchField<i64>,
     #[serde(default)]
+    traffic_reset_mode: PatchField<String>,
+    #[serde(default)]
     price_micros: PatchField<i64>,
     #[serde(default)]
     currency: PatchField<String>,
@@ -71,6 +77,7 @@ struct NodeConfigResponse {
     sort_order: i64,
     traffic_limit: Option<i64>,
     traffic_reset_day: i64,
+    traffic_reset_mode: String,
     price_micros: Option<i64>,
     currency: Option<String>,
     renewal_cycle: Option<String>,
@@ -86,6 +93,7 @@ impl From<&NodeMetaRow> for NodeConfigResponse {
             sort_order: node.sort_order,
             traffic_limit: node.traffic_limit_bytes,
             traffic_reset_day: node.traffic_reset_day,
+            traffic_reset_mode: node.traffic_reset_mode.clone(),
             price_micros: node.price_micros,
             currency: node.currency.clone(),
             renewal_cycle: node.renewal_cycle.clone(),
@@ -121,7 +129,11 @@ struct AdminNodeResponse {
     last_seen_at: Option<i64>,
     cycle_rx: i64,
     cycle_tx: i64,
+    total_rx: i64,
+    total_tx: i64,
     traffic_limit: Option<i64>,
+    traffic_reset_day: i64,
+    traffic_reset_mode: String,
     price_micros: Option<i64>,
     currency: Option<String>,
     renewal_cycle: Option<String>,
@@ -139,9 +151,11 @@ pub(super) async fn list(
     drop(settings);
     let now = unix_timestamp().map_err(|_| ApiError::internal())?;
     let day_start = day_start_utc(now, &timezone)?;
+    let cycle_starts =
+        time::cycle_starts_by_reset_day(now, &timezone).map_err(|_| ApiError::internal())?;
     let nodes = state
         .database
-        .list_admin_nodes(day_start, now)
+        .list_admin_nodes(day_start, cycle_starts)
         .await
         .map_err(ApiError::database)?;
     let snapshots = state.snapshots.read().await;
@@ -338,6 +352,7 @@ fn validate_create(
         region_code,
         traffic_limit_bytes: request.traffic_limit,
         traffic_reset_day,
+        traffic_reset_mode: MONTHLY_RESET_MODE.to_owned(),
         price_micros: request.price_micros,
         currency,
         renewal_cycle,
@@ -354,6 +369,7 @@ fn validate_patch(request: PatchNodeRequest) -> Result<NodePatchRow, ApiError> {
         region_code: required_patch(request.region_code, trimmed_region)?,
         traffic_limit_bytes: nullable_patch(request.traffic_limit, valid_positive)?,
         traffic_reset_day: required_patch(request.traffic_reset_day, valid_reset_day)?,
+        traffic_reset_mode: required_patch(request.traffic_reset_mode, valid_reset_mode)?,
         price_micros: nullable_patch(request.price_micros, valid_nonnegative)?,
         currency: nullable_patch(request.currency, trimmed_currency)?,
         renewal_cycle: nullable_patch(request.renewal_cycle, trimmed_renewal_cycle)?,
@@ -368,6 +384,7 @@ impl PatchNodeRequest {
             && self.region_code.is_missing()
             && self.traffic_limit.is_missing()
             && self.traffic_reset_day.is_missing()
+            && self.traffic_reset_mode.is_missing()
             && self.price_micros.is_missing()
             && self.currency.is_missing()
             && self.renewal_cycle.is_missing()
@@ -395,6 +412,17 @@ fn nullable_patch<T, U>(
         PatchField::Missing => Ok(None),
         PatchField::Null => Ok(Some(None)),
         PatchField::Value(value) => validate(value).map(|value| Some(Some(value))),
+    }
+}
+
+/// The schema CHECK is authoritative, but the API must reject a bad mode itself
+/// rather than surface a SQLite constraint error. Exact match only: no trimming
+/// and no case folding, so 'Monthly' and ' never' are refused.
+fn valid_reset_mode(value: String) -> Result<String, ApiError> {
+    if value == MONTHLY_RESET_MODE || value == NEVER_RESET_MODE {
+        Ok(value)
+    } else {
+        Err(ApiError::invalid_request())
     }
 }
 
@@ -520,7 +548,11 @@ fn admin_node_response(
         last_seen_at,
         cycle_rx: browser_safe_counter(row.cycle_rx_bytes),
         cycle_tx: browser_safe_counter(row.cycle_tx_bytes),
+        total_rx: browser_safe_counter(row.total_rx_bytes),
+        total_tx: browser_safe_counter(row.total_tx_bytes),
         traffic_limit: row.node.traffic_limit_bytes,
+        traffic_reset_day: row.node.traffic_reset_day,
+        traffic_reset_mode: row.node.traffic_reset_mode,
         price_micros: row.node.price_micros,
         currency: row.node.currency,
         renewal_cycle: row.node.renewal_cycle,
@@ -894,6 +926,10 @@ mod tests {
                 params![first_internal, day_start, now],
             )
             .expect("insert daily traffic");
+        // The current cycle is the one the node is configured for, so the fixture
+        // is written at that exact boundary rather than at an arbitrary window
+        // that merely contains `now`.
+        let cycle = time::billing_cycle(now, "Asia/Shanghai", 1).expect("configured cycle");
         connection
             .execute(
                 "INSERT INTO traffic_cycles
@@ -901,8 +937,8 @@ mod tests {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     first_internal,
-                    now - 60,
-                    now + 60,
+                    cycle.start_utc,
+                    cycle.end_utc,
                     crate::traffic::JS_SAFE_INTEGER_MAX + 123,
                     crate::traffic::JS_SAFE_INTEGER_MAX + 456,
                     now
@@ -914,7 +950,10 @@ mod tests {
         let joined = context
             .state
             .database
-            .list_admin_nodes(day_start, now)
+            .list_admin_nodes(
+                day_start,
+                time::cycle_starts_by_reset_day(now, "Asia/Shanghai").expect("cycle starts"),
+            )
             .await
             .expect("run administrator list join");
         assert_eq!(joined[0].today_rx_bytes, 10);
@@ -1226,6 +1265,149 @@ mod tests {
             .as_str()
             .expect("string response field")
             .to_owned()
+    }
+
+    /// The mode only selects which already-stored accumulation is presented as
+    /// quota usage, so the API hands the browser the raw counters and never a
+    /// pre-computed usage figure. Switching it must not touch a single counter.
+    #[tokio::test]
+    async fn traffic_reset_mode_is_interpretive_and_never_moves_a_counter() {
+        let context = TestContext::new(1).await;
+        let (public_id, _) = create_test_node(&context, "Reset", "JP").await;
+        let now = unix_timestamp().expect("test timestamp");
+        let cycle = time::billing_cycle(now, "Asia/Shanghai", 1).expect("cycle");
+
+        let connection = Connection::open(&context.path).expect("open traffic fixtures");
+        let node_id: i64 = connection
+            .query_row(
+                "SELECT id FROM nodes WHERE public_id = ?1",
+                [&public_id],
+                |row| row.get(0),
+            )
+            .expect("node id");
+        connection
+            .execute(
+                "UPDATE traffic_totals SET rx_total_bytes = 700, tx_total_bytes = 800,
+                    updated_at = ?2 WHERE node_id = ?1",
+                params![node_id, now],
+            )
+            .expect("seed lifetime totals");
+        connection
+            .execute(
+                "INSERT INTO traffic_cycles
+                    (node_id, cycle_start_utc, cycle_end_utc, rx_bytes, tx_bytes, updated_at)
+                 VALUES (?1, ?2, ?3, 30, 40, ?4)",
+                params![node_id, cycle.start_utc, cycle.end_utc, now],
+            )
+            .expect("seed cycle traffic");
+        drop(connection);
+
+        // A new node defaults to monthly, and the list exposes every raw counter.
+        let listed = list_first(&context).await;
+        assert_eq!(listed["traffic_reset_mode"], "monthly");
+        assert_eq!(listed["traffic_reset_day"], 1);
+        assert_eq!(listed["cycle_rx"], 30);
+        assert_eq!(listed["cycle_tx"], 40);
+        assert_eq!(listed["total_rx"], 700);
+        assert_eq!(listed["total_tx"], 800);
+        assert!(
+            listed.get("traffic_used").is_none(),
+            "usage must be derived by the browser from the raw counters"
+        );
+
+        let counters = |label: &str| {
+            let connection = Connection::open(&context.path).expect(label);
+            let row: (i64, i64, i64, i64) = connection
+                .query_row(
+                    "SELECT t.rx_total_bytes, t.tx_total_bytes, c.rx_bytes, c.tx_bytes
+                     FROM traffic_totals AS t
+                     JOIN traffic_cycles AS c ON c.node_id = t.node_id
+                     WHERE t.node_id = ?1",
+                    [node_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("read counters");
+            row
+        };
+        let before = counters("before mode switches");
+        assert_eq!(before, (700, 800, 30, 40));
+
+        // monthly -> never, then never -> monthly. Neither writes a counter.
+        for mode in ["never", "monthly", "never"] {
+            let response = patch_node(
+                &context,
+                &public_id,
+                &json!({"traffic_reset_mode": mode}).to_string(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response_json(response).await;
+            assert_eq!(body["traffic_reset_mode"], mode);
+            // A mode-only patch leaves the reset day alone.
+            assert_eq!(body["traffic_reset_day"], 1);
+            assert_eq!(
+                counters("after mode switch"),
+                before,
+                "mode {mode} moved a counter"
+            );
+        }
+        let listed = list_first(&context).await;
+        assert_eq!(listed["traffic_reset_mode"], "never");
+        assert_eq!(listed["cycle_rx"], 30);
+        assert_eq!(listed["total_rx"], 700);
+
+        // A reset-day-only patch leaves the mode alone and the lifetime totals
+        // bit-for-bit unchanged.
+        let response = patch_node(
+            &context,
+            &public_id,
+            &json!({"traffic_reset_day": 29}).to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        assert_eq!(body["traffic_reset_day"], 29);
+        assert_eq!(body["traffic_reset_mode"], "never");
+        let after_day_change = counters("after reset day change");
+        assert_eq!(
+            (after_day_change.0, after_day_change.1),
+            (before.0, before.1),
+            "a reset-day edit moved the lifetime totals"
+        );
+
+        // The database CHECK is authoritative, but the API refuses first.
+        for rejected in [
+            json!({"traffic_reset_mode": "daily"}),
+            json!({"traffic_reset_mode": ""}),
+            json!({"traffic_reset_mode": "Monthly"}),
+            json!({"traffic_reset_mode": "NEVER"}),
+            json!({"traffic_reset_mode": " never"}),
+            json!({"traffic_reset_mode": null}),
+            json!({"traffic_reset_mode": 1}),
+            json!({"traffic_reset_day": 0}),
+            json!({"traffic_reset_day": 32}),
+            json!({"traffic_reset_day": null}),
+        ] {
+            let response = patch_node(&context, &public_id, &rejected.to_string()).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "accepted {rejected}"
+            );
+        }
+        // None of the refusals changed the stored configuration.
+        let listed = list_first(&context).await;
+        assert_eq!(listed["traffic_reset_mode"], "never");
+        assert_eq!(listed["traffic_reset_day"], 29);
+        context.finish().await;
+    }
+
+    async fn list_first(context: &TestContext) -> Value {
+        let response =
+            response(list(State(context.state.clone()), context.read_request(true)).await);
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await;
+        body["nodes"][0].clone()
     }
 
     async fn create_test_node(context: &TestContext, name: &str, region: &str) -> (String, String) {

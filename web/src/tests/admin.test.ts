@@ -8,6 +8,7 @@ import {
   localDateToExpiryEpoch,
   normalizeCode,
   parseAdminNode,
+  trafficUsedBytes,
   parseAuthResponse,
   parseCreateNodeResponse,
   parseMoneyToMicros,
@@ -306,7 +307,11 @@ describe("admin pure helpers", () => {
       last_seen_at: null,
       cycle_rx: 2,
       cycle_tx: 3,
+      total_rx: 10,
+      total_tx: 20,
       traffic_limit: null,
+      traffic_reset_day: 1,
+      traffic_reset_mode: "monthly",
       price_micros: null,
       currency: null,
       renewal_cycle: null,
@@ -317,6 +322,7 @@ describe("admin pure helpers", () => {
     expect(() => parseAdminNode({ ...node, cycle_rx: -1 })).toThrow();
     const config = {
       id: node.id,
+      traffic_reset_mode: "monthly",
       name: "N",
       region_code: "US",
       sort_order: 0,
@@ -348,7 +354,11 @@ describe("admin pure helpers", () => {
       last_seen_at: null,
       cycle_rx: 2,
       cycle_tx: 3,
+      total_rx: 400,
+      total_tx: 500,
       traffic_limit: 1_610_612_736,
+      traffic_reset_day: 15,
+      traffic_reset_mode: "monthly" as const,
       price_micros: 39123456,
       currency: "USD",
       renewal_cycle: null,
@@ -359,6 +369,8 @@ describe("admin pure helpers", () => {
         name: "New",
         region_code: "US",
         traffic_limit: original.traffic_limit,
+        traffic_reset_day: original.traffic_reset_day,
+        traffic_reset_mode: original.traffic_reset_mode,
         price_micros: original.price_micros,
         currency: original.currency,
         renewal_cycle: null,
@@ -370,6 +382,8 @@ describe("admin pure helpers", () => {
         name: "N",
         region_code: "US",
         traffic_limit: original.traffic_limit,
+        traffic_reset_day: original.traffic_reset_day,
+        traffic_reset_mode: original.traffic_reset_mode,
         price_micros: original.price_micros,
         currency: original.currency,
         renewal_cycle: null,
@@ -381,6 +395,8 @@ describe("admin pure helpers", () => {
         name: "N",
         region_code: "US",
         traffic_limit: original.traffic_limit,
+        traffic_reset_day: original.traffic_reset_day,
+        traffic_reset_mode: original.traffic_reset_mode,
         price_micros: null,
         currency: null,
         renewal_cycle: null,
@@ -392,6 +408,8 @@ describe("admin pure helpers", () => {
         name: "N",
         region_code: "US",
         traffic_limit: original.traffic_limit,
+        traffic_reset_day: original.traffic_reset_day,
+        traffic_reset_mode: original.traffic_reset_mode,
         price_micros: original.price_micros,
         currency: "EUR",
         renewal_cycle: null,
@@ -444,5 +462,106 @@ describe("admin pure helpers", () => {
     expect(epoch).not.toBeNull();
     expect(expiryEpochToLocalDate(epoch)).toBe("2030-02-03");
     expect(localDateToExpiryEpoch("2030-02-31")).toBeNull();
+  });
+});
+
+describe("traffic reset mode", () => {
+  const node = {
+    id: "b".repeat(32),
+    name: "N",
+    region_code: "JP",
+    sort_order: 0,
+    last_ip: null,
+    online: true,
+    last_seen_at: 1_700_000_000,
+    cycle_rx: 30,
+    cycle_tx: 40,
+    total_rx: 700,
+    total_tx: 800,
+    traffic_limit: 1_073_741_824,
+    traffic_reset_day: 15,
+    traffic_reset_mode: "monthly" as const,
+    price_micros: null,
+    currency: null,
+    renewal_cycle: null,
+    expires_at: null,
+  };
+
+  it("rejects an unknown mode instead of loosening the parser", () => {
+    expect(parseAdminNode(node).traffic_reset_mode).toBe("monthly");
+    expect(parseAdminNode({ ...node, traffic_reset_mode: "never" }).traffic_reset_mode).toBe("never");
+    for (const invalid of ["", "Monthly", "NEVER", "daily", " never", null, 1, undefined]) {
+      expect(() => parseAdminNode({ ...node, traffic_reset_mode: invalid })).toThrow();
+    }
+    expect(() => parseAdminNode({ ...node, traffic_reset_day: 0 })).toThrow();
+    expect(() => parseAdminNode({ ...node, traffic_reset_day: 32 })).toThrow();
+    expect(() => parseAdminNode({ ...node, total_rx: -1 })).toThrow();
+    const { total_tx: _omitted, ...withoutTotal } = node;
+    expect(() => parseAdminNode(withoutTotal)).toThrow();
+  });
+
+  it("selects the cycle pair for monthly and the lifetime pair for never", () => {
+    expect(trafficUsedBytes(node)).toBe(70);
+    expect(trafficUsedBytes({ ...node, traffic_reset_mode: "never" })).toBe(1_500);
+    // Unsafe sums degrade to null rather than to a wrong number.
+    expect(
+      trafficUsedBytes({
+        ...node,
+        traffic_reset_mode: "never",
+        total_rx: Number.MAX_SAFE_INTEGER,
+        total_tx: 1,
+      }),
+    ).toBeNull();
+  });
+
+  const form = (overrides: Record<string, unknown> = {}) => ({
+    name: node.name,
+    region_code: node.region_code,
+    traffic_limit: node.traffic_limit,
+    traffic_reset_day: node.traffic_reset_day,
+    traffic_reset_mode: node.traffic_reset_mode,
+    price_micros: node.price_micros,
+    currency: node.currency,
+    renewal_cycle: node.renewal_cycle,
+    expires_at: node.expires_at,
+    ...overrides,
+  });
+
+  it("sends neither field when nothing about the billing configuration changed", () => {
+    expect(buildNodePatch(node, form())).toEqual({});
+    expect(buildNodePatch(node, form({ name: "Renamed" }))).toEqual({ name: "Renamed" });
+  });
+
+  it("sends only the mode when only the mode changed", () => {
+    expect(buildNodePatch(node, form({ traffic_reset_mode: "never" }))).toEqual({
+      traffic_reset_mode: "never",
+    });
+  });
+
+  it("sends only the day when only the day changed", () => {
+    expect(buildNodePatch(node, form({ traffic_reset_day: 1 }))).toEqual({
+      traffic_reset_day: 1,
+    });
+  });
+
+  it("keeps the stored reset day when switching back to monthly", () => {
+    const never = { ...node, traffic_reset_mode: "never" as const };
+    // The day was never erased while in never mode, so returning to monthly
+    // needs no day in the patch.
+    expect(buildNodePatch(never, form({ traffic_reset_mode: "monthly" }))).toEqual({
+      traffic_reset_mode: "monthly",
+    });
+    expect(
+      buildNodePatch(never, form({ traffic_reset_mode: "monthly", traffic_reset_day: 3 })),
+    ).toEqual({ traffic_reset_mode: "monthly", traffic_reset_day: 3 });
+  });
+
+  it("never treats the lifetime total as a writable field", () => {
+    const patch = buildNodePatch(node, form({ traffic_reset_mode: "never" }));
+    expect(patch).not.toHaveProperty("total_rx");
+    expect(patch).not.toHaveProperty("total_tx");
+    expect(patch).not.toHaveProperty("cycle_rx");
+    expect(patch).not.toHaveProperty("cycle_tx");
+    expect(patch).not.toHaveProperty("traffic_used");
   });
 });

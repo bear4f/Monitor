@@ -376,6 +376,7 @@ fn traffic_checkpoint_rolls_back_all_tables_on_late_failure() {
             region_code: "US".into(),
             traffic_limit_bytes: None,
             traffic_reset_day: 1,
+            traffic_reset_mode: "monthly".to_owned(),
             price_micros: None,
             currency: None,
             renewal_cycle: None,
@@ -604,6 +605,7 @@ fn history_node(public_id: &str) -> NewNodeRow {
         region_code: "US".into(),
         traffic_limit_bytes: None,
         traffic_reset_day: 1,
+        traffic_reset_mode: "monthly".to_owned(),
         price_micros: None,
         currency: None,
         renewal_cycle: None,
@@ -1115,11 +1117,11 @@ fn populate_schema_one_fixture(connection: &Connection) {
              INSERT INTO nodes (id, public_id, name, region_code, sort_order,
                  traffic_limit_bytes, traffic_reset_day, price_micros, currency,
                  renewal_cycle, expires_at, first_seen_at, created_at, updated_at) VALUES
-               (11, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'tokyo-1', 'JP', 3,
+               (11, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'tokyo-1', 'JP', 2,
                 1099511627776, 29, 5990000, 'USD', 'annual', 1800000000, 1600000000, 1600000000, 1600000005),
-               (22, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'frankfurt-2', 'DE', 1,
+               (22, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'frankfurt-2', 'DE', 0,
                 2199023255552, 30, 1290000, 'EUR', 'monthly', 1790000000, 1610000000, 1610000000, 1610000006),
-               (33, 'cccccccccccccccccccccccccccccccc', 'sao-paulo-3', 'BR', 2,
+               (33, 'cccccccccccccccccccccccccccccccc', 'sao-paulo-3', 'BR', 1,
                 NULL, 31, NULL, NULL, NULL, NULL, NULL, 1620000000, 1620000007);
 
              INSERT INTO node_tokens (node_id, token_hash, created_at) VALUES
@@ -1432,6 +1434,90 @@ async fn v0_1_2_database_migrates_to_schema_two_without_losing_a_row() {
             "int:3|int:2|real:7.125|real:6.5|real:8".to_owned(),
         ]
     );
+}
+
+#[tokio::test]
+async fn migrated_and_new_nodes_load_and_rehydrate_as_monthly() {
+    let path = TestDatabasePath::new("reset-mode-hydration");
+    let connection = schema_one_connection(path.as_path());
+    populate_schema_one_fixture(&connection);
+    drop(connection);
+
+    // A node that existed under schema 1 hydrates as monthly, keeping its day.
+    let database = Database::open(path.as_path()).expect("migrate and open");
+    let hydration = hydrate_startup(&database).await.expect("hydrate");
+    let migrated: Vec<(i64, String, i64)> = hydration
+        .nodes
+        .iter()
+        .map(|node| {
+            (
+                node.id,
+                node.traffic_reset_mode.clone(),
+                node.traffic_reset_day,
+            )
+        })
+        .collect();
+    assert_eq!(
+        migrated,
+        vec![
+            (22, "monthly".to_owned(), 30),
+            (33, "monthly".to_owned(), 31),
+            (11, "monthly".to_owned(), 29),
+        ],
+        "migrated nodes must load as monthly with their stored reset day"
+    );
+
+    // A node created after the migration defaults to monthly as well, and a
+    // patched mode survives a restart.
+    let created = database
+        .create_node(
+            NewNodeRow {
+                public_id: "dddddddddddddddddddddddddddddddd".to_owned(),
+                name: "after-migration".to_owned(),
+                region_code: "SG".to_owned(),
+                traffic_limit_bytes: None,
+                traffic_reset_day: 7,
+                traffic_reset_mode: "monthly".to_owned(),
+                price_micros: None,
+                currency: None,
+                renewal_cycle: None,
+                expires_at: None,
+            },
+            [9; 32],
+            1_700_001_000,
+        )
+        .await
+        .expect("create node");
+    assert_eq!(created.traffic_reset_mode, "monthly");
+    assert!(matches!(
+        database
+            .update_node(
+                created.public_id.clone(),
+                NodePatchRow {
+                    traffic_reset_mode: Some("never".to_owned()),
+                    ..NodePatchRow::default()
+                },
+                1_700_002_000,
+            )
+            .await
+            .expect("patch mode"),
+        UpdateNodeResult::Updated(_)
+    ));
+    database.shutdown().await.expect("shutdown");
+
+    let database = Database::open(path.as_path()).expect("reopen");
+    let hydration = hydrate_startup(&database).await.expect("rehydrate");
+    let restarted = hydration
+        .nodes
+        .iter()
+        .find(|node| node.public_id == created.public_id)
+        .expect("created node after restart");
+    assert_eq!(restarted.traffic_reset_mode, "never");
+    assert_eq!(
+        restarted.traffic_reset_day, 7,
+        "switching to never must keep the stored reset day for a later switch back"
+    );
+    database.shutdown().await.expect("shutdown");
 }
 
 #[test]
