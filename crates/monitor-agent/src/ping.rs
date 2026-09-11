@@ -226,10 +226,20 @@ fn settle_tcp_probe(probe: &mut TcpProbe, revents: libc::c_short, observed_at: I
     let Some(socket) = probe.socket.as_ref() else {
         return;
     };
-    let connected = revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) == 0
-        && revents & libc::POLLOUT != 0
-        && socket.take_error().is_ok_and(|error| error.is_none());
-    if connected {
+    // POLLOUT, POLLERR and POLLHUP all report that the connect attempt reached a
+    // conclusion; which conclusion it was, only SO_ERROR says. A peer that closes
+    // the moment the handshake finishes can put POLLHUP alongside the completion
+    // event, and that is still an established connection for a probe measuring
+    // establishment -- so nothing is judged before SO_ERROR is read.
+    const COMPLETION: libc::c_short = libc::POLLOUT | libc::POLLERR | libc::POLLHUP;
+    if revents & (COMPLETION | libc::POLLNVAL) == 0 {
+        return;
+    }
+    // POLLNVAL is the exception: the descriptor itself is invalid, so there is no
+    // SO_ERROR to ask and nothing was established.
+    let established =
+        revents & libc::POLLNVAL == 0 && socket.take_error().is_ok_and(|error| error.is_none());
+    if established {
         probe.latency_ms = finite_latency(probe.started_at, observed_at);
     }
     // Connection establishment is the whole measurement: close without writing,
@@ -921,6 +931,96 @@ mod tests {
             }
         }
         panic!("loopback listener did not stop accepting connections");
+    }
+
+    /// A socket left holding a pending SO_ERROR: connected to a port nobody
+    /// listens on, polled until the kernel concluded, and never inspected -- so
+    /// the completion path is what reads SO_ERROR. None means the kernel refused
+    /// the connect synchronously, which never reaches a probe at all.
+    #[cfg(target_os = "linux")]
+    fn socket_with_pending_connect_error(port: u16) -> Option<Socket> {
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        match socket.connect(&loopback(port)) {
+            Ok(()) => panic!("connect to a closed port must not succeed"),
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == Some(libc::EINPROGRESS) => {}
+            Err(_) => return None,
+        }
+        let mut poll_fd = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd for a live socket owned by this frame.
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, 500) };
+        (ready == 1).then_some(socket)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn settled(socket: Socket, revents: libc::c_short) -> TcpProbe {
+        let mut probe = TcpProbe {
+            index: 0,
+            socket: Some(socket),
+            started_at: Instant::now(),
+            latency_ms: None,
+        };
+        settle_tcp_probe(&mut probe, revents, Instant::now());
+        probe
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_hangup_beside_the_completion_event_is_still_an_established_connection() {
+        let (_listener, port) = listening_socket(8);
+        let socket = connect_completes(port, Duration::from_millis(500)).expect("connected socket");
+        // SO_ERROR is zero on this socket: the handshake completed.
+        assert!(socket.take_error().expect("SO_ERROR is readable").is_none());
+        let probe = settled(socket, libc::POLLOUT | libc::POLLHUP);
+        let latency = probe.latency_ms.expect("establishment latency");
+        assert!(latency.is_finite() && latency >= 0.0, "{latency}");
+        assert!(probe.socket.is_none(), "settling must close the connection");
+        assert_eq!(SettledProbe::from(&probe).latency_ms, Some(latency));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pending_connect_error_fails_even_when_poll_reports_writability() {
+        let (listener, port) = listening_socket(8);
+        drop(listener);
+        let Some(socket) = socket_with_pending_connect_error(port) else {
+            panic!("loopback refusal must surface through poll, not at connect()");
+        };
+        let probe = settled(socket, libc::POLLOUT | libc::POLLERR | libc::POLLHUP);
+        assert_eq!(probe.latency_ms, None);
+        assert!(probe.socket.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_invalid_descriptor_fails_without_consulting_so_error() {
+        let (_listener, port) = listening_socket(8);
+        let socket = connect_completes(port, Duration::from_millis(500)).expect("connected socket");
+        // SO_ERROR would say this connection is fine; POLLNVAL outranks it.
+        let probe = settled(socket, libc::POLLNVAL);
+        assert_eq!(probe.latency_ms, None);
+        assert!(probe.socket.is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_irrelevant_event_leaves_the_handshake_in_flight() {
+        let (_blackhole, _held, port) = blackholed_port();
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let _ = socket.connect(&loopback(port));
+        let probe = settled(socket, libc::POLLPRI);
+        assert_eq!(probe.latency_ms, None);
+        assert!(
+            probe.socket.is_some(),
+            "an unfinished connect keeps waiting"
+        );
     }
 
     #[cfg(target_os = "linux")]
