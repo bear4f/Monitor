@@ -13,7 +13,6 @@ export function refreshAuth(): void {
   started = true;
   authMe().then(() => { status = "authenticated"; emit(); }).catch((error) => { status = error instanceof AdminApiError && error.status === 401 ? "unauthenticated" : "error"; emit(); });
 }
-export function retryAuth(): void { started = false; status = "unknown"; emit(); refreshAuth(); }
 export function setUnauthenticated(): void { status = "unauthenticated"; emit(); }
 export function setAuthenticated(): void { status = "authenticated"; emit(); }
 export function useAdminSession() {
