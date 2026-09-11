@@ -1,6 +1,6 @@
 use std::{error::Error, fmt, time::Duration};
 
-use monitor_common::{AgentConfigPayload, AgentReport};
+use monitor_common::{AgentConfigPayloadV2, AgentReport};
 
 use crate::cli::RunConfig;
 
@@ -86,12 +86,19 @@ impl MonitorClient {
         }
     }
 
-    pub fn get_config(&self) -> Result<AgentConfigPayload, ClientError> {
+    pub fn get_config(&self) -> Result<AgentConfigPayloadV2, ClientError> {
         let mut response = self
             .agent
             .get(&self.config_url)
             .header("Authorization", &self.authorization)
             .header("Accept", "application/json")
+            // Asking for config protocol 2. A v0.1.2 Server does not know this
+            // header, ignores it, and answers protocol 1 -- which this Agent
+            // accepts, so a new Agent keeps working against an old Server.
+            .header(
+                monitor_common::CONFIG_VERSION_HEADER,
+                &monitor_common::CONFIG_VERSION_V2.to_string(),
+            )
             .call()
             .map_err(classify_transport)?;
         let status = response.status().as_u16();
@@ -108,8 +115,8 @@ impl MonitorClient {
             .limit(CONFIG_BODY_LIMIT)
             .read_to_string()
             .map_err(|error| ClientError::transient(format!("failed to read config: {error}")))?;
-        let config: AgentConfigPayload = serde_json::from_str(&body).map_err(|error| {
-            ClientError::protocol(None, format!("invalid agent config: {error}"))
+        let config = AgentConfigPayloadV2::from_json(&body).map_err(|error| {
+            ClientError::protocol(None, format!("invalid agent config: {error:?}"))
         })?;
         validate_config(&config)?;
         Ok(config)
@@ -173,9 +180,11 @@ fn classify_transport(error: ureq::Error) -> ClientError {
     }
 }
 
-fn validate_config(config: &AgentConfigPayload) -> Result<(), ClientError> {
-    if config.protocol_version != 1
-        || !(2..=60).contains(&config.report_interval_seconds)
+fn validate_config(config: &AgentConfigPayloadV2) -> Result<(), ClientError> {
+    if !matches!(
+        config.protocol_version,
+        monitor_common::CONFIG_VERSION_V1 | monitor_common::CONFIG_VERSION_V2
+    ) || !(2..=60).contains(&config.report_interval_seconds)
         || !(10..=300).contains(&config.ping_interval_seconds)
         || config.targets.len() > 6
     {
@@ -194,6 +203,7 @@ fn validate_config(config: &AgentConfigPayload) -> Result<(), ClientError> {
                 .host
                 .bytes()
                 .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+            || !target.endpoint_is_valid()
         {
             return Err(ClientError::protocol(None, "invalid agent target config"));
         }
@@ -363,6 +373,67 @@ mod tests {
                 .contains("content-type: application/json")
         );
         assert!(requests[1].contains("\"pings\":[]"));
+        // The config request negotiates protocol 2; the report wire protocol is
+        // frozen at 1 and must not be told anything about config versions.
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("x-monitor-config-version: 2")
+        );
+        assert!(
+            !requests[1]
+                .to_ascii_lowercase()
+                .contains("x-monitor-config-version")
+        );
+    }
+
+    #[test]
+    fn accepts_config_protocol_one_and_two_and_rejects_malformed_version_two() {
+        // An old Server answers protocol 1: ICMP-only targets, no probe fields.
+        let v1 = r#"{"protocol_version":1,"report_interval_seconds":2,"ping_interval_seconds":15,"targets":[{"id":7,"name":"Cloudflare","host":"1.1.1.1","ip_family":4}]}"#;
+        let v2 = r#"{"protocol_version":2,"report_interval_seconds":2,"ping_interval_seconds":15,"targets":[{"id":7,"name":"Cloudflare","host":"1.1.1.1","ip_family":4,"probe_kind":"icmp","port":null},{"id":8,"name":"HTTPS","host":"1.1.1.1","ip_family":4,"probe_kind":"tcp","port":443}]}"#;
+        // A TCP target without a port is refused rather than repaired into ICMP.
+        let broken = r#"{"protocol_version":2,"report_interval_seconds":2,"ping_interval_seconds":15,"targets":[{"id":9,"name":"broken","host":"1.1.1.1","ip_family":4,"probe_kind":"tcp","port":null}]}"#;
+        let (server, _captured) = server(3, move |index, _| {
+            let (body, connection) = match index {
+                0 => (v1, "keep-alive"),
+                1 => (v2, "keep-alive"),
+                _ => (broken, "close"),
+            };
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: {connection}\r\n\r\n{body}",
+                body.len()
+            )
+        });
+        let client = client(&server);
+
+        let legacy = client.get_config().expect("protocol 1 config");
+        assert_eq!(legacy.protocol_version, 1);
+        assert_eq!(legacy.targets.len(), 1);
+        assert_eq!(
+            legacy.targets[0].probe_kind,
+            monitor_common::ProbeKind::Icmp
+        );
+        assert_eq!(legacy.targets[0].port, None);
+
+        let current = client.get_config().expect("protocol 2 config");
+        assert_eq!(current.protocol_version, 2);
+        assert_eq!(
+            current
+                .targets
+                .iter()
+                .map(|target| (target.id, target.probe_kind, target.port))
+                .collect::<Vec<_>>(),
+            vec![
+                (7, monitor_common::ProbeKind::Icmp, None),
+                (8, monitor_common::ProbeKind::Tcp, Some(443)),
+            ]
+        );
+
+        let error = client
+            .get_config()
+            .expect_err("malformed protocol 2 config");
+        assert_eq!(error.kind(), FailureKind::Protocol);
     }
 
     #[test]
@@ -413,15 +484,17 @@ mod tests {
 
     #[test]
     fn strict_config_validation_rejects_bad_ranges_and_targets() {
-        let mut config = AgentConfigPayload {
+        let mut config = AgentConfigPayloadV2 {
             protocol_version: 1,
             report_interval_seconds: 2,
             ping_interval_seconds: 15,
-            targets: vec![monitor_common::AgentPingTarget {
+            targets: vec![monitor_common::AgentPingTargetV2 {
                 id: 1,
                 name: "v4".to_owned(),
                 host: "203.0.113.1".to_owned(),
                 ip_family: 4,
+                probe_kind: monitor_common::ProbeKind::Icmp,
+                port: None,
             }],
         };
         assert!(validate_config(&config).is_ok());
@@ -433,5 +506,20 @@ mod tests {
         config.targets.pop();
         config.report_interval_seconds = 1;
         assert!(validate_config(&config).is_err());
+        config.report_interval_seconds = 2;
+        // Second gate after parsing: a probe kind and endpoint that cannot be
+        // probed is refused instead of silently downgraded.
+        config.protocol_version = monitor_common::CONFIG_VERSION_V2;
+        config.targets[0].probe_kind = monitor_common::ProbeKind::Tcp;
+        assert_eq!(
+            validate_config(&config)
+                .expect_err("tcp target without a port")
+                .kind(),
+            FailureKind::Protocol
+        );
+        config.targets[0].port = Some(0);
+        assert!(validate_config(&config).is_err());
+        config.targets[0].port = Some(443);
+        assert!(validate_config(&config).is_ok());
     }
 }

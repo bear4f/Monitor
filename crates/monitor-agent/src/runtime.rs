@@ -12,7 +12,7 @@ use crate::{
     collector::{CollectorError, SystemCollector},
     ping::PingEngine,
 };
-use monitor_common::{AgentConfigPayload, AgentPingTarget, AgentReport, PingReport};
+use monitor_common::{AgentConfigPayloadV2, AgentPingTargetV2, AgentReport, PingReport};
 
 const CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -34,11 +34,11 @@ impl From<CollectorError> for RuntimeError {
 }
 
 struct PingJob {
-    targets: Vec<AgentPingTarget>,
+    targets: Vec<AgentPingTargetV2>,
 }
 
 struct CompletedPingRound {
-    targets: Vec<AgentPingTarget>,
+    targets: Vec<AgentPingTargetV2>,
     reports: Vec<PingReport>,
 }
 
@@ -64,7 +64,7 @@ impl PingWorker {
         })
     }
 
-    fn try_schedule(&mut self, targets: &[AgentPingTarget]) -> bool {
+    fn try_schedule(&mut self, targets: &[AgentPingTargetV2]) -> bool {
         if targets.is_empty() || self.in_flight {
             return false;
         }
@@ -79,7 +79,7 @@ impl PingWorker {
         }
     }
 
-    fn take_completed(&mut self, current_targets: &[AgentPingTarget]) -> Option<Vec<PingReport>> {
+    fn take_completed(&mut self, current_targets: &[AgentPingTargetV2]) -> Option<Vec<PingReport>> {
         let completed = match self.result_receiver.try_recv() {
             Ok(completed) => completed,
             Err(TryRecvError::Empty) => return None,
@@ -276,19 +276,19 @@ pub fn run(run_config: RunConfig) -> Result<(), RuntimeError> {
     }
 }
 
-fn initial_deadlines(now: Instant, config: &AgentConfigPayload) -> (Instant, Option<Instant>) {
+fn initial_deadlines(now: Instant, config: &AgentConfigPayloadV2) -> (Instant, Option<Instant>) {
     (
         now + Duration::from_secs(config.report_interval_seconds as u64),
         next_ping_deadline(now, config),
     )
 }
 
-fn next_ping_deadline(now: Instant, config: &AgentConfigPayload) -> Option<Instant> {
+fn next_ping_deadline(now: Instant, config: &AgentConfigPayloadV2) -> Option<Instant> {
     (!config.targets.is_empty())
         .then(|| now + Duration::from_secs(config.ping_interval_seconds as u64))
 }
 
-fn ping_schedule_changed(previous: &AgentConfigPayload, next: &AgentConfigPayload) -> bool {
+fn ping_schedule_changed(previous: &AgentConfigPayloadV2, next: &AgentConfigPayloadV2) -> bool {
     previous.ping_interval_seconds != next.ping_interval_seconds || previous.targets != next.targets
 }
 
@@ -314,8 +314,8 @@ fn attach_pending_ping(
 
 fn reconcile_stale_config(
     client: &MonitorClient,
-    previous: &AgentConfigPayload,
-) -> Result<Option<AgentConfigPayload>, RuntimeError> {
+    previous: &AgentConfigPayloadV2,
+) -> Result<Option<AgentConfigPayloadV2>, RuntimeError> {
     match client.get_config() {
         Ok(next) if previous.targets != next.targets => Ok(Some(next)),
         Ok(_) => Ok(None),
@@ -404,23 +404,27 @@ mod tests {
         sync::mpsc,
     };
 
-    use monitor_common::AgentPingTarget;
+    use monitor_common::AgentPingTargetV2;
 
     use super::*;
     use crate::cli::{Action, parse};
 
     const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-    fn config(report_interval: i64, ping_interval: i64) -> AgentConfigPayload {
-        AgentConfigPayload {
-            protocol_version: 1,
+    // Serialized as the fixture Server's response body, so the declared version
+    // must match the target shape: a v1 body may not carry probe fields.
+    fn config(report_interval: i64, ping_interval: i64) -> AgentConfigPayloadV2 {
+        AgentConfigPayloadV2 {
+            protocol_version: monitor_common::CONFIG_VERSION_V2,
             report_interval_seconds: report_interval,
             ping_interval_seconds: ping_interval,
-            targets: vec![AgentPingTarget {
+            targets: vec![AgentPingTargetV2 {
                 id: 1,
                 name: "target".to_owned(),
                 host: "127.0.0.1".to_owned(),
                 ip_family: 4,
+                probe_kind: monitor_common::ProbeKind::Icmp,
+                port: None,
             }],
         }
     }
