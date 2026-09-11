@@ -9,6 +9,8 @@ readonly AGENT_UNIT=/etc/systemd/system/monitor-agent.service
 readonly AGENT_ENV=/etc/monitor-agent.env
 readonly SERVER_DATA=/var/lib/monitor
 readonly UPDATE_BACKUP_ROOT=/var/lib/monitor-update-backup
+readonly UPDATE_BACKUP_MARKER=/var/lib/monitor-update-backup/.monitor-managed
+readonly UPDATE_BACKUP_MARKER_CONTENT='# Managed-By: monitor-update (rollback generation) v1'
 readonly SERVER_DROPIN_DIR=/etc/systemd/system/monitor-server.service.d
 readonly SERVER_DROPIN=/etc/systemd/system/monitor-server.service.d/10-monitor-listen.conf
 readonly SERVER_DROPIN_MARKER='# Managed-By: monitor-install (listener)'
@@ -189,13 +191,23 @@ if [[ $COMPONENT == server || $COMPONENT == all ]]; then
     rm -rf -- "$SERVER_DATA"
   fi
   # The rollback copies written by update-monitor.sh live in their own root-owned
-  # directory, so purging Server data has to remove them too. Guarded the same
-  # way as the data directory: the literal path, and a real directory only.
-  if [[ $PURGE == true && -e $UPDATE_BACKUP_ROOT ]]; then
+  # directory, so purging Server data has to remove them too. root:root 0700 is
+  # not proof of origin, so the marker update-monitor.sh writes must match before
+  # anything here deletes a root-owned tree: a path collision must never turn
+  # --purge into destruction of someone else's data.
+  if [[ $PURGE == true && ( -e $UPDATE_BACKUP_ROOT || -L $UPDATE_BACKUP_ROOT ) ]]; then
     [[ $UPDATE_BACKUP_ROOT == /var/lib/monitor-update-backup ]] \
       || die "unexpected update backup path"
     [[ -d $UPDATE_BACKUP_ROOT && ! -L $UPDATE_BACKUP_ROOT ]] \
       || die "$UPDATE_BACKUP_ROOT is not a directory; refusing to remove it"
+    [[ $(stat -c '%u:%g:%a' -- "$UPDATE_BACKUP_ROOT") == 0:0:700 ]] \
+      || die "$UPDATE_BACKUP_ROOT is not owned by root:root with mode 0700; refusing to remove it"
+    [[ -f $UPDATE_BACKUP_MARKER && ! -L $UPDATE_BACKUP_MARKER ]] \
+      || die "$UPDATE_BACKUP_ROOT has no Monitor marker; refusing to remove it"
+    [[ $(stat -c '%u:%g:%a' -- "$UPDATE_BACKUP_MARKER") == 0:0:600 ]] \
+      || die "$UPDATE_BACKUP_MARKER is not owned by root:root with mode 0600; refusing to remove it"
+    [[ $(< "$UPDATE_BACKUP_MARKER") == "$UPDATE_BACKUP_MARKER_CONTENT" ]] \
+      || die "$UPDATE_BACKUP_MARKER was not written by the Monitor updater; refusing to remove it"
     rm -rf -- "$UPDATE_BACKUP_ROOT"
   fi
 fi

@@ -34,6 +34,8 @@ CASES=(
   update_rollback_without_wal_generation
   update_backup_is_root_only
   update_applies_schema_change
+  update_refuses_foreign_backup_directory
+  update_refuses_symlinked_database
   uninstall_preflight_before_mutation
   uninstall_rejects_foreign_execstart
   password_file_ownership_and_mode
@@ -315,8 +317,13 @@ case_update_rollback_without_wal_generation() {
   : > "$fail_flag"
   prepare_schema_update "$fail_flag" nowal || return 1
 
-  # An earlier update left a complete generation, WAL included.
+  # An earlier update left a complete generation, WAL included, in a root it had
+  # marked as its own.
   install -d -o root -g root -m 0700 /var/lib/monitor-update-backup
+  printf '# Managed-By: monitor-update (rollback generation) v1\n' \
+    > /var/lib/monitor-update-backup/.monitor-managed
+  chown root:root /var/lib/monitor-update-backup/.monitor-managed
+  chmod 0600 /var/lib/monitor-update-backup/.monitor-managed
   install -d -o root -g root -m 0700 "$backup_generation"
   printf 'stale main from an earlier generation\n' > "$backup_generation/monitor.db"
   printf 'stale wal from an earlier generation\n' > "$backup_generation/monitor.db-wal"
@@ -411,6 +418,128 @@ case_update_applies_schema_change() {
     || return $(fail "the updater did not report where the pre-update copy is: $output")
   [[ $before_digest != "$(database_digest /var/lib/monitor/monitor.db)" ]] \
     || return $(fail "nothing changed, so this case proves nothing")
+  return 0
+}
+
+# root:root 0700 is access control, not provenance: an unrelated directory can
+# carry those bits legitimately. Without the marker this project writes, the
+# updater must neither adopt the directory nor plant a marker in it, and --purge
+# must never delete it.
+case_update_refuses_foreign_backup_directory() {
+  local root=/var/lib/monitor-update-backup
+  local sentinel="$root/someone-elses-data"
+  prepare_schema_update "$CASE_TMP/never_created" wal || return 1
+
+  local before_binary before_digest output sentinel_digest
+  before_binary=$(sha256sum /usr/local/bin/monitor-server | cut -d' ' -f1)
+  before_digest=$(database_digest /var/lib/monitor/monitor.db)
+
+  install -d -o root -g root -m 0700 "$root"
+  printf 'unrelated backup payload\n' > "$sentinel"
+  chmod 0600 "$sentinel"
+  sentinel_digest=$(sha256sum "$sentinel" | cut -d' ' -f1)
+
+  # No marker at all.
+  output=$("$REPO_ROOT/scripts/update-monitor.sh" --version "$TEST_TAG" --component server 2>&1) \
+    && return $(fail "the update adopted a directory it did not create")
+  grep -q 'was not created by Monitor and will not be used' <<< "$output" \
+    || return $(fail "unexpected refusal: $output")
+  [[ ! -e $root/.monitor-managed ]] \
+    || return $(fail "a Monitor marker was planted in a foreign directory")
+
+  # A falsified marker must not be accepted either.
+  printf '# Managed-By: monitor-update (rollback generation) v99\n' > "$root/.monitor-managed"
+  chown root:root "$root/.monitor-managed"
+  chmod 0600 "$root/.monitor-managed"
+  output=$("$REPO_ROOT/scripts/update-monitor.sh" --version "$TEST_TAG" --component server 2>&1) \
+    && return $(fail "the update accepted a falsified marker")
+  grep -q 'content does not match this Monitor version' <<< "$output" \
+    || return $(fail "unexpected refusal for a falsified marker: $output")
+
+  # A world-readable marker with the right text is still wrong.
+  printf '# Managed-By: monitor-update (rollback generation) v1\n' > "$root/.monitor-managed"
+  chmod 0644 "$root/.monitor-managed"
+  output=$("$REPO_ROOT/scripts/update-monitor.sh" --version "$TEST_TAG" --component server 2>&1) \
+    && return $(fail "the update accepted a marker with the wrong mode")
+  grep -q 'must be owned by root:root with mode 0600' <<< "$output" \
+    || return $(fail "unexpected refusal for a bad marker mode: $output")
+
+  # Nothing was touched by any of the three refusals.
+  [[ $(sha256sum "$sentinel" | cut -d' ' -f1) == "$sentinel_digest" ]] \
+    || return $(fail "the unrelated file was modified")
+  [[ $(sha256sum /usr/local/bin/monitor-server | cut -d' ' -f1) == "$before_binary" ]] \
+    || return $(fail "the Server binary was replaced despite the refusal")
+  [[ $(database_digest /var/lib/monitor/monitor.db) == "$before_digest" ]] \
+    || return $(fail "the database changed despite the refusal")
+  [[ $(schema_version_of /var/lib/monitor/monitor.db) == 1 ]] \
+    || return $(fail "the database was migrated despite the refusal")
+  [[ ! -e $root/current ]] || return $(fail "a generation was written into a foreign directory")
+  grep -qx monitor-server.service "$STATE/active" \
+    || return $(fail "the running Server was disturbed by a refusal")
+
+  # --purge must refuse the same directory rather than delete someone else's data.
+  output=$("$REPO_ROOT/scripts/uninstall-monitor.sh" --component server --purge 2>&1) \
+    && return $(fail "--purge deleted a directory Monitor does not own")
+  grep -q 'refusing to remove it' <<< "$output" \
+    || return $(fail "unexpected purge refusal: $output")
+  [[ -d $root && $(sha256sum "$sentinel" | cut -d' ' -f1) == "$sentinel_digest" ]] \
+    || return $(fail "--purge damaged the unrelated directory")
+  return 0
+}
+
+# The live database directory is writable by the monitor service account, so root
+# must refuse to follow anything it finds there instead of copying through it.
+case_update_refuses_symlinked_database() {
+  prepare_schema_update "$CASE_TMP/never_created" nowal || return 1
+  local secret="$CASE_TMP/not-a-database"
+  printf 'a file root can read but the updater must never copy\n' > "$secret"
+  local secret_digest
+  secret_digest=$(sha256sum "$secret" | cut -d' ' -f1)
+
+  local before_binary real_digest output
+  before_binary=$(sha256sum /usr/local/bin/monitor-server | cut -d' ' -f1)
+  real_digest=$(sha256sum /var/lib/monitor/monitor.db | cut -d' ' -f1)
+
+  # The database itself replaced by a symlink.
+  mv -- /var/lib/monitor/monitor.db "$CASE_TMP/real.db"
+  ln -s "$secret" /var/lib/monitor/monitor.db
+  output=$("$REPO_ROOT/scripts/update-monitor.sh" --version "$TEST_TAG" --component server 2>&1) \
+    && return $(fail "the update followed a symlinked database")
+  grep -q 'monitor.db is a symbolic link; refusing to copy through it' <<< "$output" \
+    || return $(fail "unexpected refusal: $output")
+  [[ $(sha256sum "$secret" | cut -d' ' -f1) == "$secret_digest" ]] \
+    || return $(fail "the symlink target was modified")
+  [[ ! -e /var/lib/monitor-update-backup/current ]] \
+    || return $(fail "the symlink target was copied into a generation")
+  [[ $(sha256sum /usr/local/bin/monitor-server | cut -d' ' -f1) == "$before_binary" ]] \
+    || return $(fail "the binary was replaced despite the refusal")
+  rm -f -- /var/lib/monitor/monitor.db
+  mv -- "$CASE_TMP/real.db" /var/lib/monitor/monitor.db
+  chown monitor:monitor /var/lib/monitor/monitor.db
+
+  # A real database with a symlinked WAL beside it.
+  ln -s "$secret" /var/lib/monitor/monitor.db-wal
+  output=$("$REPO_ROOT/scripts/update-monitor.sh" --version "$TEST_TAG" --component server 2>&1) \
+    && return $(fail "the update followed a symlinked -wal")
+  grep -q 'monitor.db-wal is a symbolic link; refusing to copy through it' <<< "$output" \
+    || return $(fail "unexpected refusal for a symlinked -wal: $output")
+  [[ $(sha256sum "$secret" | cut -d' ' -f1) == "$secret_digest" ]] \
+    || return $(fail "the symlink target was modified")
+  [[ ! -e /var/lib/monitor-update-backup/current ]] \
+    || return $(fail "a generation was written despite the refusal")
+  [[ $(sha256sum /var/lib/monitor/monitor.db | cut -d' ' -f1) == "$real_digest" ]] \
+    || return $(fail "the real database was modified")
+  [[ $(sha256sum /usr/local/bin/monitor-server | cut -d' ' -f1) == "$before_binary" ]] \
+    || return $(fail "the binary was replaced despite the refusal")
+  grep -qx monitor-server.service "$STATE/active" \
+    || return $(fail "the running Server was disturbed by a refusal")
+
+  # With the symlink gone the same update succeeds, so the guard is not blanket.
+  rm -f -- /var/lib/monitor/monitor.db-wal
+  "$REPO_ROOT/scripts/update-monitor.sh" --version "$TEST_TAG" --component server >/dev/null \
+    || return $(fail "a clean database was refused as well")
+  [[ $(schema_version_of /var/lib/monitor/monitor.db) == 2 ]] \
+    || return $(fail "the healthy update did not migrate")
   return 0
 }
 

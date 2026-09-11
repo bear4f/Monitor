@@ -176,12 +176,21 @@ fails to start or to stay up, the previous binary **and** that pre-update
 database are both restored and the Server is started again.
 
 That copy is kept in `/var/lib/monitor-update-backup/current/`, which is
-`root:root` mode `0700` and deliberately outside `/var/lib/monitor`: the unit
+`root:root` mode `0700`, carries a `.monitor-managed` marker the updater checks
+byte for byte before it writes or deletes anything there, and sits deliberately
+outside `/var/lib/monitor`: the unit
 gives the `monitor` service account write access to its own state directory, so a
 rollback copy kept there would be both replaceable under the root updater and
 deletable by the very Server being rolled back. Each update replaces the whole
 directory, so `monitor.db` and `monitor.db-wal` there always belong to the same
 generation — a database backed up without a WAL leaves no WAL behind.
+
+If `/var/lib/monitor-update-backup` already exists without that marker it
+belongs to something else: the update refuses rather than adopting it, no marker
+is planted in it, and `--purge` refuses to delete it. The updater also refuses to
+copy through a symlinked `monitor.db` or `monitor.db-wal`, because the live
+database directory is writable by the service account and root must not follow
+what it finds there.
 
 Keep that copy: once a schema has been raised, downgrading the Server means
 restoring it first, because an older Server will not open a newer schema.

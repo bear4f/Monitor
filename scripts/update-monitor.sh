@@ -11,9 +11,16 @@ readonly SERVER_DB=/var/lib/monitor/monitor.db
 # replace under a root writer and a copy the freshly upgraded Server could
 # delete after startup. This directory is root:root 0700, so the service account
 # can neither traverse nor modify it.
+readonly SERVER_DATA=/var/lib/monitor
 readonly BACKUP_ROOT=/var/lib/monitor-update-backup
 readonly BACKUP_GENERATION=/var/lib/monitor-update-backup/current
 readonly BACKUP_STAGING=/var/lib/monitor-update-backup/staging
+# root:root 0700 proves who may write here, not who created it: an unrelated
+# directory can legitimately carry those bits. Ownership is therefore asserted
+# the same way the managed systemd listener drop-in asserts it, with a marker
+# this project writes and checks byte for byte.
+readonly BACKUP_MARKER=/var/lib/monitor-update-backup/.monitor-managed
+readonly BACKUP_MARKER_CONTENT='# Managed-By: monitor-update (rollback generation) v1'
 readonly SERVER_UNIT=/etc/systemd/system/monitor-server.service
 readonly SERVER_UNIT_NAME=monitor-server.service
 readonly SERVER_DROPIN_DIR=/etc/systemd/system/monitor-server.service.d
@@ -132,17 +139,57 @@ installed_component() {
 # WAL mode the main file alone is not a complete database: committed frames may
 # still sit in -wal, so the pair is copied and restored together. -shm is a
 # rebuildable index into -wal and is deliberately not copied.
-# Refuses a tampered backup root rather than writing into it.
-prepare_backup_root() {
-  [[ ! -L $BACKUP_ROOT ]] || die "$BACKUP_ROOT must not be a symbolic link"
-  if [[ -e $BACKUP_ROOT ]]; then
-    [[ -d $BACKUP_ROOT ]] || die "$BACKUP_ROOT is not a directory"
-    [[ $(stat -c '%u:%g:%a' -- "$BACKUP_ROOT") == 0:0:700 ]] \
-      || die "$BACKUP_ROOT must be owned by root:root with mode 0700"
-  else
-    install -d -o root -g root -m 0700 "$BACKUP_ROOT" || return 1
+# The live database directory is writable by the monitor service account, so root
+# must not follow anything it finds there. Symlinks are rejected outright rather
+# than resolved: a copy through one would read a file of the service account's
+# choosing into the protected generation. This runs before the service is
+# stopped, so a refusal leaves the installation exactly as it was.
+assert_server_database_safe() {
+  [[ ! -L $SERVER_DATA ]] || die "$SERVER_DATA must not be a symbolic link"
+  [[ -d $SERVER_DATA ]] || die "$SERVER_DATA is not a directory"
+  if [[ -e $SERVER_DB || -L $SERVER_DB ]]; then
+    [[ ! -L $SERVER_DB ]] || die "$SERVER_DB is a symbolic link; refusing to copy through it"
+    [[ -f $SERVER_DB ]] || die "$SERVER_DB is not a regular file"
   fi
+  if [[ -e ${SERVER_DB}-wal || -L ${SERVER_DB}-wal ]]; then
+    [[ ! -L ${SERVER_DB}-wal ]] \
+      || die "${SERVER_DB}-wal is a symbolic link; refusing to copy through it"
+    [[ -f ${SERVER_DB}-wal ]] || die "${SERVER_DB}-wal is not a regular file"
+  fi
+}
+
+assert_backup_root_managed() {
+  [[ ! -L $BACKUP_ROOT ]] || die "$BACKUP_ROOT must not be a symbolic link"
+  [[ -d $BACKUP_ROOT ]] || die "$BACKUP_ROOT is not a directory"
+  [[ $(stat -c '%u:%g:%a' -- "$BACKUP_ROOT") == 0:0:700 ]] \
+    || die "$BACKUP_ROOT must be owned by root:root with mode 0700"
+  [[ -e $BACKUP_MARKER || -L $BACKUP_MARKER ]] \
+    || die "$BACKUP_ROOT has no $BACKUP_MARKER marker; it was not created by Monitor and will not be used"
+  [[ -f $BACKUP_MARKER && ! -L $BACKUP_MARKER ]] \
+    || die "$BACKUP_MARKER is not a regular file"
+  [[ $(stat -c '%u:%g:%a' -- "$BACKUP_MARKER") == 0:0:600 ]] \
+    || die "$BACKUP_MARKER must be owned by root:root with mode 0600"
+  [[ $(< "$BACKUP_MARKER") == "$BACKUP_MARKER_CONTENT" ]] \
+    || die "$BACKUP_MARKER content does not match this Monitor version; refusing to use $BACKUP_ROOT"
   [[ ! -L $BACKUP_GENERATION ]] || die "$BACKUP_GENERATION must not be a symbolic link"
+}
+
+# Creates the backup root only when the path is free. An existing directory is
+# never adopted just because its uid, gid and mode happen to match; without the
+# marker it belongs to something else and no marker is planted in it.
+prepare_backup_root() {
+  if [[ -e $BACKUP_ROOT || -L $BACKUP_ROOT ]]; then
+    assert_backup_root_managed
+    return 0
+  fi
+  install -d -o root -g root -m 0700 "$BACKUP_ROOT" \
+    || die "failed to create $BACKUP_ROOT"
+  printf '%s\n' "$BACKUP_MARKER_CONTENT" > "$BACKUP_MARKER.new.$$" \
+    || die "failed to write $BACKUP_MARKER"
+  chown root:root "$BACKUP_MARKER.new.$$" || die "failed to own $BACKUP_MARKER"
+  chmod 0600 "$BACKUP_MARKER.new.$$" || die "failed to set the mode of $BACKUP_MARKER"
+  mv -f -- "$BACKUP_MARKER.new.$$" "$BACKUP_MARKER" || die "failed to publish $BACKUP_MARKER"
+  assert_backup_root_managed
 }
 
 # One backup is one generation, held in its own directory. The whole directory is
@@ -154,7 +201,6 @@ backup_database() {
   BACKUP_TAKEN=false
   [[ -e $SERVER_DB ]] || return 0
   [[ -f $SERVER_DB && ! -L $SERVER_DB ]] || die "$SERVER_DB is not a regular file"
-  prepare_backup_root || return 1
 
   rm -rf -- "$BACKUP_STAGING" || return 1
   install -d -o root -g root -m 0700 "$BACKUP_STAGING" || return 1
@@ -309,6 +355,9 @@ architecture_asset
 if [[ $COMPONENT == server || $COMPONENT == all ]]; then
   installed_component server "$SERVER_BINARY" "$SERVER_UNIT"
   assert_listener_dropin_safe
+  # Both of these refuse before anything is downloaded, stopped or swapped.
+  assert_server_database_safe
+  prepare_backup_root
 fi
 if [[ $COMPONENT == agent || $COMPONENT == all ]]; then
   installed_component agent "$AGENT_BINARY" /etc/systemd/system/monitor-agent.service
