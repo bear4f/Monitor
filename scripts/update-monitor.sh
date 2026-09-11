@@ -4,6 +4,9 @@ set -euo pipefail
 readonly REPOSITORY="bear4f/Monitor"
 readonly SERVER_BINARY=/usr/local/bin/monitor-server
 readonly AGENT_BINARY=/usr/local/bin/monitor-agent
+readonly SERVER_DB=/var/lib/monitor/monitor.db
+readonly SERVER_DB_BACKUP=/var/lib/monitor/monitor.db.pre-update
+readonly SERVER_DB_BACKUP_WAL=/var/lib/monitor/monitor.db.pre-update-wal
 readonly SERVER_UNIT=/etc/systemd/system/monitor-server.service
 readonly SERVER_UNIT_NAME=monitor-server.service
 readonly SERVER_DROPIN_DIR=/etc/systemd/system/monitor-server.service.d
@@ -111,6 +114,49 @@ installed_component() {
   grep -Eq "^ExecStart=$binary([[:space:]]|$)" "$unit" \
     || die "$unit is not a recognized Monitor unit for $component"
 }
+# A Server release may raise the SQLite user_version, and the Server migrates the
+# database while starting up -- before it binds its listener, so long before the
+# stability check below can judge the new version. Restoring only the binary
+# would then strand an old Server in front of a newer schema it refuses to open,
+# which is exactly the state the rollback claims to prevent. The pre-update
+# database is therefore copied first and restored together with the binary.
+#
+# The copy is taken with the service stopped, so the database has no writer. In
+# WAL mode the main file alone is not a complete database: committed frames may
+# still sit in -wal, so the pair is copied and restored together. -shm is a
+# rebuildable index into -wal and is deliberately not copied.
+backup_database() {
+  BACKUP_TAKEN=false
+  [[ -e $SERVER_DB ]] || return 0
+  [[ -f $SERVER_DB && ! -L $SERVER_DB ]] || die "$SERVER_DB is not a regular file"
+  rm -f -- "$SERVER_DB_BACKUP" "$SERVER_DB_BACKUP_WAL"
+  cp -p -- "$SERVER_DB" "$SERVER_DB_BACKUP.new.$$" || return 1
+  if [[ -f ${SERVER_DB}-wal ]]; then
+    cp -p -- "${SERVER_DB}-wal" "$SERVER_DB_BACKUP_WAL.new.$$" || return 1
+  fi
+  mv -f -- "$SERVER_DB_BACKUP.new.$$" "$SERVER_DB_BACKUP" || return 1
+  if [[ -f $SERVER_DB_BACKUP_WAL.new.$$ ]]; then
+    mv -f -- "$SERVER_DB_BACKUP_WAL.new.$$" "$SERVER_DB_BACKUP_WAL" || return 1
+  fi
+  BACKUP_TAKEN=true
+}
+
+# Any -wal left by the new Server describes the migrated schema, so it must be
+# discarded before the pre-update files go back; replaying it onto the restored
+# main file would reintroduce the migration this is undoing.
+restore_database() {
+  [[ ${BACKUP_TAKEN-false} == true ]] || return 0
+  rm -f -- "${SERVER_DB}-wal" "${SERVER_DB}-shm"
+  cp -p -- "$SERVER_DB_BACKUP" "$SERVER_DB.restore.$$" \
+    && mv -f -- "$SERVER_DB.restore.$$" "$SERVER_DB" \
+    || return 1
+  if [[ -f $SERVER_DB_BACKUP_WAL ]]; then
+    cp -p -- "$SERVER_DB_BACKUP_WAL" "${SERVER_DB}-wal.restore.$$" \
+      && mv -f -- "${SERVER_DB}-wal.restore.$$" "${SERVER_DB}-wal" \
+      || return 1
+  fi
+}
+
 stage_binary() {
   local source=$1 destination=$2
   local temporary="${destination}.new.$$"
@@ -133,25 +179,51 @@ service_is_stable() {
 update_component() {
   local component=$1 unit=$2 binary=$3 source=$4
   local backup="$WORK_DIR/$component.previous"
+  local is_server=false restored="previous binary"
+  if [[ $component == Server ]]; then
+    is_server=true
+    restored="previous binary and pre-update database"
+  fi
   local was_active=false
   if systemctl is-active --quiet "$unit"; then
     was_active=true
   fi
   cp -p -- "$binary" "$backup"
-  stage_binary "$source" "$binary"
+
+  # Stop, copy, swap, start -- rather than one restart -- so the database copy
+  # happens in the window where the Server is not running and cannot write.
   if [[ $was_active == true ]]; then
-    if ! systemctl restart "$unit" || ! service_is_stable "$unit"; then
+    systemctl stop "$unit" >/dev/null || die "failed to stop $unit"
+    if systemctl is-active --quiet "$unit"; then
+      die "$unit remains active after stop"
+    fi
+  fi
+  if [[ $is_server == true ]] && ! backup_database; then
+    if [[ $was_active == true ]]; then
+      systemctl start "$unit" >/dev/null 2>&1 || true
+    fi
+    die "failed to copy $SERVER_DB before the update; nothing was changed"
+  fi
+  stage_binary "$source" "$binary"
+
+  if [[ $was_active == true ]]; then
+    if ! systemctl start "$unit" || ! service_is_stable "$unit"; then
+      systemctl stop "$unit" >/dev/null 2>&1 || true
       rollback_binary "$backup" "$binary" \
-        || die "$component restart failed and previous binary could not be restored"
-      if systemctl restart "$unit" && service_is_stable "$unit"; then
-        die "$component restart failed; previous binary restored and service recovered"
+        || die "$component start failed and the previous binary could not be restored"
+      if [[ $is_server == true ]] && ! restore_database; then
+        die "$component start failed and the pre-update database could not be restored from $SERVER_DB_BACKUP"
       fi
-      die "$component restart failed; previous binary was restored but service recovery failed"
+      if systemctl start "$unit" && service_is_stable "$unit"; then
+        die "$component start failed; the $restored were restored and the service recovered"
+      fi
+      die "$component start failed; the $restored were restored but the service did not recover; inspect journalctl -u ${unit%.service}"
     fi
   fi
   printf '%s updated to %s\n' "$component" "$RELEASE_VERSION"
 }
 
+BACKUP_TAKEN=false
 VERSION=
 COMPONENT=all
 while (($#)); do
@@ -215,3 +287,8 @@ if [[ $COMPONENT == agent || $COMPONENT == all ]]; then
   update_component Agent monitor-agent.service "$AGENT_BINARY" "$WORK_DIR/monitor-agent"
 fi
 printf 'Monitor %s update complete (%s).\n' "$RELEASE_TAG" "$COMPONENT"
+if [[ ${BACKUP_TAKEN-false} == true ]]; then
+  printf 'Pre-update database kept at %s; it matches the previously installed Server.\n' \
+    "$SERVER_DB_BACKUP"
+  printf 'Downgrading the Server later requires restoring it, because an older Server refuses a newer schema.\n'
+fi

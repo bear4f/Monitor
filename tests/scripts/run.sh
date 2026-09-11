@@ -30,6 +30,8 @@ CASES=(
   foreign_execstart_dropin_refused
   update_preserves_managed_listener
   update_rejects_foreign_execstart
+  update_rolls_back_schema_change
+  update_applies_schema_change
   uninstall_preflight_before_mutation
   uninstall_rejects_foreign_execstart
   password_file_ownership_and_mode
@@ -202,6 +204,88 @@ case_update_rejects_foreign_execstart() {
   grep -q 'overrides ExecStart' <<< "$output" || return $(fail "unexpected refusal: $output")
   [[ $(sha256sum /usr/local/bin/monitor-server | cut -d' ' -f1) == "$before" ]] \
     || return $(fail "the binary was replaced despite the refusal")
+}
+
+# The Server migrates its database during startup, before it binds a listener,
+# so a schema-raising release commits the migration and only then can fail the
+# updater's stability check. Restoring just the binary would leave an older
+# Server in front of a newer schema, which it refuses to open -- the rollback
+# has to restore the database too.
+prepare_schema_update() {
+  local fail_flag=$1
+  install_server >/dev/null || return $(fail "install failed")
+  # Replace the installed Server with one that supports schema 1 only, and give
+  # it a v0.1.2-shaped database.
+  make_schema_binary /usr/local/bin/monitor-server 9.9.8 1 /nonexistent
+  rm -f -- /var/lib/monitor/monitor.db /var/lib/monitor/monitor.db-wal /var/lib/monitor/monitor.db-shm
+  seed_legacy_database /var/lib/monitor/monitor.db
+  systemctl restart monitor-server.service >/dev/null \
+    || return $(fail "the schema 1 Server could not start on its own database")
+  # The release the updater will fetch supports schema 2.
+  local asset="$CASE_TMP/web/bear4f/Monitor/releases/download/$TEST_TAG/monitor-server-linux-$ARCH"
+  make_schema_binary "$asset" 9.9.9 2 "$fail_flag"
+  (
+    cd "$CASE_TMP/web/bear4f/Monitor/releases/download/$TEST_TAG"
+    sha256sum "monitor-server-linux-$ARCH" "monitor-agent-linux-$ARCH" > SHA256SUMS
+  )
+}
+
+case_update_rolls_back_schema_change() {
+  local fail_flag="$CASE_TMP/fail_start"
+  : > "$fail_flag"
+  prepare_schema_update "$fail_flag" || return 1
+
+  local before_schema before_digest before_binary output
+  before_schema=$(schema_version_of /var/lib/monitor/monitor.db)
+  before_digest=$(database_digest /var/lib/monitor/monitor.db)
+  before_binary=$(sha256sum /usr/local/bin/monitor-server | cut -d' ' -f1)
+  [[ $before_schema == 1 ]] || return $(fail "fixture schema is $before_schema, expected 1")
+
+  output=$("$REPO_ROOT/scripts/update-monitor.sh" --version "$TEST_TAG" --component server 2>&1) \
+    && return $(fail "the update reported success even though the new Server failed to start")
+  grep -q 'previous binary and pre-update database were restored and the service recovered' <<< "$output" \
+    || return $(fail "unexpected failure message: $output")
+
+  # The migration really did run before the failure.
+  grep -q 'migrated-marker' <<< "$(database_digest /var/lib/monitor/monitor.db)" \
+    && return $(fail "the new Server never migrated, so this case proves nothing")
+
+  [[ $(schema_version_of /var/lib/monitor/monitor.db) == 1 ]] \
+    || return $(fail "schema stayed at $(schema_version_of /var/lib/monitor/monitor.db) after rollback")
+  [[ $(database_digest /var/lib/monitor/monitor.db) == "$before_digest" ]] \
+    || return $(fail "pre-upgrade rows changed: $(database_digest /var/lib/monitor/monitor.db)")
+  [[ $(sha256sum /usr/local/bin/monitor-server | cut -d' ' -f1) == "$before_binary" ]] \
+    || return $(fail "the previous binary was not restored")
+  grep -qx monitor-server.service "$STATE/active" \
+    || return $(fail "the service did not recover after rollback")
+  [[ -f /var/lib/monitor/monitor.db.pre-update ]] \
+    || return $(fail "the pre-update database copy is missing")
+
+  # The restored pair must be usable by the restored binary, not merely present.
+  systemctl restart monitor-server.service >/dev/null \
+    || return $(fail "the restored binary and database cannot start together")
+  return 0
+}
+
+case_update_applies_schema_change() {
+  prepare_schema_update "$CASE_TMP/never_created" || return 1
+
+  local before_digest output
+  before_digest=$(database_digest /var/lib/monitor/monitor.db)
+  output=$("$REPO_ROOT/scripts/update-monitor.sh" --version "$TEST_TAG" --component server 2>&1) \
+    || { printf '%s\n' "$output"; return $(fail "a healthy schema update failed"); }
+  [[ $(schema_version_of /var/lib/monitor/monitor.db) == 2 ]] \
+    || return $(fail "schema is $(schema_version_of /var/lib/monitor/monitor.db), expected 2")
+  grep -q 'migrated-marker' <<< "$(database_digest /var/lib/monitor/monitor.db)" \
+    || return $(fail "the migration did not run")
+  grep -q "tokyo" <<< "$(database_digest /var/lib/monitor/monitor.db)" \
+    || return $(fail "pre-upgrade rows were lost by a successful update")
+  grep -qx monitor-server.service "$STATE/active" || return $(fail "the Server is not active")
+  grep -q 'Pre-update database kept at /var/lib/monitor/monitor.db.pre-update' <<< "$output" \
+    || return $(fail "the updater did not report where the pre-update copy is: $output")
+  [[ $before_digest != "$(database_digest /var/lib/monitor/monitor.db)" ]] \
+    || return $(fail "nothing changed, so this case proves nothing")
+  return 0
 }
 
 case_uninstall_preflight_before_mutation() {
@@ -500,6 +584,7 @@ fi
 [[ "$(id -u)" -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 [[ "$(uname -s)" == Linux ]] || { echo "Linux is required" >&2; exit 1; }
 command -v unshare >/dev/null || { echo "unshare (util-linux) is required" >&2; exit 1; }
+command -v python3 >/dev/null || { echo "python3 is required for the schema fixtures" >&2; exit 1; }
 
 selected=("$@")
 ((${#selected[@]})) || selected=("${CASES[@]}")

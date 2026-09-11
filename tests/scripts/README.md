@@ -13,7 +13,8 @@ unmodified at their real absolute paths while nothing on the host changes.
 systemd, `ss`, GitHub and the release binaries are replaced by small fakes on
 `PATH`; the privilege drop uses the real `runuser`.
 
-Requirements: root, Linux, `unshare`, overlayfs, `runuser`.
+Requirements: root, Linux, `unshare`, overlayfs, `runuser`, `python3` (the
+schema-migration fixtures build and inspect real SQLite databases).
 
 This is test-only tooling. It is never installed, never downloaded by the
 installers, and adds no runtime dependency.

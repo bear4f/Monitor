@@ -159,13 +159,27 @@ stopped and prints only the file path.
 ## Update and uninstall
 
 Updates require an explicit version and verify the same-release checksum before
-staging a binary. The old binary is restored if restart or health verification
-fails; the database, Agent environment, and a custom Server listener are all
+staging a binary. The Agent environment and a custom Server listener are always
 preserved:
 
 ```sh
 sudo ./scripts/update-monitor.sh --version v0.1.2 --component all
 ```
+
+A Server release may raise the database schema, and the Server migrates the
+database while starting up — before it binds its listener, and so before the
+updater can judge whether the new version stays healthy. Restoring only the
+binary would therefore leave an older Server in front of a newer schema, which
+it refuses to open. The update stops the Server, copies `monitor.db` and its
+`-wal` while nothing can write to them, and swaps the binary; if the new Server
+fails to start or to stay up, the previous binary **and** that pre-update
+database are both restored and the Server is started again.
+
+The copy stays at `/var/lib/monitor/monitor.db.pre-update` after a successful
+update and is replaced by the next one. Keep it: once a schema has been raised,
+downgrading the Server means restoring that copy first, because an older Server
+will not open a newer schema. `uninstall-monitor.sh --purge` removes it with the
+rest of `/var/lib/monitor`.
 
 Default uninstall stops and removes Monitor units and binaries, removes the
 Agent secret file, and preserves Server data. To delete only the explicitly

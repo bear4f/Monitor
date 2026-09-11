@@ -148,13 +148,22 @@ drop_listeners_for_unit() {
 start_unit() {
   local unit=$1 exec_line port pid
   exec_line=$(effective_exec "$unit") || { printf 'no unit %s\n' "$unit" >&2; exit 1; }
+  printf 'exec %s :: %s\n' "$unit" "$exec_line" >> "$STATE/exec.log"
+  # The real Server opens and migrates its database during startup, before it
+  # binds a listener, so starting a unit here actually runs its ExecStart and a
+  # non-zero exit means the unit did not come up.
+  # shellcheck disable=SC2086
+  if ! $exec_line >> "$STATE/exec.log" 2>&1; then
+    clear_active "$unit"
+    drop_listeners_for_unit "$unit"
+    return 1
+  fi
   drop_listeners_for_unit "$unit"
   pid=$(next_pid)
   printf '%s %s\n' "$pid" "$unit" > "$STATE/mainpid.$unit"
   if port=$(listen_port "$exec_line"); then
     printf '%s %s %s\n' "$port" "$pid" "$unit" >> "$STATE/listeners"
   fi
-  printf 'exec %s :: %s\n' "$unit" "$exec_line" >> "$STATE/exec.log"
   set_active "$unit"
 }
 
@@ -222,7 +231,7 @@ case ${1-} in
     ;;
   start|restart)
     shift
-    start_unit "${1-}"
+    start_unit "${1-}" || exit 1
     exit 0
     ;;
 esac
@@ -376,6 +385,110 @@ fi
 exit 0
 BINARY
   chmod 0755 "$destination"
+}
+
+# A fake Server that does the one startup step that matters to the updater:
+# open the database, refuse a schema newer than it supports, migrate a schema
+# older than it supports, then either stay up or fail. When it fails after
+# migrating it exits through os._exit so the committed frames stay in -wal and
+# are never checkpointed -- the state that makes a naive main-file-only backup
+# wrong.
+make_schema_binary() {
+  local destination=$1 version=$2 supported=$3 fail_flag=$4
+  local helper="$destination.startup.py"
+  cat > "$helper" <<'HELPER'
+import os, sqlite3, sys
+db, supported, fail_flag = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+connection = sqlite3.connect(db)
+connection.execute("PRAGMA journal_mode=WAL")
+installed = connection.execute("PRAGMA user_version").fetchone()[0]
+if installed > supported:
+    sys.stderr.write("unsupported schema version %d > %d\n" % (installed, supported))
+    sys.exit(1)
+if installed < supported:
+    connection.execute(
+        "ALTER TABLE nodes ADD COLUMN traffic_reset_mode TEXT NOT NULL DEFAULT 'monthly'"
+    )
+    connection.execute("INSERT INTO nodes (id, name) VALUES (900, 'migrated-marker')")
+    connection.execute("PRAGMA user_version=%d" % supported)
+    connection.commit()
+if os.path.exists(fail_flag):
+    sys.stderr.write("simulated post-migration startup failure\n")
+    os._exit(1)
+connection.close()
+HELPER
+  cat > "$destination" <<BINARY
+#!/usr/bin/env bash
+set -uo pipefail
+LOG="$STATE"
+NAME=monitor-server
+VERSION=$version
+SUPPORTED=$supported
+FAIL_FLAG="$fail_flag"
+HELPER_PY="$helper"
+BINARY
+  cat >> "$destination" <<'BINARY'
+printf '%s argv: %s\n' "$NAME" "$*" >> "$LOG/admin.log"
+if [[ ${1-} == --version ]]; then
+  printf '%s %s\n' "$NAME" "$VERSION"
+  exit 0
+fi
+database=
+previous=
+for argument in "$@"; do
+  [[ $previous == --db ]] && database=$argument
+  previous=$argument
+done
+[[ -n $database ]] || exit 0
+exec python3 "$HELPER_PY" "$database" "$SUPPORTED" "$FAIL_FLAG"
+BINARY
+  chmod 0755 "$destination"
+}
+
+# A database shaped like the v0.1.2 schema: user_version 1, WAL, and rows in the
+# tables the migration must not disturb.
+seed_legacy_database() {
+  local path=$1
+  install -d -o monitor -g monitor -m 0750 "$(dirname -- "$path")"
+  python3 - "$path" <<'SEED'
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1])
+for statement in (
+    "PRAGMA journal_mode=WAL",
+    "CREATE TABLE nodes (id INTEGER PRIMARY KEY, name TEXT NOT NULL) STRICT",
+    "CREATE TABLE traffic_totals (node_id INTEGER PRIMARY KEY, rx_total_bytes INTEGER NOT NULL, tx_total_bytes INTEGER NOT NULL) STRICT",
+    "CREATE TABLE ping_targets (id INTEGER PRIMARY KEY, name TEXT NOT NULL, host TEXT NOT NULL) STRICT",
+    "CREATE TABLE ping_history (node_id INTEGER NOT NULL, bucket_ts INTEGER NOT NULL, target_id INTEGER NOT NULL, sample_count INTEGER NOT NULL, PRIMARY KEY (node_id, bucket_ts, target_id)) STRICT, WITHOUT ROWID",
+    "INSERT INTO nodes VALUES (1, 'tokyo'), (2, 'osaka')",
+    "INSERT INTO traffic_totals VALUES (1, 111111, 222222), (2, 333333, 444444)",
+    "INSERT INTO ping_targets VALUES (1, 'cf v4', '1.1.1.1')",
+    "INSERT INTO ping_history VALUES (1, 60, 1, 4), (1, 120, 1, 4), (2, 60, 1, 3)",
+    "PRAGMA user_version=1",
+):
+    connection.execute(statement)
+connection.commit()
+connection.close()
+SEED
+  chown monitor:monitor "$path" "$path-wal" "$path-shm" 2>/dev/null || true
+}
+
+schema_version_of() {
+  python3 -c "import sqlite3,sys; print(sqlite3.connect(sys.argv[1]).execute('PRAGMA user_version').fetchone()[0])" "$1"
+}
+
+database_digest() {
+  python3 - "$1" <<'DIGEST'
+import sqlite3, sys
+connection = sqlite3.connect(sys.argv[1])
+parts = []
+for table in ("nodes", "traffic_totals", "ping_targets", "ping_history"):
+    count = connection.execute("SELECT count(*) FROM " + table).fetchone()[0]
+    parts.append("%s=%d" % (table, count))
+parts.append("nodes:" + repr(connection.execute("SELECT id, name FROM nodes ORDER BY id").fetchall()))
+parts.append("totals:" + repr(connection.execute("SELECT * FROM traffic_totals ORDER BY node_id").fetchall()))
+parts.append("ping:" + repr(connection.execute("SELECT * FROM ping_history ORDER BY node_id, bucket_ts").fetchall()))
+print(" | ".join(parts))
+DIGEST
 }
 
 make_source_tarball() {
