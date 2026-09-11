@@ -34,6 +34,8 @@ PRAGMA wal_autocheckpoint = 1000;
 
 schema 版本使用 `PRAGMA user_version`。每个 migration 在 `BEGIN IMMEDIATE` 事务中执行；失败必须回滚并阻止 Server 开始监听。
 
+当前 `CURRENT_SCHEMA_VERSION = 2`。第 3 节是 schema 1 的契约；schema 2 的增量见第 3.1 节。
+
 ## 3. 首版 schema
 
 以下 SQL 是 Phase 2 migration 的契约。实现时只能为 SQLite 语法/测试修正，不得无规格增加业务表。
@@ -223,6 +225,35 @@ CREATE TABLE ping_history (
     )
 ) STRICT, WITHOUT ROWID;
 ```
+
+## 3.1 schema 2 增量
+
+`migrations/0002_traffic_reset_mode_and_probe_targets.sql`，`user_version` 1 → 2。只做
+`ALTER TABLE ADD COLUMN`：不重建表、不 RENAME、不 DROP、不动 `foreign_keys`，因此
+`ping_history` 对 `ping_targets(id)` 的外键不存在任何级联风险。
+
+```sql
+ALTER TABLE nodes ADD COLUMN traffic_reset_mode TEXT NOT NULL DEFAULT 'monthly'
+    CHECK (traffic_reset_mode IN ('monthly', 'never'));
+
+ALTER TABLE ping_targets ADD COLUMN probe_kind TEXT NOT NULL DEFAULT 'icmp'
+    CHECK (probe_kind IN ('icmp', 'tcp'));
+
+ALTER TABLE ping_targets ADD COLUMN port INTEGER
+    CHECK (
+        (probe_kind = 'tcp' AND port IS NOT NULL AND port BETWEEN 1 AND 65535)
+        OR
+        (probe_kind = 'icmp' AND port IS NULL)
+    );
+```
+
+`probe_kind` 必须先于 `port` 添加：`port` 的 CHECK 引用它，而 CHECK 不能引用尚不存在的列。
+`port IS NOT NULL` 是显式写出的——NULL 不可比较，单靠 `BETWEEN` 在三值逻辑下对 NULL 为真，
+会放过没有端口的 TCP 目标。
+
+既有行由 SQLite 套用声明的默认值：所有 node 为 `monthly`，所有 ping target 为 `icmp` 且
+`port IS NULL`，行为与 v0.1.2 完全一致。这一层只是存储基础，`never` 的账期语义与 TCP 探测
+行为分别在后续 commit 实现。
 
 ## 4. 表职责与保留策略
 

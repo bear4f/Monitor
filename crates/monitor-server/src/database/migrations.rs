@@ -2,15 +2,24 @@ use rusqlite::{Connection, TransactionBehavior};
 
 use super::DatabaseError;
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 1;
+pub const CURRENT_SCHEMA_VERSION: i64 = 2;
 
-const MIGRATIONS: &[(i64, &str)] = &[(
-    1,
-    include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../migrations/0001_initial.sql"
-    )),
-)];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (
+        1,
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../migrations/0001_initial.sql"
+        )),
+    ),
+    (
+        2,
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../migrations/0002_traffic_reset_mode_and_probe_targets.sql"
+        )),
+    ),
+];
 
 pub(super) fn apply_migrations(connection: &mut Connection) -> Result<(), DatabaseError> {
     let installed_version = schema_version(connection)?;
