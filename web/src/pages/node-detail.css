@@ -317,6 +317,13 @@
   white-space: nowrap;
 }
 
+.ping-legend-loss {
+  color: var(--muted-foreground);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 .ping-inline-error {
   position: absolute;
   z-index: 6;

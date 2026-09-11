@@ -132,7 +132,7 @@ export function pingSeriesDash(index: number): readonly number[] {
   return DASH_PATTERNS[Math.max(0, index) % DASH_PATTERNS.length];
 }
 
-export function latestLatency(values: readonly (number | null)[]): number | null {
+export function latestValue(values: readonly (number | null)[]): number | null {
   for (let index = values.length - 1; index >= 0; index -= 1) {
     if (values[index] !== null) return values[index];
   }
@@ -142,4 +142,11 @@ export function latestLatency(values: readonly (number | null)[]): number | null
 function supportsOklch(): boolean {
   return typeof CSS !== "undefined" && typeof CSS.supports === "function"
     && CSS.supports("color", "oklch(0.7 0.16 120 / 0.9)");
+}
+
+// Loss arrives as a 0..1 ratio; the legend shows it as a percentage.
+export function formatLossPercent(ratio: number): string {
+  const percent = ratio * 100;
+  const rounded = percent >= 10 ? Math.round(percent) : Number(percent.toFixed(1));
+  return `${rounded}%`;
 }

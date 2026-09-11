@@ -53,6 +53,18 @@ pub struct ResourceSample {
     pub tx_rate_bytes_per_sec: i64,
 }
 
+/// One target's counters for the minute that is still open, copied out of the
+/// accumulator. Values only -- the accumulator itself is never exposed, and the
+/// minute is neither finalized nor mutated by reading it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CurrentPingSample {
+    pub bucket_ts: i64,
+    pub target_id: i64,
+    pub sample_count: i64,
+    pub success_count: i64,
+    pub latency_avg_ms: Option<f64>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct PingSample {
     pub target_id: i64,
@@ -143,6 +155,34 @@ impl HistoryAccumulator {
             state.push_pending(current.finalize());
             state.closed_before = state.closed_before.max(bucket_ts + MINUTE_SECONDS);
         }
+    }
+
+    /// Copies one node's ping counters for the still-open minute. The lock is
+    /// held for the copy and nothing else: the returned values own no guard, so
+    /// no caller can keep it across a database await or a response build.
+    pub fn current_ping_samples(&self, node_id: i64) -> Vec<CurrentPingSample> {
+        let state = self.lock();
+        let Some(current) = state.current.as_ref() else {
+            return Vec::new();
+        };
+        let bucket_ts = current.bucket_ts;
+        let mut samples: Vec<CurrentPingSample> = current
+            .pings
+            .iter()
+            .filter(|((id, _), _)| *id == node_id)
+            .map(|((_, target_id), ping)| CurrentPingSample {
+                bucket_ts,
+                target_id: *target_id,
+                sample_count: ping.sample_count,
+                success_count: ping.success_count,
+                // Same rule as a persisted minute: no successful sample, no
+                // latency, so loss and latency describe one sample population.
+                latency_avg_ms: (ping.success_count > 0).then_some(ping.latency_mean),
+            })
+            .collect();
+        drop(state);
+        samples.sort_unstable_by_key(|sample| sample.target_id);
+        samples
     }
 
     pub fn remove_node(&self, node_id: i64) {
@@ -599,6 +639,119 @@ mod tests {
 
         assert_eq!(history.ping_samples(7), 0);
         assert_eq!(history.ping_samples(8), 2);
+    }
+
+    #[test]
+    fn the_open_minute_is_readable_without_being_finalized_or_mutated() {
+        let history = HistoryAccumulator::new();
+        history.record(
+            1,
+            120,
+            resource(10.0, 10, 10),
+            [
+                PingSample {
+                    target_id: 7,
+                    success: true,
+                    latency_ms: Some(10.0),
+                },
+                PingSample {
+                    target_id: 7,
+                    success: false,
+                    latency_ms: None,
+                },
+                PingSample {
+                    target_id: 8,
+                    success: false,
+                    latency_ms: None,
+                },
+            ],
+        );
+        // Another node's samples never leak into this node's snapshot.
+        history.record(
+            2,
+            120,
+            resource(10.0, 10, 10),
+            [PingSample {
+                target_id: 7,
+                success: false,
+                latency_ms: None,
+            }],
+        );
+
+        let first = history.current_ping_samples(1);
+        assert_eq!(
+            first,
+            vec![
+                CurrentPingSample {
+                    bucket_ts: 120,
+                    target_id: 7,
+                    sample_count: 2,
+                    success_count: 1,
+                    latency_avg_ms: Some(10.0),
+                },
+                CurrentPingSample {
+                    bucket_ts: 120,
+                    target_id: 8,
+                    sample_count: 1,
+                    success_count: 0,
+                    // No successful sample, so no latency: loss and latency
+                    // describe the same population.
+                    latency_avg_ms: None,
+                },
+            ]
+        );
+
+        // The snapshot owns no lock, so the accumulator stays usable while it is
+        // alive -- a snapshot that carried the guard would deadlock here.
+        history.remove_target(9);
+        assert_eq!(first.len(), 2);
+
+        // Reading finalized nothing and changed nothing.
+        assert!(history.pending_snapshot().is_empty());
+        assert_eq!(history.current_ping_samples(1), first);
+        assert_eq!(history.ping_samples(7), 3);
+        history.record(
+            1,
+            150,
+            resource(10.0, 10, 10),
+            [PingSample {
+                target_id: 7,
+                success: false,
+                latency_ms: None,
+            }],
+        );
+        let later = history.current_ping_samples(1);
+        assert_eq!(later[0].bucket_ts, 120, "still the same open minute");
+        assert_eq!((later[0].sample_count, later[0].success_count), (3, 1));
+    }
+
+    #[test]
+    fn a_removed_target_disappears_from_the_open_minute_snapshot() {
+        let history = HistoryAccumulator::new();
+        let sample = |target_id| PingSample {
+            target_id,
+            success: false,
+            latency_ms: None,
+        };
+        history.record(1, 60, resource(10.0, 10, 10), [sample(7), sample(8)]);
+        history.remove_target(7);
+        assert_eq!(
+            history
+                .current_ping_samples(1)
+                .iter()
+                .map(|sample| sample.target_id)
+                .collect::<Vec<_>>(),
+            vec![8]
+        );
+    }
+
+    #[test]
+    fn an_unreported_node_and_an_empty_accumulator_snapshot_nothing() {
+        let history = HistoryAccumulator::new();
+        assert!(history.current_ping_samples(1).is_empty());
+        history.record(1, 60, resource(10.0, 10, 10), std::iter::empty());
+        assert!(history.current_ping_samples(2).is_empty());
+        assert!(history.current_ping_samples(1).is_empty());
     }
 
     #[test]

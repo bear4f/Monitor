@@ -10,6 +10,9 @@ export interface PingTarget {
 export interface PingSeries {
   target_id: number;
   latency: (number | null)[];
+  // Failed samples over total samples per bucket, as a 0..1 ratio. null means the
+  // bucket has no samples at all, which is not the same as no loss.
+  loss: (number | null)[];
 }
 
 export interface PingHistory {
@@ -54,10 +57,13 @@ export function parsePingHistory(value: unknown): PingHistory | null {
   for (let index = 0; index < value.series.length; index += 1) {
     const candidate = value.series[index];
     if (!isRecord(candidate) || !isSafeInteger(candidate.target_id)
-      || candidate.target_id !== targets[index]?.id || !Array.isArray(candidate.latency)) return null;
+      || candidate.target_id !== targets[index]?.id || !Array.isArray(candidate.latency)
+      || !Array.isArray(candidate.loss)) return null;
     const latency = nullableLatencyArray(candidate.latency);
     if (!latency || latency.length !== timestamps.length) return null;
-    series.push({ target_id: candidate.target_id, latency });
+    const loss = nullableRatioArray(candidate.loss);
+    if (!loss || loss.length !== timestamps.length) return null;
+    series.push({ target_id: candidate.target_id, latency, loss });
   }
 
   return {
@@ -109,6 +115,12 @@ function numberArray(value: unknown[]): number[] | null {
 
 function nullableLatencyArray(value: unknown[]): (number | null)[] | null {
   return value.every((item) => item === null || (isFiniteNumber(item) && item >= 0))
+    ? value as (number | null)[]
+    : null;
+}
+
+function nullableRatioArray(value: unknown[]): (number | null)[] | null {
+  return value.every((item) => item === null || (isFiniteNumber(item) && item >= 0 && item <= 1))
     ? value as (number | null)[]
     : null;
 }

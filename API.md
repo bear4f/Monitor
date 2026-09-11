@@ -318,8 +318,8 @@ Query：必填 `range=1h|6h|24h|7d`。
   ],
   "timestamps": [1788642840, 1788642900, 1788642960],
   "series": [
-    { "target_id": 1, "latency": [142.1, null, 145.7] },
-    { "target_id": 2, "latency": [168.4, 170.2, null] }
+    { "target_id": 1, "latency": [142.1, null, 145.7], "loss": [0, 1, 0.25] },
+    { "target_id": 2, "latency": [168.4, 170.2, null], "loss": [0, 0, null] }
   ]
 }
 ```
@@ -330,6 +330,15 @@ Query：必填 `range=1h|6h|24h|7d`。
 - `targets` 和 `series` 顺序一致，按 target `sort_order, id`。
 - 每条 `latency` 与 `timestamps` 等长；全失败、timeout、未上报、已断开区间均为 null，不得为 0。
 - 分钟桶有部分成功时 latency 为成功样本平均值；7d 的 5 分钟桶按 success count 加权。
+- `loss = 失败样本数 / 总样本数`，即 `(sample_count - success_count) / sample_count`。
+- **`loss` 是 0..1 的比例，不是百分比整数**：`0.0`、`0.25`、`1.0`。浏览器负责显示为百分比。
+- 每条 `loss` 与 `timestamps` 等长，同一下标在 `latency` 与 `loss` 中是同一个桶。
+  - 桶不存在：`latency` 与 `loss` 都是 null（丢包未知，而不是没有丢包）。
+  - `sample_count > 0 且 success_count = 0`：`latency` 为 null，`loss` 为 `1.0`。
+  - 部分失败：`latency` 为成功样本平均值，`loss` 为小数比例。
+- 丢包不从 `latency == null` 推断，而是来自与 latency 同源的 `sample_count`/`success_count`。
+- 5 分钟桶先累加 `sample_count` 与 `success_count`，再做一次除法；不是各分钟比例的平均值（样本数不等时两者不同）。
+- 仍在累积的当前分钟从内存累加器读取并合入：分钟粒度下当前分钟覆盖同一分钟的持久化表示，5 分钟粒度下与同桶已完成分钟合并一次，latency 按 success count 加权。当前分钟不会为了可查询而写入 SQLite。
 - “削峰”不作为 API 参数。浏览器只裁剪传给 uPlot 的副本，response 和 tooltip 原始值不变。
 - 一次 SQL JOIN 返回指定节点全部 targets 的范围数据，不逐 target 查询。
 

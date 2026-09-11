@@ -4,6 +4,8 @@ import {
   clampViewport,
   cutPeakCap,
   displayLatencySeries,
+  formatLossPercent,
+  latestValue,
   median,
   medianAbsoluteDeviation,
   nearestRankP95,
@@ -25,8 +27,8 @@ const fixture: PingHistory = {
   ],
   timestamps: [1_700_000_000, 1_700_000_060, 1_700_000_120],
   series: [
-    { target_id: 10, latency: [20, null, 22] },
-    { target_id: 11, latency: [40, 41, null] },
+    { target_id: 10, latency: [20, null, 22], loss: [0, null, 0.25] },
+    { target_id: 11, latency: [40, 41, null], loss: [0, 0.5, 1] },
   ],
 };
 
@@ -37,18 +39,56 @@ describe("ping API contract", () => {
     expect(parsed?.series[0].latency[1]).toBeNull();
   });
 
+  it("accepts the full loss ratio range and preserves null buckets", () => {
+    const parsed = parsePingHistory({
+      ...fixture,
+      series: [
+        { target_id: 10, latency: [20, null, 22], loss: [0, null, 1] },
+        { target_id: 11, latency: [40, 41, null], loss: [0.25, 0.5, 1] },
+      ],
+    });
+    expect(parsed?.series[0].loss).toEqual([0, null, 1]);
+    expect(parsed?.series[1].loss).toEqual([0.25, 0.5, 1]);
+    // Latency keeps behaving exactly as before alongside loss.
+    expect(parsed?.series[0].latency).toEqual([20, null, 22]);
+  });
+
+  it("rejects loss values outside the 0..1 ratio, wrong lengths, and absent arrays", () => {
+    for (const loss of [
+      [0, null, -0.01],
+      [0, null, 1.01],
+      [0, null, Number.NaN],
+      [0, null, Number.POSITIVE_INFINITY],
+      [0, null, "0.25"],
+      [0, null],
+      [0, null, 0, 0],
+      "0",
+      null,
+    ]) {
+      expect(parsePingHistory({
+        ...fixture,
+        series: [{ target_id: 10, latency: [20, null, 22], loss }, fixture.series[1]],
+      })).toBeNull();
+    }
+    // A missing loss array is a rejected payload, never silently filled with nulls.
+    expect(parsePingHistory({
+      ...fixture,
+      series: [{ target_id: 10, latency: [20, null, 22] }, fixture.series[1]],
+    })).toBeNull();
+  });
+
   it("rejects length mismatch, unknown target, and negative latency", () => {
     expect(parsePingHistory({
       ...fixture,
-      series: [{ target_id: 10, latency: [20] }, fixture.series[1]],
+      series: [{ target_id: 10, latency: [20], loss: [0] }, fixture.series[1]],
     })).toBeNull();
     expect(parsePingHistory({
       ...fixture,
-      series: [{ target_id: 99, latency: [20, null, 22] }, fixture.series[1]],
+      series: [{ target_id: 99, latency: [20, null, 22], loss: [0, null, 0] }, fixture.series[1]],
     })).toBeNull();
     expect(parsePingHistory({
       ...fixture,
-      series: [{ target_id: 10, latency: [20, -1, 22] }, fixture.series[1]],
+      series: [{ target_id: 10, latency: [20, -1, 22], loss: [0, null, 0] }, fixture.series[1]],
     })).toBeNull();
     expect(parsePingHistory({
       ...fixture,
@@ -143,11 +183,26 @@ it("keeps the six frozen dash identities stable", () => {
 it("keeps an all-null target in its fixed style slot and data order", () => {
   const history: PingHistory = {
     ...fixture,
-    series: [fixture.series[0], { target_id: 11, latency: [null, null, null] }],
+    series: [
+      fixture.series[0],
+      { target_id: 11, latency: [null, null, null], loss: [1, 1, 1] },
+    ],
   };
   const data = pingAlignedData(history, true, { start: 0, end: 2 });
   expect(data[2]).toEqual([null, null, null]);
   expect(data).toHaveLength(3);
+});
+
+it("shows loss ratios as percentages and reads the latest sample of a series", () => {
+  expect([0, 0.025, 0.1, 0.5, 1].map(formatLossPercent)).toEqual([
+    "0%",
+    "2.5%",
+    "10%",
+    "50%",
+    "100%",
+  ]);
+  expect(latestValue([20, null, 22, null])).toBe(22);
+  expect(latestValue([null, null])).toBeNull();
 });
 
 it("rejects stale ping request generations", () => {

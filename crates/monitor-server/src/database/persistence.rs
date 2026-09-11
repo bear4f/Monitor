@@ -1721,12 +1721,18 @@ pub(super) fn query_ping_history(
     to: i64,
     step: i64,
 ) -> Result<Vec<PingHistoryPoint>, DatabaseError> {
+    // Packet loss is derived from these counts, never from a NULL latency: the
+    // five-minute step must sum the counts first and divide once, because an
+    // average of per-minute ratios is a different number when the minutes carry
+    // different sample counts.
     let sql = if step == 300 {
         "SELECT t.id, t.name, t.ip_family, t.sort_order,
-                h.bucket_ts, h.latency_ms
+                h.bucket_ts, h.sample_count, h.success_count, h.latency_ms
          FROM ping_targets AS t
          LEFT JOIN (
              SELECT target_id, bucket_ts - bucket_ts % 300 AS bucket_ts,
+                    SUM(sample_count) AS sample_count,
+                    SUM(success_count) AS success_count,
                     CASE WHEN SUM(success_count) = 0 THEN NULL
                          ELSE SUM(COALESCE(latency_avg_ms, 0.0) * success_count)
                               / SUM(success_count)
@@ -1739,7 +1745,7 @@ pub(super) fn query_ping_history(
          ORDER BY t.sort_order, t.id, h.bucket_ts"
     } else {
         "SELECT t.id, t.name, t.ip_family, t.sort_order,
-                h.bucket_ts, h.latency_avg_ms
+                h.bucket_ts, h.sample_count, h.success_count, h.latency_avg_ms
          FROM ping_targets AS t
          LEFT JOIN ping_history AS h
            ON h.target_id = t.id AND h.node_id = ?1
@@ -1761,7 +1767,9 @@ pub(super) fn query_ping_history(
                 ip_family: row.get(2)?,
                 sort_order: row.get(3)?,
                 bucket_ts: row.get(4)?,
-                latency_ms: row.get(5)?,
+                sample_count: row.get(5)?,
+                success_count: row.get(6)?,
+                latency_ms: row.get(7)?,
             })
         })
         .map_err(|source| DatabaseError::Sql {

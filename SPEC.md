@@ -96,6 +96,7 @@ CPU 使用率和网络速率由相邻采样的 counter delta 计算。首次采�
 - Agent 通过 `X-Monitor-Config-Version: 2` 请求 config protocol 2；老 Server 忽略该 header 并回复 protocol 1，Agent 两者都接受。report 线协议仍固定为 1。
 - 上报项只包含 `target_id`、`success`、`latency_ms`。成功时 latency 为非负数；失败/超时时必须是 `null`，禁止用 `0` 代替。
 - Agent 不排队补传历史 Ping。Server 按收到时间写入当前分钟的内存聚合器，每分钟持久化平均/最小/最大延迟与成功/总样本数。
+- 丢包 = 失败样本数 / 总样本数，以 0..1 比例暴露（不是百分比整数），与 latency 同源于 `sample_count`/`success_count`；样本数为 0 时为 null，不由 `latency == null` 推断。不引入可用率/SLA 语义。
 - 图表断点使用 `null`，uPlot 的 `spanGaps` 保持关闭，失败区间不能连到 0 ms。
 - “削峰”仅在浏览器显示层生成裁剪后的 series，API 和数据库原始聚合值不变；tooltip 同时保留原始值标识。
 

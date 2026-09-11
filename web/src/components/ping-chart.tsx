@@ -14,7 +14,8 @@ import { formatAxisTime, formatTooltipTime, timeAxisSplits } from "../lib/histor
 import {
   clampViewport,
   fullViewport,
-  latestLatency,
+  formatLossPercent,
+  latestValue,
   niceLatencyScale,
   pingAlignedData,
   pingSeriesColor,
@@ -421,7 +422,8 @@ function PingLegend({ history, colors }: { history: PingHistory; colors: readonl
   return (
     <ul className="ping-legend" aria-label="延迟监控线路">
       {history.targets.map((target, index) => {
-        const latest = latestLatency(history.series[index].latency);
+        const latest = latestValue(history.series[index].latency);
+        const loss = latestValue(history.series[index].loss);
         const style = { "--ping-color": colors[index] } as CSSProperties;
         return (
           <li className="ping-legend-item" style={style} key={target.id}>
@@ -430,6 +432,7 @@ function PingLegend({ history, colors }: { history: PingHistory; colors: readonl
             </svg>
             <span>{target.name}</span>
             <span className="ping-legend-latency">{latest === null ? "—" : `${formatLatency(latest)} ms`}</span>
+            {loss !== null && <span className="ping-legend-loss">丢包 {formatLossPercent(loss)}</span>}
           </li>
         );
       })}

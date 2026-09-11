@@ -278,7 +278,13 @@ pub struct PingHistoryPoint {
     pub name: String,
     pub ip_family: i64,
     pub sort_order: i64,
+    /// `None` on every field below means the LEFT JOIN found no bucket for this
+    /// target in the window, which is not the same as a bucket holding no
+    /// samples -- packet loss is unknown in the first case and defined in the
+    /// second, so the two must stay distinguishable.
     pub bucket_ts: Option<i64>,
+    pub sample_count: Option<i64>,
+    pub success_count: Option<i64>,
     pub latency_ms: Option<f64>,
 }
 

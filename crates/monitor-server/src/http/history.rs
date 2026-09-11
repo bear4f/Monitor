@@ -15,11 +15,13 @@ use crate::{
     app::AppState,
     auth::{encode_hex, sha256, unix_timestamp},
     database::{PingHistoryPoint, ResourceHistoryPoint},
+    history::CurrentPingSample,
 };
 
 use super::auth::ApiError;
 
 const HISTORY_CACHE_CONTROL: &str = "public, max-age=30";
+const MINUTE_STEP: i64 = 60;
 
 #[derive(Clone, Copy)]
 struct HistoryRange {
@@ -69,6 +71,87 @@ struct PingTargetResponse {
 struct PingSeries {
     target_id: i64,
     latency: Vec<Option<f64>>,
+    /// Failed samples over total samples, as a 0..=1 ratio, one entry per
+    /// timestamp. `null` means no bucket, not a bucket without loss.
+    loss: Vec<Option<f64>>,
+}
+
+/// One bucket's sample population. Latency is the success-weighted mean of that
+/// population, kept as a value rather than recomputed from a weight sum so a
+/// single-source bucket reports exactly what was stored.
+#[derive(Clone, Copy)]
+struct BucketTotals {
+    sample_count: i64,
+    success_count: i64,
+    latency_ms: Option<f64>,
+}
+
+impl BucketTotals {
+    fn merged(self, other: Self) -> Self {
+        let success_count = self.success_count.saturating_add(other.success_count);
+        let latency_ms = match (self.latency_ms, other.latency_ms) {
+            (Some(mine), Some(theirs)) if success_count > 0 => Some(
+                (mine * self.success_count as f64 + theirs * other.success_count as f64)
+                    / success_count as f64,
+            ),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            _ => None,
+        };
+        Self {
+            sample_count: self.sample_count.saturating_add(other.sample_count),
+            success_count,
+            latency_ms,
+        }
+    }
+
+    fn latency(&self) -> Option<f64> {
+        (self.success_count > 0)
+            .then_some(self.latency_ms)
+            .flatten()
+    }
+
+    fn loss(&self) -> Option<f64> {
+        (self.sample_count > 0).then(|| {
+            ((self.sample_count - self.success_count) as f64 / self.sample_count as f64)
+                .clamp(0.0, 1.0)
+        })
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct BucketSlot {
+    persisted: Option<BucketTotals>,
+    current: Option<BucketTotals>,
+}
+
+impl BucketSlot {
+    fn add_persisted(&mut self, totals: BucketTotals) {
+        self.persisted = Some(match self.persisted {
+            Some(existing) => existing.merged(totals),
+            None => totals,
+        });
+    }
+
+    fn add_current(&mut self, totals: BucketTotals) {
+        self.current = Some(match self.current {
+            Some(existing) => existing.merged(totals),
+            None => totals,
+        });
+    }
+
+    fn totals(&self, step: i64) -> Option<BucketTotals> {
+        match (self.persisted, self.current) {
+            // At minute granularity the open minute IS the bucket: a persisted row
+            // for the same minute would be the same samples seen twice, so the
+            // still-open state wins instead of being added to it.
+            (_, Some(current)) if step == MINUTE_STEP => Some(current),
+            // A wider bucket holds other, already-completed minutes, so the open
+            // minute joins them once and the ratio comes from the combined counts.
+            (Some(persisted), Some(current)) => Some(persisted.merged(current)),
+            (Some(totals), None) | (None, Some(totals)) => Some(totals),
+            (None, None) => None,
+        }
+    }
 }
 
 pub(super) async fn resource(
@@ -109,7 +192,10 @@ pub(super) async fn ping(
         .query_ping_history(node_id, from, to, range.step)
         .await
         .map_err(ApiError::database)?;
-    let (targets, timestamps, series) = dense_ping_series(from, to, range.step, points);
+    // Read the open minute after the database, never before: a minute finalized
+    // while the query ran is already in the rows above and has left `current`.
+    let current = state.history.current_ping_samples(node_id);
+    let (targets, timestamps, series) = dense_ping_series(from, to, range.step, points, current);
     let response = PingHistoryResponse {
         node_id: public_id,
         from,
@@ -216,6 +302,7 @@ fn dense_ping_series(
     to: i64,
     step: i64,
     points: Vec<PingHistoryPoint>,
+    current: Vec<CurrentPingSample>,
 ) -> (Vec<PingTargetResponse>, Vec<i64>, Vec<PingSeries>) {
     let timestamps = aligned_timestamps(from, to, step);
     let positions: HashMap<_, _> = timestamps
@@ -224,7 +311,7 @@ fn dense_ping_series(
         .map(|(index, timestamp)| (*timestamp, index))
         .collect();
     let mut targets = Vec::new();
-    let mut series: Vec<PingSeries> = Vec::new();
+    let mut slots: Vec<Vec<BucketSlot>> = Vec::new();
     let mut target_indexes = HashMap::new();
     for point in points {
         let index = *target_indexes.entry(point.target_id).or_insert_with(|| {
@@ -235,18 +322,53 @@ fn dense_ping_series(
                 ip_family: point.ip_family,
                 sort_order: point.sort_order,
             });
-            series.push(PingSeries {
-                target_id: point.target_id,
-                latency: vec![None; timestamps.len()],
-            });
+            slots.push(vec![BucketSlot::default(); timestamps.len()]);
             index
         });
         if let Some(bucket_ts) = point.bucket_ts
+            && let Some(sample_count) = point.sample_count
             && let Some(position) = positions.get(&bucket_ts)
         {
-            series[index].latency[*position] = point.latency_ms;
+            slots[index][*position].add_persisted(BucketTotals {
+                sample_count,
+                success_count: point.success_count.unwrap_or(0),
+                latency_ms: point.latency_ms,
+            });
         }
     }
+    // The open minute only fills buckets of targets this window already reports;
+    // which targets appear, and in what order, stays the query's decision.
+    for sample in current {
+        let Some(index) = target_indexes.get(&sample.target_id).copied() else {
+            continue;
+        };
+        let bucket_ts = sample.bucket_ts - sample.bucket_ts.rem_euclid(step);
+        if let Some(position) = positions.get(&bucket_ts) {
+            slots[index][*position].add_current(BucketTotals {
+                sample_count: sample.sample_count,
+                success_count: sample.success_count,
+                latency_ms: sample.latency_avg_ms,
+            });
+        }
+    }
+    let series = targets
+        .iter()
+        .zip(slots)
+        .map(|(target, buckets)| {
+            let mut latency = Vec::with_capacity(timestamps.len());
+            let mut loss = Vec::with_capacity(timestamps.len());
+            for slot in buckets {
+                let totals = slot.totals(step);
+                latency.push(totals.and_then(|totals| totals.latency()));
+                loss.push(totals.and_then(|totals| totals.loss()));
+            }
+            PingSeries {
+                target_id: target.id,
+                latency,
+                loss,
+            }
+        })
+        .collect();
     (targets, timestamps, series)
 }
 
@@ -305,8 +427,11 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::database::{
-        Database, NewNodeRow, PingHistoryWriteRow, ResourceHistoryWriteRow, hydrate_startup,
+    use crate::{
+        database::{
+            Database, NewNodeRow, PingHistoryWriteRow, ResourceHistoryWriteRow, hydrate_startup,
+        },
+        history::{PingSample, ResourceSample},
     };
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -475,6 +600,40 @@ mod tests {
         assert_eq!(series.memory, vec![Some(10), None, None]);
     }
 
+    fn bucket(
+        target_id: i64,
+        bucket_ts: Option<i64>,
+        counts: Option<(i64, i64)>,
+        latency_ms: Option<f64>,
+    ) -> PingHistoryPoint {
+        PingHistoryPoint {
+            target_id,
+            name: format!("target-{target_id}"),
+            ip_family: 4,
+            sort_order: target_id,
+            bucket_ts,
+            sample_count: counts.map(|(samples, _)| samples),
+            success_count: counts.map(|(_, successes)| successes),
+            latency_ms,
+        }
+    }
+
+    fn current(
+        target_id: i64,
+        bucket_ts: i64,
+        sample_count: i64,
+        success_count: i64,
+        latency_avg_ms: Option<f64>,
+    ) -> CurrentPingSample {
+        CurrentPingSample {
+            bucket_ts,
+            target_id,
+            sample_count,
+            success_count,
+            latency_avg_ms,
+        }
+    }
+
     #[test]
     fn ping_axis_and_target_order_follow_query_rows() {
         let (targets, timestamps, series) = dense_ping_series(
@@ -482,23 +641,10 @@ mod tests {
             600,
             300,
             vec![
-                PingHistoryPoint {
-                    target_id: 2,
-                    name: "v6".into(),
-                    ip_family: 6,
-                    sort_order: 0,
-                    bucket_ts: Some(0),
-                    latency_ms: Some(20.0),
-                },
-                PingHistoryPoint {
-                    target_id: 3,
-                    name: "v4".into(),
-                    ip_family: 4,
-                    sort_order: 1,
-                    bucket_ts: None,
-                    latency_ms: None,
-                },
+                bucket(2, Some(0), Some((4, 4)), Some(20.0)),
+                bucket(3, None, None, None),
             ],
+            Vec::new(),
         );
         assert_eq!(timestamps, vec![0, 300]);
         assert_eq!(
@@ -507,6 +653,124 @@ mod tests {
         );
         assert_eq!(series[0].latency, vec![Some(20.0), None]);
         assert_eq!(series[1].latency, vec![None, None]);
+        // A target with no bucket at all reports unknown loss, not zero loss.
+        assert_eq!(series[1].loss, vec![None, None]);
+    }
+
+    #[test]
+    fn minute_loss_is_failed_over_total_samples() {
+        let (_, timestamps, series) = dense_ping_series(
+            0,
+            240,
+            60,
+            vec![
+                bucket(1, Some(0), Some((4, 4)), Some(10.0)),
+                bucket(1, Some(60), Some((4, 3)), Some(12.0)),
+                bucket(1, Some(120), Some((4, 0)), None),
+            ],
+            Vec::new(),
+        );
+        assert_eq!(timestamps, vec![0, 60, 120, 180]);
+        assert_eq!(series[0].loss, vec![Some(0.0), Some(0.25), Some(1.0), None]);
+        // An all-failed bucket is real data: loss 1.0 with no latency to report.
+        assert_eq!(
+            series[0].latency,
+            vec![Some(10.0), Some(12.0), None, None],
+            "latency stays the stored success-weighted mean"
+        );
+        assert_eq!(series[0].loss.len(), timestamps.len());
+        assert_eq!(series[0].latency.len(), timestamps.len());
+    }
+
+    #[test]
+    fn five_minute_loss_divides_summed_counts_once() {
+        // What the five-minute query returns for minutes 1/0 and 9/9: summed, not
+        // averaged. Averaging the two per-minute ratios would give 0.5.
+        let (_, _, series) = dense_ping_series(
+            0,
+            300,
+            300,
+            vec![bucket(1, Some(0), Some((10, 9)), Some(10.0))],
+            Vec::new(),
+        );
+        assert_eq!(series[0].loss, vec![Some(0.1)]);
+    }
+
+    #[test]
+    fn the_open_minute_wins_its_own_minute_instead_of_being_added() {
+        let (_, _, series) = dense_ping_series(
+            0,
+            120,
+            60,
+            vec![bucket(1, Some(0), Some((4, 4)), Some(10.0))],
+            vec![current(1, 0, 4, 2, Some(30.0))],
+        );
+        // Adding both would report 8 samples and 6 successes, so loss 0.25.
+        assert_eq!(series[0].loss, vec![Some(0.5), None]);
+        assert_eq!(series[0].latency, vec![Some(30.0), None]);
+    }
+
+    #[test]
+    fn the_open_minute_joins_persisted_minutes_of_the_same_five_minute_bucket() {
+        let (_, _, series) = dense_ping_series(
+            0,
+            300,
+            300,
+            vec![bucket(1, Some(0), Some((9, 9)), Some(10.0))],
+            vec![current(1, 240, 1, 1, Some(100.0))],
+        );
+        // Success-weighted, not two equal observations: (9*10 + 1*100) / 10.
+        assert_eq!(series[0].latency, vec![Some(19.0)]);
+        assert_eq!(series[0].loss, vec![Some(0.0)]);
+
+        let (_, _, unequal) = dense_ping_series(
+            0,
+            300,
+            300,
+            vec![bucket(1, Some(0), Some((1, 0)), None)],
+            vec![current(1, 240, 9, 9, Some(5.0))],
+        );
+        // (10 - 9) / 10, never (1.0 + 0.0) / 2.
+        assert_eq!(unequal[0].loss, vec![Some(0.1)]);
+        assert_eq!(unequal[0].latency, vec![Some(5.0)]);
+    }
+
+    #[test]
+    fn open_minute_samples_for_unreported_targets_and_windows_are_ignored() {
+        let (targets, _, series) = dense_ping_series(
+            0,
+            120,
+            60,
+            vec![bucket(1, None, None, None)],
+            vec![
+                current(1, 60, 2, 1, Some(4.0)),
+                // A target the query did not report: target metadata stays the
+                // query's decision, so this sample has nowhere to land.
+                current(7, 60, 2, 0, None),
+                // Outside the window entirely.
+                current(1, 600, 3, 0, None),
+            ],
+        );
+        assert_eq!(
+            targets.iter().map(|target| target.id).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(series.len(), 1);
+        assert_eq!(series[0].loss, vec![None, Some(0.5)]);
+        assert_eq!(series[0].latency, vec![None, Some(4.0)]);
+    }
+
+    #[test]
+    fn a_zero_sample_open_minute_reports_unknown_loss() {
+        let (_, _, series) = dense_ping_series(
+            0,
+            120,
+            60,
+            vec![bucket(1, None, None, None)],
+            vec![current(1, 0, 0, 0, None)],
+        );
+        assert_eq!(series[0].loss, vec![None, None]);
+        assert_eq!(series[0].latency, vec![None, None]);
     }
 
     #[tokio::test]
@@ -597,6 +861,110 @@ mod tests {
         assert_eq!(value["targets"][1]["id"], 1);
         assert_eq!(value["series"][0]["target_id"], 2);
         assert_eq!(value["timestamps"].as_array().expect("axis").len(), 2_016);
+        // Disabled-with-history and enabled-without-history targets keep the same
+        // inclusion and ordering they had; loss simply joins each series.
+        for index in 0..2 {
+            assert_eq!(
+                value["series"][index]["loss"]
+                    .as_array()
+                    .expect("loss axis")
+                    .len(),
+                2_016
+            );
+        }
+        let persisted = value["series"][0]["loss"]
+            .as_array()
+            .expect("loss axis")
+            .iter()
+            .filter(|value| !value.is_null())
+            .collect::<Vec<_>>();
+        // The fixture minute is 2 samples with 1 success.
+        assert_eq!(persisted, vec![&json!(0.5)]);
+        assert!(
+            value["series"][1]["loss"]
+                .as_array()
+                .expect("loss axis")
+                .iter()
+                .all(|value| value.is_null())
+        );
+        context.finish().await;
+    }
+
+    #[tokio::test]
+    async fn the_open_minute_reaches_the_endpoint_without_being_persisted() {
+        let context = TestContext::new().await;
+        let now = unix_timestamp().expect("clock");
+        let bucket = (now - 1) - (now - 1).rem_euclid(60);
+        let read = || async {
+            let response = ping(
+                State(context.state.clone()),
+                Path(context.public_id.clone()),
+                context.request("range=1h"),
+            )
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+            let etag = response.headers()[ETAG].clone();
+            let value: Value = serde_json::from_slice(
+                &to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("read ping body"),
+            )
+            .expect("parse ping response");
+            (etag, value)
+        };
+        let slot_of = |value: &Value| {
+            value["timestamps"]
+                .as_array()
+                .expect("axis")
+                .iter()
+                .position(|timestamp| timestamp == &json!(bucket))
+                .expect("open minute is inside the one-hour window")
+        };
+
+        let (first_etag, before) = read().await;
+        let slot = slot_of(&before);
+        assert!(before["series"][1]["loss"][slot].is_null());
+
+        context.state.history.record(
+            context.node_id,
+            now - 1,
+            ResourceSample {
+                cpu_usage: 1.0,
+                load_1: 0.0,
+                load_5: 0.0,
+                load_15: 0.0,
+                memory_used_bytes: 1,
+                swap_used_bytes: 0,
+                disk_used_bytes: 1,
+                rx_rate_bytes_per_sec: 0,
+                tx_rate_bytes_per_sec: 0,
+            },
+            [PingSample {
+                target_id: 1,
+                success: false,
+                latency_ms: None,
+            }],
+        );
+
+        let (second_etag, after) = read().await;
+        let slot = slot_of(&after);
+        // One failed sample in the open minute: total loss, no latency.
+        assert_eq!(after["series"][1]["loss"][slot], json!(1.0));
+        assert!(after["series"][1]["latency"][slot].is_null());
+        assert_ne!(first_etag, second_etag, "a changed body changes the ETag");
+
+        // Nothing was written to SQLite to make that minute queryable.
+        let persisted = context
+            .state
+            .database
+            .query_ping_history(context.node_id, bucket, bucket + 60, 60)
+            .await
+            .expect("query open minute");
+        assert!(
+            persisted
+                .iter()
+                .all(|point| point.bucket_ts.is_none() || point.target_id != 1)
+        );
         context.finish().await;
     }
 

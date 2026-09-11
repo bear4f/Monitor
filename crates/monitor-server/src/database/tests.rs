@@ -856,7 +856,93 @@ async fn history_batch_upsert_is_absolute_and_queries_weighted_five_minute_data(
     assert_eq!(ping[0].latency_ms, Some(25.0));
     assert_eq!(ping[1].target_id, 1);
     assert_eq!(ping[1].bucket_ts, None);
+    // A target with no bucket carries no counts at all, which is how packet loss
+    // stays "unknown" instead of collapsing into "no samples lost".
+    assert_eq!(ping[1].sample_count, None);
+    assert_eq!(ping[1].success_count, None);
 
+    database.shutdown().await.expect("shutdown database");
+}
+
+#[tokio::test]
+async fn ping_history_counts_are_summed_before_any_ratio_is_taken() {
+    let path = TestDatabasePath::new("ping-loss-counts");
+    let database = Database::open(path.as_path()).expect("open database");
+    let node = database
+        .create_node(history_node(&"c".repeat(32)), [3; 32], 1)
+        .await
+        .expect("create node");
+    database
+        .shutdown()
+        .await
+        .expect("close before target fixture");
+    let connection = Connection::open(path.as_path()).expect("open fixture connection");
+    connection
+        .execute(
+            "INSERT INTO ping_targets
+             (id, name, host, ip_family, enabled, sort_order, created_at, updated_at)
+             VALUES (1, 'target', '127.0.0.1', 4, 1, 0, 1, 1)",
+            [],
+        )
+        .expect("insert target fixture");
+    drop(connection);
+    let database = Database::open(path.as_path()).expect("reopen database");
+    database
+        .persist_history_batch(
+            Vec::new(),
+            vec![
+                // Deliberately unequal minutes inside one five-minute bucket.
+                PingHistoryWriteRow {
+                    node_id: node.id,
+                    bucket_ts: 0,
+                    target_id: 1,
+                    sample_count: 1,
+                    success_count: 0,
+                    latency_avg_ms: None,
+                    latency_min_ms: None,
+                    latency_max_ms: None,
+                },
+                PingHistoryWriteRow {
+                    node_id: node.id,
+                    bucket_ts: 60,
+                    target_id: 1,
+                    sample_count: 9,
+                    success_count: 9,
+                    latency_avg_ms: Some(5.0),
+                    latency_min_ms: Some(5.0),
+                    latency_max_ms: Some(5.0),
+                },
+            ],
+        )
+        .await
+        .expect("persist ping fixtures");
+
+    let minutes = database
+        .query_ping_history(node.id, 0, 300, 60)
+        .await
+        .expect("query minute ping history");
+    assert_eq!(
+        minutes
+            .iter()
+            .map(|point| (point.bucket_ts, point.sample_count, point.success_count))
+            .collect::<Vec<_>>(),
+        vec![(Some(0), Some(1), Some(0)), (Some(60), Some(9), Some(9)),],
+        "each stored minute carries its own counts"
+    );
+
+    let five_minutes = database
+        .query_ping_history(node.id, 0, 300, 300)
+        .await
+        .expect("query five-minute ping history");
+    assert_eq!(five_minutes.len(), 1);
+    // (1 - 0)/1 = 1.0 and (9 - 9)/9 = 0.0, so averaging the per-minute ratios
+    // would say 0.5. The summed counts say (10 - 9)/10 = 0.1.
+    assert_eq!(five_minutes[0].sample_count, Some(10));
+    assert_eq!(five_minutes[0].success_count, Some(9));
+    let loss = (10.0 - 9.0) / 10.0;
+    assert_eq!(loss, 0.1);
+    // Latency stays success-weighted across the summed minutes.
+    assert_eq!(five_minutes[0].latency_ms, Some(5.0));
     database.shutdown().await.expect("shutdown database");
 }
 
@@ -920,6 +1006,12 @@ async fn all_failure_ping_stays_null_and_history_cleanup_respects_batch_limit() 
         .await
         .expect("query failure ping");
     assert_eq!(ping[0].latency_ms, None);
+    // A bucket whose samples all failed is real data: three samples, none
+    // successful, which is total loss rather than an absent bucket.
+    assert_eq!(
+        (ping[0].sample_count, ping[0].success_count),
+        (Some(3), Some(0))
+    );
 
     assert_eq!(
         database

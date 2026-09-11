@@ -31,17 +31,35 @@ export function mockPingHistory(nodeId: string, range: HistoryRange): PingHistor
     step,
     targets: TARGETS.map((target) => ({ ...target })),
     timestamps,
-    series: TARGETS.map((target, targetIndex) => ({
-      target_id: target.id,
-      latency: timestamps.map((_, index) => {
-        const gapStart = 12 + targetIndex * 3;
-        if ((index >= gapStart && index < gapStart + 3) || (targetIndex === 4 && index % 97 === 0)) return null;
-        if (targetIndex === 0 && index === Math.floor(timestamps.length * 0.62)) return 920;
-        if (targetIndex === 3 && index === Math.floor(timestamps.length * 0.31)) return 410;
-        const wave = Math.sin(index / (4.5 + targetIndex)) * (2.2 + targetIndex * 0.55);
-        const ripple = Math.cos(index / 17) * 1.4;
-        return Number((baselines[targetIndex] + wave + ripple).toFixed(1));
-      }),
-    })),
+    series: TARGETS.map((target, targetIndex) => {
+      const gapStart = 12 + targetIndex * 3;
+      const latency: (number | null)[] = [];
+      const loss: (number | null)[] = [];
+      timestamps.forEach((_, index) => {
+        // A gap is a bucket that never existed: latency and loss are both unknown.
+        if (index >= gapStart && index < gapStart + 3) {
+          latency.push(null);
+          loss.push(null);
+          return;
+        }
+        // Samples that all failed: no latency to show, and total loss.
+        if (targetIndex === 4 && index % 97 === 0) {
+          latency.push(null);
+          loss.push(1);
+          return;
+        }
+        if (targetIndex === 0 && index === Math.floor(timestamps.length * 0.62)) {
+          latency.push(920);
+        } else if (targetIndex === 3 && index === Math.floor(timestamps.length * 0.31)) {
+          latency.push(410);
+        } else {
+          const wave = Math.sin(index / (4.5 + targetIndex)) * (2.2 + targetIndex * 0.55);
+          const ripple = Math.cos(index / 17) * 1.4;
+          latency.push(Number((baselines[targetIndex] + wave + ripple).toFixed(1)));
+        }
+        loss.push(index % 53 === 0 ? 0.25 : 0);
+      });
+      return { target_id: target.id, latency, loss };
+    }),
   };
 }
