@@ -252,8 +252,8 @@ ALTER TABLE ping_targets ADD COLUMN port INTEGER
 会放过没有端口的 TCP 目标。
 
 既有行由 SQLite 套用声明的默认值：所有 node 为 `monthly`，所有 ping target 为 `icmp` 且
-`port IS NULL`，行为与 v0.1.2 完全一致。这一层只是存储基础，`never` 的账期语义与 TCP 探测
-行为分别在后续 commit 实现。
+`port IS NULL`，行为与 v0.1.2 完全一致。`never` 的账期语义与 TCP 探测行为建立在这一层之上，
+不再需要新的 schema 变更。
 
 ## 4. 表职责与保留策略
 

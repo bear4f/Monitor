@@ -347,9 +347,10 @@ Header：`Authorization: Bearer <64-char-lowercase-hex-token>`。token 包含 32
 
 Authentication：Agent Bearer。  
 CSRF：否。  
-Request body/query：无。
+Request body/query：无。  
+Request header：`X-Monitor-Config-Version: 2`（可选）。只有值恰好为 `2` 时返回 config protocol 2；缺失、其它值或 `02` 都按 protocol 1 处理。
 
-#### 200 response
+#### 200 response（protocol 1，默认）
 
 ```json
 {
@@ -363,7 +364,23 @@ Request body/query：无。
 }
 ```
 
-只返回 enabled targets，最多 6 个，按 sort order。配置来自内存 `AgentConfigCache`，不为每个 Agent 请求 SQLite。
+protocol 1 只返回 `probe_kind = icmp` 的 target，且 target 对象不含 `probe_kind`、`port` 或任何占位字段——老 Agent 用 `deny_unknown_fields` 解析，多一个字段就会失败。
+
+#### 200 response（protocol 2）
+
+```json
+{
+  "protocol_version": 2,
+  "report_interval_seconds": 2,
+  "ping_interval_seconds": 15,
+  "targets": [
+    { "id": 1, "name": "电信 v4", "host": "203.0.113.1", "ip_family": 4, "probe_kind": "icmp", "port": null },
+    { "id": 3, "name": "HTTPS", "host": "203.0.113.9", "ip_family": 4, "probe_kind": "tcp", "port": 443 }
+  ]
+}
+```
+
+两种版本都只返回 enabled targets，最多 6 个，按 sort order。配置来自内存 `AgentConfigCache`，不为每个 Agent 请求 SQLite。report 线协议与 config 协议无关，始终为 1。
 
 Status：200；401 `unauthorized`。
 
@@ -614,13 +631,17 @@ Status：200；401；403；404；503。
   "id": 1,
   "name": "电信 v4",
   "host": "203.0.113.1",
+  "port": null,
   "ip_family": 4,
+  "probe_kind": "icmp",
   "enabled": true,
   "sort_order": 0
 }
 ```
 
-`host` 只能是 IP literal 或合法 DNS hostname，不允许 scheme、port、path、空白或 shell 字符语义；Agent 使用 socket API，不拼接命令行。
+`probe_kind` 为 `icmp` 或 `tcp`。`icmp` 的 `port` 必须为 null；`tcp` 的 `port` 必须为 1–65535。`host` 只能是 IP literal 或合法 DNS hostname，不允许 scheme、path、空白或 shell 字符语义；Agent 使用 socket API，不拼接命令行，也不调用 `ping`/`nc`/`curl` 等外部程序。
+
+写入用单个 `target` 字符串，由 Server 唯一解析：`icmp` 只接受裸 host（含裸 IPv6 literal，不接受方括号）；`tcp` 接受 `host:port`，IPv6 literal 必须写作 `[2001:db8::1]:443`。响应把它拆成 `host` 与 `port` 返回。
 
 ### 9.2 `GET /api/admin/ping-targets`
 
@@ -636,8 +657,9 @@ Request：
 
 ```json
 {
-  "name": "电信 v4",
-  "host": "203.0.113.1",
+  "name": "HTTPS",
+  "target": "203.0.113.9:443",
+  "probe_kind": "tcp",
   "ip_family": 4,
   "enabled": true
 }
@@ -645,14 +667,15 @@ Request：
 
 sort order 自动追加。201 response：`{"target": {...}}`。
 
-Validation：name 1–64；host 1–253 且格式合法；family 4/6；enabled boolean。启用后全站 enabled target 总数不得超过 6。
+Validation：name 1–64；`probe_kind` 为 `icmp`/`tcp`；`target` 不接受首尾空白，必须能按该 probe kind 与 family 解析；family 4/6；enabled boolean。启用后全站 enabled target 总数不得超过 6。同一 host 上不同 TCP port、或同一 host 同时配置 ICMP 与 TCP，都是不同 target。
 
 Status：201；400；401；403；409；413；415；503。
 
 ### 9.4 `PATCH /api/admin/ping-targets/:id`
 
 Authentication：Admin session。CSRF：是。  
-Request：以上任意字段及 `sort_order`，至少一个；null 不合法。  
+Request：`name`、`target`、`probe_kind`、`ip_family`、`enabled`、`sort_order` 中任意一个或多个；null 不合法。  
+校验按“改完之后的最终状态”进行：只改 `probe_kind` 而留下不匹配的 host/port 会返回 400，例如 ICMP 目标直接切成 TCP 却没有给出端口。  
 200 response：`{"target": {...}}`。
 
 修改/禁用后同步更新 AgentConfigCache；既有历史仍按同一 target id 展示。Status：200；400；401；403；404；409；413；415；503。

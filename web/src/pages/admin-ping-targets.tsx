@@ -7,12 +7,17 @@ import {
   canEnablePingTarget,
   createPingTarget,
   deletePingTarget,
+  formatPingTargetEndpoint,
   listPingTargets,
   pingTargetMutationMessage,
   PingTarget,
+  ProbeKind,
+  probeKindLabel,
+  PROBE_KINDS,
+  retargetForProbeKind,
   targetSortOrder,
   updatePingTarget,
-  validatePingTargetHost,
+  validatePingTargetEndpoint,
 } from "../api/admin";
 import { handleAdminError } from "../stores/auth";
 import { Button } from "../ui/primitives";
@@ -110,7 +115,7 @@ export function AdminPingTargetsPage() {
               <th aria-label="排序" />
               <th>名称</th>
               <th>目标</th>
-              <th>协议</th>
+              <th>探测方式</th>
               <th>状态</th>
               <th>操作</th>
             </tr>
@@ -219,6 +224,7 @@ function TargetRow({
   onEdit: () => void;
   onDelete: () => void;
 }) {
+  const endpoint = formatPingTargetEndpoint(target);
   return (
     <tr onDragOver={(event) => event.preventDefault()} onDrop={onDrop}>
       <td className="sort-cell">
@@ -253,8 +259,11 @@ function TargetRow({
       <td>
         <strong className="admin-node-name" title={target.name}>{target.name}</strong>
       </td>
-      <td className="admin-target-host" title={target.host}>{target.host}</td>
-      <td>IPv{target.ip_family}</td>
+      <td className="admin-target-host" title={endpoint}>{endpoint}</td>
+      <td>
+        <span className="probe-tag">{probeKindLabel(target.probe_kind)}</span>
+        <span className="probe-family">IPv{target.ip_family}</span>
+      </td>
       <td><span className={`admin-status ${target.enabled ? "online" : "offline"}`}>{target.enabled ? "启用" : "停用"}</span></td>
       <td>
         <div className="row-actions">
@@ -286,7 +295,10 @@ function TargetDialog({
   serverError?: string | null;
 }) {
   const [name, setName] = useState(target?.name ?? "");
-  const [host, setHost] = useState(target?.host ?? "");
+  const [endpoint, setEndpoint] = useState(
+    target ? formatPingTargetEndpoint(target) : "",
+  );
+  const [probeKind, setProbeKind] = useState<ProbeKind>(target?.probe_kind ?? "icmp");
   const [family, setFamily] = useState<4 | 6>(target?.ip_family ?? 4);
   const [enabled, setEnabled] = useState(target?.enabled ?? defaultEnabled);
   const [formError, setFormError] = useState<string | null>(null);
@@ -294,13 +306,15 @@ function TargetDialog({
     event.preventDefault();
     setFormError(null);
     const normalizedName = name.trim();
-    const normalizedHost = host.trim();
+    const normalizedEndpoint = endpoint.trim();
     if (normalizedName.length < 1 || normalizedName.length > 64) {
       setFormError("名称长度需为 1–64 个字符");
       return;
     }
-    if (!validatePingTargetHost(normalizedHost)) {
-      setFormError("目标地址格式无效");
+    if (!validatePingTargetEndpoint(probeKind, normalizedEndpoint)) {
+      setFormError(
+        probeKind === "tcp" ? "TCP 目标需填写 host:port" : "目标地址格式无效",
+      );
       return;
     }
     if (!target && enabled && !canEnablePingTarget(enabledCount, false)) {
@@ -311,14 +325,26 @@ function TargetDialog({
       setFormError("最多只能启用 6 个延迟监控目标");
       return;
     }
-    const form = { name: normalizedName, host: normalizedHost, ip_family: family, enabled };
+    const form = {
+      name: normalizedName,
+      target: normalizedEndpoint,
+      probe_kind: probeKind,
+      ip_family: family,
+      enabled,
+    };
     await onSubmit(target ? buildPingTargetPatch(target, form) : form);
   };
   return (
     <Dialog title={title} onClose={onClose}>
       <form onSubmit={submit} className="node-form">
         <label>名称<input value={name} onChange={(event) => setName(event.target.value)} autoFocus /></label>
-        <label>目标地址<input value={host} onChange={(event) => setHost(event.target.value)} placeholder="hostname / IP" /></label>
+        <label>探测方式<select value={probeKind} onChange={(event) => {
+          const kind = event.target.value as ProbeKind;
+          setProbeKind(kind);
+          setEndpoint((current) => retargetForProbeKind(kind, current));
+        }}>{PROBE_KINDS.map((kind) => <option key={kind} value={kind}>{probeKindLabel(kind)}</option>)}</select></label>
+        <label>目标地址<input value={endpoint} onChange={(event) => setEndpoint(event.target.value)} placeholder={probeKind === "tcp" ? "hostname:port / IP:port" : "hostname / IP"} /></label>
+        <p className="field-note">{probeKind === "tcp" ? "TCP 探测只测量建立连接的耗时；IPv6 字面量需写作 [2001:db8::1]:443。" : "ICMP 探测使用 Echo 请求，无需端口。"}</p>
         <label>IP 协议<select value={family} onChange={(event) => setFamily(Number(event.target.value) as 4 | 6)}><option value={4}>IPv4</option><option value={6}>IPv6</option></select></label>
         <label className="checkbox-label"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />启用</label>
         {(formError || serverError) && <div className="form-error" role="alert">{formError ?? serverError}</div>}

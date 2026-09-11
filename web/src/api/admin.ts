@@ -55,11 +55,15 @@ export interface NodeConfig {
   renewal_cycle: RenewalCycle | null;
   expires_at: number | null;
 }
+export type ProbeKind = "icmp" | "tcp";
+export const PROBE_KINDS: readonly ProbeKind[] = ["icmp", "tcp"];
 export interface PingTarget {
   id: number;
   name: string;
   host: string;
+  port: number | null;
   ip_family: 4 | 6;
+  probe_kind: ProbeKind;
   enabled: boolean;
   sort_order: number;
 }
@@ -355,6 +359,14 @@ export function parseRotateTokenResponse(value: unknown): {
   return { agent_token: item.agent_token };
 }
 
+function isProbeKind(value: unknown): value is ProbeKind {
+  return value === "icmp" || value === "tcp";
+}
+function isProbePort(kind: ProbeKind, port: unknown): boolean {
+  return kind === "tcp"
+    ? isSafeInt(port, true) && port <= 65535
+    : port === null;
+}
 export function parsePingTarget(value: unknown): PingTarget {
   const item = object(value);
   if (
@@ -366,11 +378,25 @@ export function parsePingTarget(value: unknown): PingTarget {
     characterLength(item.host) < 1 ||
     characterLength(item.host) > 253 ||
     (item.ip_family !== 4 && item.ip_family !== 6) ||
+    !isProbeKind(item.probe_kind) ||
+    !isProbePort(item.probe_kind, item.port) ||
     typeof item.enabled !== "boolean" ||
     !isSafeInt(item.sort_order)
   )
     throw new Error("invalid ping target");
   return item as unknown as PingTarget;
+}
+export function probeKindLabel(kind: ProbeKind): string {
+  return kind === "tcp" ? "TCP" : "ICMP";
+}
+// One endpoint string, exactly as the API accepts it: a bare host for ICMP,
+// `host:port` for TCP with an IPv6 literal bracketed.
+export function formatPingTargetEndpoint(
+  target: Pick<PingTarget, "host" | "port" | "probe_kind">,
+): string {
+  if (target.probe_kind !== "tcp" || target.port === null) return target.host;
+  const host = target.host.includes(":") ? `[${target.host}]` : target.host;
+  return `${host}:${target.port}`;
 }
 export function canEnablePingTarget(
   enabledCount: number,
@@ -379,7 +405,8 @@ export function canEnablePingTarget(
   return originalEnabled || enabledCount < 6;
 }
 export function pingTargetMutationMessage(status: number): string | null {
-  if (status === 400) return "目标配置无效，请检查名称、目标地址和 IP 协议";
+  if (status === 400)
+    return "目标配置无效，请检查名称、探测方式和目标地址（TCP 需 host:port）";
   if (status === 409) return "最多只能启用 6 个延迟监控目标";
   return null;
 }
@@ -500,15 +527,53 @@ export function validatePingTargetHost(value: string): boolean {
     !/[\/?#]/.test(host)
   );
 }
+function splitTcpEndpoint(value: string): { host: string; port: string } | null {
+  const separator = value.lastIndexOf(":");
+  if (separator < 1) return null;
+  const host = value.slice(0, separator);
+  // A bare IPv6 literal has colons of its own; only a bracketed host or a
+  // colon-free host can carry a port here.
+  if (!(host.startsWith("[") && host.endsWith("]")) && host.includes(":")) return null;
+  return { host: host.replace(/^\[|\]$/g, ""), port: value.slice(separator + 1) };
+}
+// A dialog-level sanity check, not a second parser: the Server decides whether
+// an endpoint is usable, and its 400 is what the dialog shows when it refuses.
+export function validatePingTargetEndpoint(kind: ProbeKind, value: string): boolean {
+  const endpoint = value.trim();
+  if (kind === "icmp") return validatePingTargetHost(endpoint);
+  const parts = splitTcpEndpoint(endpoint);
+  if (parts === null) return false;
+  return (
+    validatePingTargetHost(parts.host) &&
+    /^[1-9][0-9]{0,4}$/.test(parts.port) &&
+    Number(parts.port) <= 65535
+  );
+}
+// Switching a form to ICMP drops a port the endpoint no longer has room for,
+// so the field keeps matching the kind the user just picked.
+export function retargetForProbeKind(kind: ProbeKind, value: string): string {
+  const endpoint = value.trim();
+  if (kind === "tcp") return endpoint;
+  const parts = splitTcpEndpoint(endpoint);
+  return parts !== null && /^[0-9]+$/.test(parts.port) ? parts.host : endpoint;
+}
+export interface PingTargetForm {
+  name: string;
+  target: string;
+  probe_kind: ProbeKind;
+  ip_family: 4 | 6;
+  enabled: boolean;
+}
 export function buildPingTargetPatch(
   original: PingTarget,
-  form: Pick<PingTarget, "name" | "host" | "ip_family" | "enabled">,
+  form: PingTargetForm,
 ): Record<string, unknown> {
   const patch: Record<string, unknown> = {};
   const name = form.name.trim();
-  const host = form.host.trim();
+  const target = form.target.trim();
   if (name !== original.name) patch.name = name;
-  if (host !== original.host) patch.host = host;
+  if (target !== formatPingTargetEndpoint(original)) patch.target = target;
+  if (form.probe_kind !== original.probe_kind) patch.probe_kind = form.probe_kind;
   if (form.ip_family !== original.ip_family) patch.ip_family = form.ip_family;
   if (form.enabled !== original.enabled) patch.enabled = form.enabled;
   return patch;

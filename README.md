@@ -2,7 +2,7 @@
 
 Monitor is a small, self-hosted Linux monitoring system: one embedded-web
 Server, outbound-only Linux Agents, resource and traffic history, and optional
-per-node ICMP latency targets. It is single-admin and intentionally has no
+per-node ICMP and TCP latency targets. It is single-admin and intentionally has no
 remote shell, command execution, updater daemon, notifications, plugins,
 multi-user/RBAC, or Docker management.
 
@@ -152,7 +152,9 @@ sudo ./scripts/install-monitor.sh --version v0.1.2 --component agent \
 ```
 
 The Agent unit runs as `monitor-agent:monitor-agent`, has only `CAP_NET_RAW`
-for raw ICMP, and has no inbound listener or command/file-write capability.
+for raw ICMP, and has no inbound listener or command/file-write capability. A
+TCP latency target needs no capability: the Agent measures connection setup and
+closes immediately, without sending or reading anything on the connection.
 If the environment file is not configured, installation leaves the Agent
 stopped and prints only the file path.
 

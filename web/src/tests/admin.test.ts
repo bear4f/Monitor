@@ -22,6 +22,11 @@ import {
   canEnablePingTarget,
   targetSortOrder,
   validatePingTargetHost,
+  validatePingTargetEndpoint,
+  formatPingTargetEndpoint,
+  probeKindLabel,
+  retargetForProbeKind,
+  PROBE_KINDS,
   trafficLimitToForm,
   trafficUnitBytes,
   AdminSettings,
@@ -119,7 +124,9 @@ describe("admin pure helpers", () => {
       id: 1,
       name: "😀".repeat(65),
       host: "example.com",
+      port: null,
       ip_family: 4,
+      probe_kind: "icmp",
       enabled: true,
       sort_order: 0,
     })).toThrow();
@@ -141,10 +148,13 @@ describe("admin pure helpers", () => {
     id: 1,
     name: "电信 v4",
     host: "203.0.113.1",
+    port: null,
     ip_family: 4 as const,
+    probe_kind: "icmp" as const,
     enabled: true,
     sort_order: 0,
   };
+  const tcpTarget = { ...target, probe_kind: "tcp" as const, port: 443 };
   it("parses ping target responses strictly", () => {
     expect(parsePingTarget(target)).toEqual(target);
     expect(parsePingTargets({ targets: [target] }).targets).toHaveLength(1);
@@ -159,13 +169,45 @@ describe("admin pure helpers", () => {
     expect(() => parsePingTargets({ targets: {} })).toThrow();
     expect(() => parsePingTargetResponse({ target: null })).toThrow();
   });
+  it("binds probe kind to the port it requires", () => {
+    expect(parsePingTarget(tcpTarget)).toEqual(tcpTarget);
+    // ICMP carries no port, TCP must carry a usable one, and nothing else is a kind.
+    expect(() => parsePingTarget({ ...target, port: 443 })).toThrow();
+    expect(() => parsePingTarget({ ...tcpTarget, port: null })).toThrow();
+    expect(() => parsePingTarget({ ...tcpTarget, port: 0 })).toThrow();
+    expect(() => parsePingTarget({ ...tcpTarget, port: 65_536 })).toThrow();
+    expect(() => parsePingTarget({ ...tcpTarget, port: 443.5 })).toThrow();
+    expect(() => parsePingTarget({ ...tcpTarget, port: "443" })).toThrow();
+    expect(() => parsePingTarget({ ...target, probe_kind: "http" })).toThrow();
+    expect(() => parsePingTarget({ ...target, probe_kind: "ICMP" })).toThrow();
+    expect(() => parsePingTarget({ ...target, probe_kind: undefined })).toThrow();
+    expect(PROBE_KINDS).toEqual(["icmp", "tcp"]);
+    expect([probeKindLabel("icmp"), probeKindLabel("tcp")]).toEqual(["ICMP", "TCP"]);
+  });
+  it("formats endpoints the API would accept back", () => {
+    expect(formatPingTargetEndpoint(target)).toBe("203.0.113.1");
+    expect(formatPingTargetEndpoint(tcpTarget)).toBe("203.0.113.1:443");
+    expect(formatPingTargetEndpoint({ ...tcpTarget, host: "2001:db8::1" })).toBe(
+      "[2001:db8::1]:443",
+    );
+    expect(formatPingTargetEndpoint({ ...target, host: "2001:db8::1" })).toBe("2001:db8::1");
+  });
+  it("keeps the endpoint field consistent when the probe kind changes", () => {
+    expect(retargetForProbeKind("icmp", "203.0.113.1:443")).toBe("203.0.113.1");
+    expect(retargetForProbeKind("icmp", "[2001:db8::1]:443")).toBe("2001:db8::1");
+    // A bare IPv6 literal keeps every hextet: none of them is a port.
+    expect(retargetForProbeKind("icmp", "2001:db8::1")).toBe("2001:db8::1");
+    expect(retargetForProbeKind("tcp", "203.0.113.1:443")).toBe("203.0.113.1:443");
+  });
   it("enforces the six-enabled target limit without blocking enabled edits", () => {
     expect(canEnablePingTarget(5, false)).toBe(true);
     expect(canEnablePingTarget(6, false)).toBe(false);
     expect(canEnablePingTarget(6, true)).toBe(true);
   });
   it("maps target mutation errors to form-safe messages", () => {
-    expect(pingTargetMutationMessage(400)).toBe("目标配置无效，请检查名称、目标地址和 IP 协议");
+    expect(pingTargetMutationMessage(400)).toBe(
+      "目标配置无效，请检查名称、探测方式和目标地址（TCP 需 host:port）",
+    );
     expect(pingTargetMutationMessage(409)).toBe("最多只能启用 6 个延迟监控目标");
     expect(pingTargetMutationMessage(503)).toBeNull();
   });
@@ -177,10 +219,45 @@ describe("admin pure helpers", () => {
       expect(validatePingTargetHost(value)).toBe(false);
     }
   });
+  it("checks endpoints per probe kind without owning the syntax", () => {
+    expect(validatePingTargetEndpoint("icmp", "2001:db8::1")).toBe(true);
+    expect(validatePingTargetEndpoint("tcp", "example.com:443")).toBe(true);
+    expect(validatePingTargetEndpoint("tcp", "[2001:db8::1]:443")).toBe(true);
+    expect(validatePingTargetEndpoint("tcp", "203.0.113.1:65535")).toBe(true);
+    for (const value of [
+      "example.com",
+      "example.com:",
+      "example.com:0",
+      "example.com:65536",
+      "example.com:0443",
+      "example.com:443x",
+      "2001:db8::1",
+      "https://example.com:443",
+    ]) {
+      expect(validatePingTargetEndpoint("tcp", value)).toBe(false);
+    }
+  });
   it("builds non-destructive target patches and clamps sorting", () => {
-    expect(buildPingTargetPatch(target, { name: target.name, host: target.host, ip_family: 4, enabled: true })).toEqual({});
-    expect(buildPingTargetPatch(target, { name: "new", host: target.host, ip_family: 4, enabled: true })).toEqual({ name: "new" });
-    expect(buildPingTargetPatch(target, { name: target.name, host: "::1", ip_family: 6, enabled: false })).toEqual({ host: "::1", ip_family: 6, enabled: false });
+    const form = {
+      name: target.name,
+      target: "203.0.113.1",
+      probe_kind: "icmp" as const,
+      ip_family: 4 as const,
+      enabled: true,
+    };
+    expect(buildPingTargetPatch(target, form)).toEqual({});
+    expect(buildPingTargetPatch(target, { ...form, name: "new" })).toEqual({ name: "new" });
+    expect(
+      buildPingTargetPatch(target, { ...form, target: "::1", ip_family: 6, enabled: false }),
+    ).toEqual({ target: "::1", ip_family: 6, enabled: false });
+    // Switching kinds sends both halves of the new endpoint, and only those.
+    expect(
+      buildPingTargetPatch(target, { ...form, probe_kind: "tcp", target: "203.0.113.1:443" }),
+    ).toEqual({ probe_kind: "tcp", target: "203.0.113.1:443" });
+    // An unchanged TCP target compares against its formatted endpoint, not its host.
+    expect(
+      buildPingTargetPatch(tcpTarget, { ...form, probe_kind: "tcp", target: "203.0.113.1:443" }),
+    ).toEqual({});
     expect(targetSortOrder(0, -1, 3)).toBeNull();
     expect(targetSortOrder(2, 1, 3)).toBeNull();
     expect(targetSortOrder(1, -1, 3)).toBe(0);

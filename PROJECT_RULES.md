@@ -14,7 +14,7 @@ Monitor 是从零设计的自用型 Linux VPS 监控系统，不 fork Komari，�
 - Server 使用 Rust stable、Tokio、Axum、Serde、rusqlite/SQLite；不使用 ORM、Redis、消息队列、gRPC 或复杂 RPC。
 - Frontend 使用 React、TypeScript、Vite、Tailwind CSS、uPlot、lucide-react；生产环境不依赖 Node.js 或外部 CDN。
 - 最终部署物为一个 Server 二进制和一个 SQLite 数据库；Agent 只支持 Linux。
-- Agent 只能读取本机状态、执行 ICMP 探测并上报；不存在远程命令、文件、更新或 shell 协议。
+- Agent 只能读取本机状态、执行 ICMP 与 TCP 延迟探测并上报；不存在远程 shell、远程命令执行、任意插件执行、远程自更新机制，也不是通用端口扫描器。TCP 探测只测量连接建立耗时，不发送应用数据、不做 TLS、不读取 banner，并在连接成功后立即关闭。
 - 当前数据从内存 snapshot 提供；2 秒样本不得逐条永久写入 SQLite；历史资源最多每 60 秒一条。
 - 数据库和 cache 同时参与的 mutation 必须先提交 SQLite transaction，再更新 cache。
 - 不为未来需求预建层次、crate、接口、配置或扩展点；优先删除不必要的依赖和抽象。

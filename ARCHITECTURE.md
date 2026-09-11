@@ -16,7 +16,7 @@ Linux VPS                           Monitor Server
 ┌──────────────────┐               ┌─────────────────────────────────┐
 │ monitor-agent    │  HTTPS JSON   │ Axum router                     │
 │ /proc + /sys     ├──────────────►│  agent auth + validation        │
-│ ICMP v4/v6       │               │              │                  │
+│ ICMP / TCP probe │               │              │                  │
 └──────────────────┘               │              ▼                  │
                                    │ SnapshotStore + traffic state   │
 Browser                            │      │             │             │
@@ -106,7 +106,7 @@ linux/
   os_release.rs
   disk.rs
   virtualization.rs
-ping.rs                 ICMP v4/v6 与 timeout
+ping.rs                 ICMP v4/v6 与 TCP connect 探测，单轮统一超时
 reporter.rs             单一 keep-alive HTTP client、重试
 ```
 
@@ -265,7 +265,7 @@ Ping 固定保留 7 天，覆盖最长 UI range，同时把典型 7 节点 × 6 
 
 - 所有请求设置 body limit、合理 header timeout（由反向代理和 Server 层共同负责）与安全响应 header。
 - HTML 设置严格 CSP：script 默认只允许 self，唯一主题启动脚本以构建期固定 SHA-256 hash 放行；不允许其他 inline script、外部字体或第三方 analytics。
-- Server 不以 root 运行。Agent 使用专用低权限用户，仅授予 ICMP 所需 `CAP_NET_RAW`。
+- Server 不以 root 运行。Agent 使用专用低权限用户，仅授予 ICMP 所需 `CAP_NET_RAW`；TCP 探测不需要额外能力。
 - Agent systemd hardening 至少启用 `NoNewPrivileges=true`、`PrivateTmp=true`、`ProtectSystem=strict`、`ProtectHome=true`、`ProtectKernelTunables=true`、`ProtectKernelModules=true`、`ProtectControlGroups=true`；通过 `ReadOnlyPaths=/proc /sys /etc` 不应阻止读取，实际在 Debian/Ubuntu/Alpine 验证。
 
 ## 13. 前端架构
@@ -331,7 +331,7 @@ Vite 输出带 hash 文件名，并在构建阶段生成 Brotli/Gzip 文件。Se
 
 - `serde`、`serde_json`；
 - `ureq`（只启用 keep-alive HTTPS/rustls 所需 feature）；
-- `socket2`/`libc` 用于 ICMP 与 `statvfs`；
+- `socket2`/`libc` 用于 ICMP、TCP 探测与 `statvfs`；
 - CSPRNG 不是 Agent 必需依赖。
 
 Agent 主循环可用阻塞 I/O 和单线程定时，不为简单周期任务引入 Tokio。HTTP client 必须复用连接并关闭 HTTP/2/不必要 feature。Phase 3 以 Alpine musl 与 Debian glibc 的 RSS/二进制体积实测决定具体 client，不能凭假 benchmark 宣称达标。

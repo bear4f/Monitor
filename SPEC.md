@@ -58,7 +58,7 @@ Monitor 是从零实现的、自用型 Linux VPS 监控系统。它不是 Komari
 
 ### 3.3 Agent
 
-Agent 只读取本机状态、执行 ICMP 探测、读取 Server 配置并上报。Agent 不接受 Server 主动命令，不暴露监听端口，不保存历史数据。
+Agent 只读取本机状态、执行 ICMP 与 TCP 延迟探测、读取 Server 配置并上报。Agent 不接受 Server 主动命令，不暴露监听端口，不保存历史数据。
 
 ## 4. Agent 采集规格
 
@@ -89,9 +89,11 @@ CPU 使用率和网络速率由相邻采样的 counter delta 计算。首次采�
 ## 5. Ping 规格
 
 - 最多配置 6 个启用目标，语义为电信 v4/v6、联通 v4/v6、移动 v4/v6；不实现复杂规则、探测组或告警。
-- Target 字段：显示名称、IP/Host、IP family（4 或 6）、启用状态、排序。
+- Target 字段：显示名称、探测方式（`icmp`/`tcp`）、IP/Host、TCP 端口、IP family（4 或 6）、启用状态、排序。后台以单个 target 字符串输入（`icmp` 为裸 host，`tcp` 为 `host:port`），由 Server 唯一解析。
 - 默认每 15 秒探测；允许设置为 10 秒或更慢。
-- Agent 使用 ICMP Echo；IPv4/IPv6 family 必须与 Target 配置一致。
+- Agent 对 `probe_kind = icmp` 使用 ICMP Echo；对 `probe_kind = tcp` 只测量到 `host:port` 建立连接的耗时，成功后立即关闭，不发送应用数据、不做 TLS、不读 banner。连接被拒、超时、解析失败一律记为失败。
+- IPv4/IPv6 family 必须与 Target 配置一致。
+- Agent 通过 `X-Monitor-Config-Version: 2` 请求 config protocol 2；老 Server 忽略该 header 并回复 protocol 1，Agent 两者都接受。report 线协议仍固定为 1。
 - 上报项只包含 `target_id`、`success`、`latency_ms`。成功时 latency 为非负数；失败/超时时必须是 `null`，禁止用 `0` 代替。
 - Agent 不排队补传历史 Ping。Server 按收到时间写入当前分钟的内存聚合器，每分钟持久化平均/最小/最大延迟与成功/总样本数。
 - 图表断点使用 `null`，uPlot 的 `spanGaps` 保持关闭，失败区间不能连到 0 ms。
