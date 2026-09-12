@@ -14,6 +14,12 @@ use crate::{
 
 pub const JS_SAFE_INTEGER_MAX: i64 = 9_007_199_254_740_991;
 
+/// The cycle window `load_traffic_recovery` reports when a node has no stored
+/// bucket for the cycle it is currently in -- the Server was down across the
+/// boundary, or the reset day moved while it was down. It is a placeholder for
+/// "unknown", not a period that ever ran, so nothing may be persisted for it.
+pub(crate) const UNKNOWN_CYCLE_UTC: i64 = -1;
+
 pub(crate) fn browser_safe_counter(value: i64) -> i64 {
     value.clamp(0, JS_SAFE_INTEGER_MAX)
 }
@@ -185,12 +191,18 @@ impl TrafficState {
         next.today_rx_bytes = checked_i64_add(next.today_rx_bytes, rx_delta)?;
         next.today_tx_bytes = checked_i64_add(next.today_tx_bytes, tx_delta)?;
         if cycle_changed {
-            next.previous_cycle = Some(TrafficCycleCheckpointRow {
-                cycle_start_utc: next.cycle_start_utc,
-                cycle_end_utc: next.cycle_end_utc,
-                rx_bytes: next.cycle_rx_bytes,
-                tx_bytes: next.cycle_tx_bytes,
-            });
+            // Only an established window owns a bucket worth closing. A recovered
+            // placeholder window carries no bytes and describes no period, and
+            // `traffic_cycles` rejects it outright -- handing it off would fail the
+            // whole checkpoint transaction on every retry, for every node.
+            if is_established_cycle(next.cycle_start_utc, next.cycle_end_utc) {
+                next.previous_cycle = Some(TrafficCycleCheckpointRow {
+                    cycle_start_utc: next.cycle_start_utc,
+                    cycle_end_utc: next.cycle_end_utc,
+                    rx_bytes: next.cycle_rx_bytes,
+                    tx_bytes: next.cycle_tx_bytes,
+                });
+            }
             next.cycle_start_utc = sample.billing_cycle.start_utc;
             next.cycle_end_utc = sample.billing_cycle.end_utc;
             next.cycle_rx_bytes = 0;
@@ -352,6 +364,12 @@ pub async fn checkpoint_once(
         .await?;
     state.traffic.mark_persisted(&acknowledgements);
     Ok(count)
+}
+
+/// Mirrors the `traffic_cycles` schema: a real window starts at or after the
+/// epoch and ends after it starts.
+fn is_established_cycle(start_utc: i64, end_utc: i64) -> bool {
+    start_utc >= 0 && end_utc > start_utc
 }
 
 fn counter_delta(last: Option<i64>, boot_changed: bool, current: i64) -> i64 {
@@ -523,6 +541,66 @@ mod tests {
         assert_eq!(
             (rebooted.rx_total_bytes, rebooted.tx_total_bytes),
             (1_000 + 4_096, 250 + 2_048)
+        );
+    }
+
+    /// Startup hydration normalizes a recovered window before any state is built
+    /// from it, so this placeholder does not reach `update` in production. It is
+    /// guarded anyway: handing it off writes a row `traffic_cycles` rejects, which
+    /// would fail the whole checkpoint transaction on every retry, for every node.
+    #[test]
+    fn a_recovered_placeholder_cycle_is_never_handed_off() {
+        let traffic = TrafficState::from_recovery(vec![TrafficRecoveryRow {
+            node_id: 1,
+            rx_total_bytes: 500,
+            tx_total_bytes: 400,
+            last_rx_counter_bytes: Some(500),
+            last_tx_counter_bytes: Some(400),
+            last_boot_id: Some("boot-a".into()),
+            day_start_utc: 10_000,
+            today_rx_bytes: 0,
+            today_tx_bytes: 0,
+            // No stored bucket for the cycle this node is now in.
+            cycle_start_utc: UNKNOWN_CYCLE_UTC,
+            cycle_end_utc: UNKNOWN_CYCLE_UTC,
+            cycle_rx_bytes: 0,
+            cycle_tx_bytes: 0,
+        }]);
+        let mut first = sample(600, 500, "boot-a");
+        first.day_start_utc = 10_000;
+        first.billing_cycle = BillingCycle {
+            start_utc: 10_000,
+            end_utc: 20_000,
+        };
+        traffic
+            .update(1, first)
+            .expect("first report after restart");
+        let opened = traffic.get(1).expect("node state");
+        // The placeholder describes no period and carries no bytes: closing it
+        // would write a row `traffic_cycles` rejects.
+        assert_eq!(opened.previous_cycle, None);
+        assert_eq!(
+            (opened.cycle_start_utc, opened.cycle_end_utc),
+            (10_000, 20_000)
+        );
+        assert_eq!((opened.cycle_rx_bytes, opened.cycle_tx_bytes), (100, 100));
+
+        // A window that really ran is still closed and handed off.
+        let mut next = sample(900, 800, "boot-a");
+        next.day_start_utc = 20_000;
+        next.billing_cycle = BillingCycle {
+            start_utc: 20_000,
+            end_utc: 30_000,
+        };
+        traffic.update(1, next).expect("report in the next cycle");
+        assert_eq!(
+            traffic.get(1).expect("node state").previous_cycle,
+            Some(TrafficCycleCheckpointRow {
+                cycle_start_utc: 10_000,
+                cycle_end_utc: 20_000,
+                rx_bytes: 100,
+                tx_bytes: 100,
+            })
         );
     }
 

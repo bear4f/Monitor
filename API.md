@@ -174,7 +174,7 @@ Agent Bearer 请求不使用 cookie，也不做 CSRF。
 
 ### 4.2 `AdminNode`
 
-Admin 列表在 `PublicNode` 的配置/状态基础上增加 `last_ip`，但不返回 token hash、boot id、raw network counter 或 session 数据。
+Admin 列表在 `PublicNode` 的配置/状态基础上增加 `last_ip`、流量重置配置和累计用量，但不返回 token hash、boot id、raw network counter 或 session 数据。
 
 ```json
 {
@@ -187,13 +187,19 @@ Admin 列表在 `PublicNode` 的配置/状态基础上增加 `last_ip`，但不�
   "last_seen_at": 1788664400,
   "cycle_rx": 4299161600,
   "cycle_tx": 4257218560,
+  "total_rx": 956703965184,
+  "total_tx": 812345678901,
   "traffic_limit": 1073741824000,
+  "traffic_reset_day": 1,
+  "traffic_reset_mode": "monthly",
   "price_micros": 39900000,
   "currency": "USD",
   "renewal_cycle": "annual",
   "expires_at": 1793836800
 }
 ```
+
+`traffic_reset_mode` 为 `monthly` 或 `never`：`monthly` 的已用流量是 `cycle_rx + cycle_tx`，`never` 是 `total_rx + total_tx`。`cycle_*`/`total_*` 来自最近一次 traffic checkpoint（最多滞后一个 checkpoint 周期），`online`/`last_seen_at` 来自内存 snapshot。
 
 ## 5. Public API
 
@@ -589,7 +595,7 @@ Validation：name 1–64；region 为两个大写 ASCII 字母；limit 为 null 
 Authentication：Admin session。  
 CSRF：是。
 
-Request 可包含创建字段以及 `sort_order`；省略表示不变，显式 null 只用于可空字段：
+Request 可包含创建字段、`traffic_reset_mode` 以及 `sort_order`；省略表示不变，显式 null 只用于可空字段。`traffic_reset_mode` 只接受 `monthly`/`never`（精确匹配，不去空白、不折叠大小写），创建时固定为 `monthly`，只能在此修改：
 
 ```json
 {

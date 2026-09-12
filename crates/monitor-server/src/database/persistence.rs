@@ -1269,6 +1269,9 @@ fn hash_from_row(row: &Row<'_>, index: usize) -> rusqlite::Result<[u8; 32]> {
     })
 }
 
+/// A node with no stored bucket for its current cycle recovers with
+/// `UNKNOWN_CYCLE_UTC` rather than a fabricated window: the first report after
+/// the restart opens the real cycle, and nothing is written for the placeholder.
 pub(super) fn load_traffic_recovery(
     connection: &Connection,
     day_start_utc: i64,
@@ -1278,7 +1281,8 @@ pub(super) fn load_traffic_recovery(
         "{}SELECT t.node_id, t.rx_total_bytes, t.tx_total_bytes,
                     t.last_rx_counter_bytes, t.last_tx_counter_bytes, t.last_boot_id,
                     ?1, COALESCE(d.rx_bytes, 0), COALESCE(d.tx_bytes, 0),
-                    COALESCE(c.cycle_start_utc, -1), COALESCE(c.cycle_end_utc, -1),
+                    COALESCE(c.cycle_start_utc, {unknown}),
+                    COALESCE(c.cycle_end_utc, {unknown}),
                     COALESCE(c.rx_bytes, 0), COALESCE(c.tx_bytes, 0)
              FROM traffic_totals AS t
              JOIN nodes AS n ON n.id = t.node_id
@@ -1288,7 +1292,8 @@ pub(super) fn load_traffic_recovery(
              LEFT JOIN traffic_cycles AS c
                ON c.node_id = t.node_id AND c.cycle_start_utc = w.start_utc
              ORDER BY t.node_id",
-        cycle_start_cte(2)
+        cycle_start_cte(2),
+        unknown = crate::traffic::UNKNOWN_CYCLE_UTC
     );
     let mut statement = connection
         .prepare(&sql)

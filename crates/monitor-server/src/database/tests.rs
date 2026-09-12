@@ -364,6 +364,231 @@ fn password_change_rolls_back_if_session_invalidation_fails() {
     );
 }
 
+/// The guarantee that keeps the placeholder window out of `TrafficState`: startup
+/// hydration replaces any recovered window that is not the node's current cycle
+/// with the configured one and zeroes its bytes, whether the stored window was a
+/// different cycle or missing entirely.
+#[tokio::test]
+async fn unmatched_recovery_cycles_are_normalized_before_the_state_is_built() {
+    const ANCIENT: i64 = 1_000_000;
+    const RESET_DAY: i64 = 15;
+
+    let path = TestDatabasePath::new("cycle-normalization");
+    let database = Database::open(path.as_path()).expect("open database");
+    let node = database
+        .create_node(
+            NewNodeRow {
+                public_id: "cccccccccccccccccccccccccccccccc".into(),
+                name: "Recovery node".into(),
+                region_code: "US".into(),
+                traffic_limit_bytes: None,
+                traffic_reset_day: RESET_DAY,
+                traffic_reset_mode: "monthly".to_owned(),
+                price_micros: None,
+                currency: None,
+                renewal_cycle: None,
+                expires_at: None,
+            },
+            [3; 32],
+            1,
+        )
+        .await
+        .expect("create node");
+    database
+        .persist_traffic_batch(
+            vec![TrafficCheckpointRow {
+                node_id: node.id,
+                captured_generation: 1,
+                rx_total_bytes: 500,
+                tx_total_bytes: 400,
+                last_rx_counter_bytes: 500,
+                last_tx_counter_bytes: 400,
+                last_boot_id: "boot".into(),
+                day_start_utc: ANCIENT,
+                today_rx_bytes: 500,
+                today_tx_bytes: 400,
+                cycle_start_utc: ANCIENT,
+                cycle_end_utc: ANCIENT + 1_000,
+                cycle_rx_bytes: 500,
+                cycle_tx_bytes: 400,
+                previous_day: None,
+                previous_cycle: None,
+                snapshot: checkpoint_snapshot(),
+            }],
+            ANCIENT + 900,
+        )
+        .await
+        .expect("persist an ancient cycle");
+
+    let now = crate::auth::unix_timestamp().expect("clock");
+    let hydration = hydrate_startup(&database).await.expect("hydrate startup");
+    assert_eq!(hydration.traffic_recovery.len(), 1);
+    let recovered = &hydration.traffic_recovery[0];
+    let expected = crate::time::billing_cycle(now, &hydration.settings.site_timezone, RESET_DAY)
+        .expect("current cycle");
+    assert_eq!(
+        (recovered.cycle_start_utc, recovered.cycle_end_utc),
+        (expected.start_utc, expected.end_utc),
+        "the recovered window is the one the node is configured for"
+    );
+    assert!(recovered.cycle_start_utc >= 0);
+    assert_eq!((recovered.cycle_rx_bytes, recovered.cycle_tx_bytes), (0, 0));
+    // Lifetime totals and the counter baseline survive untouched.
+    assert_eq!(
+        (recovered.rx_total_bytes, recovered.tx_total_bytes),
+        (500, 400)
+    );
+    assert_eq!(recovered.last_rx_counter_bytes, Some(500));
+    database.shutdown().await.expect("shutdown database");
+}
+
+fn checkpoint_snapshot() -> crate::snapshot::NodeSnapshot {
+    crate::snapshot::NodeSnapshot {
+        live_since_start: true,
+        first_seen_at: 900,
+        last_seen_at: 950,
+        last_ip: "127.0.0.1".parse().expect("IP"),
+        hostname: "rollback".into(),
+        os_name: "Debian".into(),
+        os_version: "13".into(),
+        kernel: "6.12".into(),
+        architecture: "x86_64".into(),
+        virtualization: "qemu".into(),
+        agent_version: "0.1.0".into(),
+        cpu_model: "CPU".into(),
+        cpu_cores: 1,
+        cpu_usage: 1.0,
+        load_1: 0.1,
+        load_5: 0.1,
+        load_15: 0.1,
+        memory_total: 100,
+        memory_used: 50,
+        swap_total: 0,
+        swap_used: 0,
+        disk_total: 100,
+        disk_used: 50,
+        rx_counter_bytes: 150,
+        tx_counter_bytes: 275,
+        rx_rate_bytes_per_sec: 1,
+        tx_rate_bytes_per_sec: 1,
+        uptime_seconds: 10,
+        process_count: 2,
+        boot_id: "boot".into(),
+    }
+}
+
+/// A node with no stored bucket for the cycle it is now in -- the Server was down
+/// across the boundary -- recovers with the `UNKNOWN_CYCLE_UTC` placeholder.
+/// `hydrate_startup` replaces that window before any state is built from it (see
+/// `unmatched_recovery_cycles_are_normalized_before_the_state_is_built`), so this
+/// covers the layer beneath that: even if the placeholder did reach the state, it
+/// is not a window `traffic_cycles` accepts and must never be handed off to it.
+#[test]
+fn a_placeholder_recovery_cycle_is_never_written_to_traffic_cycles() {
+    const AUGUST: i64 = 1_000_000;
+    const SEPTEMBER: i64 = 2_000_000;
+    const OCTOBER: i64 = 3_000_000;
+    const RESET_DAY: i64 = 15;
+
+    let path = TestDatabasePath::new("traffic-unstored-cycle");
+    let mut connection = open_ready_connection(path.as_path()).expect("open database");
+    let node = persistence::create_node(
+        &mut connection,
+        &NewNodeRow {
+            public_id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            name: "Restart node".into(),
+            region_code: "US".into(),
+            traffic_limit_bytes: None,
+            traffic_reset_day: RESET_DAY,
+            traffic_reset_mode: "monthly".to_owned(),
+            price_micros: None,
+            currency: None,
+            renewal_cycle: None,
+            expires_at: None,
+        },
+        &[2; 32],
+        1,
+    )
+    .expect("create node");
+    let snapshot = checkpoint_snapshot();
+    persistence::persist_traffic_batch(
+        &mut connection,
+        &[TrafficCheckpointRow {
+            node_id: node.id,
+            captured_generation: 1,
+            rx_total_bytes: 500,
+            tx_total_bytes: 400,
+            last_rx_counter_bytes: 500,
+            last_tx_counter_bytes: 400,
+            last_boot_id: "boot".into(),
+            day_start_utc: AUGUST + 500,
+            today_rx_bytes: 500,
+            today_tx_bytes: 400,
+            cycle_start_utc: AUGUST,
+            cycle_end_utc: SEPTEMBER,
+            cycle_rx_bytes: 500,
+            cycle_tx_bytes: 400,
+            previous_day: None,
+            previous_cycle: None,
+            snapshot: snapshot.clone(),
+        }],
+        AUGUST + 900,
+    )
+    .expect("persist the August cycle");
+
+    // Restart inside the September cycle, which has no stored bucket yet.
+    let mut cycle_starts = [0_i64; crate::time::RESET_DAY_COUNT];
+    cycle_starts[RESET_DAY as usize - 1] = SEPTEMBER;
+    let recovery = persistence::load_traffic_recovery(&connection, SEPTEMBER + 500, &cycle_starts)
+        .expect("load traffic recovery");
+    assert_eq!(recovery.len(), 1);
+    assert_eq!(recovery[0].cycle_rx_bytes, 0);
+    assert_eq!(
+        recovery[0].cycle_start_utc,
+        crate::traffic::UNKNOWN_CYCLE_UTC
+    );
+
+    let traffic = crate::traffic::TrafficState::from_recovery(recovery);
+    traffic
+        .update(
+            node.id,
+            crate::traffic::TrafficSample {
+                rx_counter_bytes: 700,
+                tx_counter_bytes: 600,
+                boot_id: "boot",
+                day_start_utc: SEPTEMBER + 500,
+                billing_cycle: crate::time::BillingCycle {
+                    start_utc: SEPTEMBER,
+                    end_utc: OCTOBER,
+                },
+            },
+        )
+        .expect("first report after the restart");
+    let snapshots = std::collections::HashMap::from([(node.id, snapshot)]);
+    let rows = traffic.capture_dirty(&snapshots);
+    assert_eq!(rows.len(), 1);
+
+    persistence::persist_traffic_batch(&mut connection, &rows, SEPTEMBER + 900)
+        .expect("checkpoint after restarting into an unstored cycle");
+
+    let cycles: Vec<(i64, i64, i64)> = connection
+        .prepare(
+            "SELECT cycle_start_utc, cycle_end_utc, rx_bytes FROM traffic_cycles
+                  WHERE node_id = ?1 ORDER BY cycle_start_utc",
+        )
+        .expect("prepare cycle query")
+        .query_map([node.id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("query cycles")
+        .collect::<Result<_, _>>()
+        .expect("read cycles");
+    // The August bucket is untouched and September holds only the new delta; no
+    // phantom bucket is invented for the window the restart never observed.
+    assert_eq!(
+        cycles,
+        vec![(AUGUST, SEPTEMBER, 500), (SEPTEMBER, OCTOBER, 200)]
+    );
+}
+
 #[test]
 fn traffic_checkpoint_rolls_back_all_tables_on_late_failure() {
     let path = TestDatabasePath::new("traffic-rollback");
@@ -412,38 +637,7 @@ fn traffic_checkpoint_rolls_back_all_tables_on_late_failure() {
         cycle_tx_bytes: 75,
         previous_day: None,
         previous_cycle: None,
-        snapshot: crate::snapshot::NodeSnapshot {
-            live_since_start: true,
-            first_seen_at: 900,
-            last_seen_at: 950,
-            last_ip: "127.0.0.1".parse().expect("IP"),
-            hostname: "rollback".into(),
-            os_name: "Debian".into(),
-            os_version: "13".into(),
-            kernel: "6.12".into(),
-            architecture: "x86_64".into(),
-            virtualization: "qemu".into(),
-            agent_version: "0.1.0".into(),
-            cpu_model: "CPU".into(),
-            cpu_cores: 1,
-            cpu_usage: 1.0,
-            load_1: 0.1,
-            load_5: 0.1,
-            load_15: 0.1,
-            memory_total: 100,
-            memory_used: 50,
-            swap_total: 0,
-            swap_used: 0,
-            disk_total: 100,
-            disk_used: 50,
-            rx_counter_bytes: 150,
-            tx_counter_bytes: 275,
-            rx_rate_bytes_per_sec: 1,
-            tx_rate_bytes_per_sec: 1,
-            uptime_seconds: 10,
-            process_count: 2,
-            boot_id: "boot".into(),
-        },
+        snapshot: checkpoint_snapshot(),
     };
     assert!(persistence::persist_traffic_batch(&mut connection, &[checkpoint], 1_000).is_err());
     let totals: (i64, i64, Option<i64>) = connection
