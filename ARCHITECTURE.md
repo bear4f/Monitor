@@ -209,6 +209,7 @@ Agent 10/15 秒采样只进入当前分钟 accumulator。每个 `(node_id, targe
 - `success_count = 0`：三个 latency 字段均写 NULL；
 - 丢包率由 `(sample_count - success_count) / sample_count` 查询时计算，作为 0..1 比例返回，不是百分比整数。5 分钟降采样先累加两个 count 再除一次，不取各分钟比例的平均值。
 - ping history 响应还合入仍在累积的当前分钟：`HistoryAccumulator` 提供一个只复制计数值的短锁方法，锁不跨 SQLite await 或响应构造，当前分钟也不会为了可查询而落盘。
+- 先快照当前分钟再查 SQLite，并把持久化查询上界压到快照分钟：finalize 与 flush 之间的分钟既不在 accumulator 也不在库里，先查库会丢整分钟；快照优先加上界则同一分钟既不丢失也不重复。
 
 Ping 固定保留 7 天，覆盖最长 UI range，同时把典型 7 节点 × 6 target 的数据库控制在几十 MiB 量级。不增加 Ping 保留期设置。
 

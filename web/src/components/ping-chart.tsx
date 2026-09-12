@@ -15,7 +15,7 @@ import {
   clampViewport,
   fullViewport,
   formatLossPercent,
-  latestValue,
+  legendSample,
   niceLatencyScale,
   pingAlignedData,
   pingSeriesColor,
@@ -422,8 +422,7 @@ function PingLegend({ history, colors }: { history: PingHistory; colors: readonl
   return (
     <ul className="ping-legend" aria-label="延迟监控线路">
       {history.targets.map((target, index) => {
-        const latest = latestValue(history.series[index].latency);
-        const loss = latestValue(history.series[index].loss);
+        const { latency: latest, loss } = legendSample(history.series[index]);
         const style = { "--ping-color": colors[index] } as CSSProperties;
         return (
           <li className="ping-legend-item" style={style} key={target.id}>

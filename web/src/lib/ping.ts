@@ -1,5 +1,5 @@
 import type uPlot from "uplot";
-import type { PingHistory } from "../api/ping";
+import type { PingHistory, PingSeries } from "../api/ping";
 
 export interface IndexViewport {
   start: number;
@@ -132,11 +132,20 @@ export function pingSeriesDash(index: number): readonly number[] {
   return DASH_PATTERNS[Math.max(0, index) % DASH_PATTERNS.length];
 }
 
-export function latestValue(values: readonly (number | null)[]): number | null {
-  for (let index = values.length - 1; index >= 0; index -= 1) {
-    if (values[index] !== null) return values[index];
+export interface LegendSample {
+  latency: number | null;
+  loss: number | null;
+}
+
+// The latest bucket that actually holds samples, read once: latency and loss must
+// describe the same bucket, so they are never scanned for separately.
+export function legendSample(series: Pick<PingSeries, "latency" | "loss">): LegendSample {
+  for (let index = series.loss.length - 1; index >= 0; index -= 1) {
+    const loss = series.loss[index];
+    if (loss === null || loss === undefined) continue;
+    return { latency: series.latency[index] ?? null, loss };
   }
-  return null;
+  return { latency: null, loss: null };
 }
 
 function supportsOklch(): boolean {

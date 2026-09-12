@@ -5,7 +5,7 @@ import {
   cutPeakCap,
   displayLatencySeries,
   formatLossPercent,
-  latestValue,
+  legendSample,
   median,
   medianAbsoluteDeviation,
   nearestRankP95,
@@ -193,7 +193,7 @@ it("keeps an all-null target in its fixed style slot and data order", () => {
   expect(data).toHaveLength(3);
 });
 
-it("shows loss ratios as percentages and reads the latest sample of a series", () => {
+it("shows loss ratios as percentages", () => {
   expect([0, 0.025, 0.1, 0.5, 1].map(formatLossPercent)).toEqual([
     "0%",
     "2.5%",
@@ -201,8 +201,25 @@ it("shows loss ratios as percentages and reads the latest sample of a series", (
     "50%",
     "100%",
   ]);
-  expect(latestValue([20, null, 22, null])).toBe(22);
-  expect(latestValue([null, null])).toBeNull();
+});
+
+it("reads legend latency and loss from one bucket", () => {
+  // The newest sampled bucket lost every sample: no latency to show, 100% loss.
+  expect(legendSample({ latency: [20, null], loss: [0, 1] })).toEqual({
+    latency: null,
+    loss: 1,
+  });
+  // Trailing buckets with no samples are skipped, and both values come from the
+  // same surviving bucket.
+  expect(legendSample({ latency: [20, 22, null], loss: [0, 0.25, null] })).toEqual({
+    latency: 22,
+    loss: 0.25,
+  });
+  expect(legendSample({ latency: [null, null], loss: [null, null] })).toEqual({
+    latency: null,
+    loss: null,
+  });
+  expect(legendSample({ latency: [], loss: [] })).toEqual({ latency: null, loss: null });
 });
 
 it("rejects stale ping request generations", () => {

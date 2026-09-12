@@ -185,16 +185,23 @@ pub(super) async fn ping(
 ) -> Result<Response, ApiError> {
     let range = parse_range(request.uri().query())?;
     let node_id = resolve_node(&state, &public_id).await?;
+    // Capture the open minute before touching the database. A minute that is
+    // finalized but not yet flushed is in neither `current` nor SQLite, so a
+    // database-first read can miss it entirely; capturing first makes the
+    // snapshot authoritative for its own minute.
+    let current = state.history.current_ping_samples(node_id);
     let to = unix_timestamp().map_err(|_| ApiError::internal())?;
     let from = to - range.duration;
     let points = state
         .database
-        .query_ping_history(node_id, from, to, range.step)
+        .query_ping_history(
+            node_id,
+            from,
+            persisted_upper_bound(from, to, &current),
+            range.step,
+        )
         .await
         .map_err(ApiError::database)?;
-    // Read the open minute after the database, never before: a minute finalized
-    // while the query ran is already in the rows above and has left `current`.
-    let current = state.history.current_ping_samples(node_id);
     let (targets, timestamps, series) = dense_ping_series(from, to, range.step, points, current);
     let response = PingHistoryResponse {
         node_id: public_id,
@@ -256,6 +263,18 @@ fn parse_range(query: Option<&str>) -> Result<HistoryRange, ApiError> {
         }),
         _ => Err(ApiError::invalid_request()),
     }
+}
+
+/// Upper bound for the persisted read. The captured snapshot owns its minute, so
+/// the query stops below it: a flush landing after the capture must not let that
+/// minute be counted a second time. Only this bound moves -- the response window
+/// and its timestamps stay exactly as requested.
+fn persisted_upper_bound(from: i64, to: i64, current: &[CurrentPingSample]) -> i64 {
+    current
+        .iter()
+        .map(|sample| sample.bucket_ts)
+        .min()
+        .map_or(to, |bucket_ts| bucket_ts.clamp(from, to))
 }
 
 fn aligned_timestamps(from: i64, to: i64, step: i64) -> Vec<i64> {
@@ -600,6 +619,20 @@ mod tests {
         assert_eq!(series.memory, vec![Some(10), None, None]);
     }
 
+    fn resource_sample() -> ResourceSample {
+        ResourceSample {
+            cpu_usage: 1.0,
+            load_1: 0.0,
+            load_5: 0.0,
+            load_15: 0.0,
+            memory_used_bytes: 1,
+            swap_used_bytes: 0,
+            disk_used_bytes: 1,
+            rx_rate_bytes_per_sec: 0,
+            tx_rate_bytes_per_sec: 0,
+        }
+    }
+
     fn bucket(
         target_id: i64,
         bucket_ts: Option<i64>,
@@ -890,6 +923,213 @@ mod tests {
         context.finish().await;
     }
 
+    #[test]
+    fn the_persisted_read_stops_below_a_captured_open_minute() {
+        let window = 1_000;
+        assert_eq!(persisted_upper_bound(0, window, &[]), window);
+        assert_eq!(
+            persisted_upper_bound(0, window, &[current(1, 600, 1, 0, None)]),
+            600
+        );
+        // Two targets share one open minute; the bound is that minute either way.
+        assert_eq!(
+            persisted_upper_bound(
+                0,
+                window,
+                &[
+                    current(1, 600, 1, 0, None),
+                    current(2, 600, 1, 1, Some(4.0))
+                ]
+            ),
+            600
+        );
+        // A bound can never escape the requested window.
+        assert_eq!(
+            persisted_upper_bound(0, window, &[current(1, 4_000, 1, 0, None)]),
+            window
+        );
+        assert_eq!(
+            persisted_upper_bound(500, window, &[current(1, 60, 1, 0, None)]),
+            500
+        );
+    }
+
+    /// The minute-boundary race: a snapshot is captured while the minute is open,
+    /// then that same minute is finalized and flushed to SQLite. The captured
+    /// snapshot stays authoritative and the flushed row must not add a second
+    /// copy of it at either step.
+    #[tokio::test]
+    async fn a_captured_open_minute_is_not_queried_through_after_it_is_flushed() {
+        let context = TestContext::new().await;
+        let now = unix_timestamp().expect("clock");
+        let bucket = (now - 1) - (now - 1).rem_euclid(60);
+        let sample = |success: bool| PingSample {
+            target_id: 1,
+            success,
+            latency_ms: success.then_some(20.0),
+        };
+        for success in [true, false, false, false] {
+            context.state.history.record(
+                context.node_id,
+                now - 1,
+                resource_sample(),
+                [sample(success)],
+            );
+        }
+        let captured = context.state.history.current_ping_samples(context.node_id);
+        assert_eq!(
+            captured,
+            vec![CurrentPingSample {
+                bucket_ts: bucket,
+                target_id: 1,
+                sample_count: 4,
+                success_count: 1,
+                latency_avg_ms: Some(20.0),
+            }]
+        );
+
+        // The same minute keeps collecting, then closes and reaches SQLite, so the
+        // persisted row is a superset of what was captured.
+        for _ in 0..6 {
+            context.state.history.record(
+                context.node_id,
+                now - 1,
+                resource_sample(),
+                [sample(false)],
+            );
+        }
+        context.state.history.finalize_before(bucket + 60);
+        crate::history::flush_pending(&context.state)
+            .await
+            .expect("flush the closed minute");
+        assert!(
+            context
+                .state
+                .history
+                .current_ping_samples(context.node_id)
+                .is_empty(),
+            "the captured minute has left the accumulator"
+        );
+
+        for (step, duration) in [(60, 60 * 60), (300, 7 * 24 * 60 * 60)] {
+            let to = now;
+            let from = to - duration;
+            let db_to = persisted_upper_bound(from, to, &captured);
+            assert_eq!(db_to, bucket, "the captured minute bounds the query");
+            let points = context
+                .state
+                .database
+                .query_ping_history(context.node_id, from, db_to, step)
+                .await
+                .expect("query persisted history");
+            let aligned = bucket - bucket.rem_euclid(step);
+            assert!(
+                points
+                    .iter()
+                    .all(|point| point.target_id != 1 || point.bucket_ts != Some(aligned)),
+                "step {step}: the flushed copy of the captured minute is not read back"
+            );
+            let (targets, timestamps, series) =
+                dense_ping_series(from, to, step, points, captured.clone());
+            let index = targets
+                .iter()
+                .position(|target| target.id == 1)
+                .expect("target 1 is reported");
+            let slot = timestamps
+                .iter()
+                .position(|timestamp| *timestamp == aligned)
+                .expect("the captured minute is inside the window");
+            // Exactly one copy: the captured 4 samples with 1 success. Reading
+            // through to the flushed row would report 10/1 alone, or 14/2 combined.
+            assert_eq!(series[index].loss[slot], Some(0.75), "step {step}");
+            assert_eq!(series[index].latency[slot], Some(20.0), "step {step}");
+            assert_eq!(
+                series[index]
+                    .loss
+                    .iter()
+                    .filter(|value| value.is_some())
+                    .count(),
+                1,
+                "step {step}: the minute appears in exactly one bucket"
+            );
+        }
+        context.finish().await;
+    }
+
+    /// The same race seen through the endpoint: a persisted row already exists for
+    /// the minute the snapshot captured, which is what a flush between the two
+    /// reads would leave behind.
+    #[tokio::test]
+    async fn the_endpoint_reports_a_captured_minute_once_at_both_steps() {
+        let context = TestContext::new().await;
+        let now = unix_timestamp().expect("clock");
+        let bucket = (now - 1) - (now - 1).rem_euclid(60);
+        context
+            .state
+            .database
+            .persist_history_batch(
+                Vec::new(),
+                vec![PingHistoryWriteRow {
+                    node_id: context.node_id,
+                    bucket_ts: bucket,
+                    target_id: 1,
+                    sample_count: 10,
+                    success_count: 1,
+                    latency_avg_ms: Some(20.0),
+                    latency_min_ms: Some(20.0),
+                    latency_max_ms: Some(20.0),
+                }],
+            )
+            .await
+            .expect("persist the flushed minute");
+        for success in [true, false, false, false] {
+            context.state.history.record(
+                context.node_id,
+                now - 1,
+                resource_sample(),
+                [PingSample {
+                    target_id: 1,
+                    success,
+                    latency_ms: success.then_some(20.0),
+                }],
+            );
+        }
+
+        for (range, step) in [("range=1h", 60), ("range=7d", 300)] {
+            let response = ping(
+                State(context.state.clone()),
+                Path(context.public_id.clone()),
+                context.request(range),
+            )
+            .await
+            .unwrap_or_else(IntoResponse::into_response);
+            let value: Value = serde_json::from_slice(
+                &to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("read ping body"),
+            )
+            .expect("parse ping response");
+            let aligned = bucket - bucket.rem_euclid(step);
+            let slot = value["timestamps"]
+                .as_array()
+                .expect("axis")
+                .iter()
+                .position(|timestamp| timestamp == &json!(aligned))
+                .expect("captured minute is inside the window");
+            let series = value["series"]
+                .as_array()
+                .expect("series")
+                .iter()
+                .find(|series| series["target_id"] == json!(1))
+                .expect("target 1 series");
+            // Captured 4/1 alone. The persisted 10/1 would give 0.9, and combining
+            // both would give 6/7.
+            assert_eq!(series["loss"][slot], json!(0.75), "{range}");
+            assert_eq!(series["latency"][slot], json!(20.0), "{range}");
+        }
+        context.finish().await;
+    }
+
     #[tokio::test]
     async fn the_open_minute_reaches_the_endpoint_without_being_persisted() {
         let context = TestContext::new().await;
@@ -928,17 +1168,7 @@ mod tests {
         context.state.history.record(
             context.node_id,
             now - 1,
-            ResourceSample {
-                cpu_usage: 1.0,
-                load_1: 0.0,
-                load_5: 0.0,
-                load_15: 0.0,
-                memory_used_bytes: 1,
-                swap_used_bytes: 0,
-                disk_used_bytes: 1,
-                rx_rate_bytes_per_sec: 0,
-                tx_rate_bytes_per_sec: 0,
-            },
+            resource_sample(),
             [PingSample {
                 target_id: 1,
                 success: false,

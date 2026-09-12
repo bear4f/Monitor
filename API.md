@@ -339,6 +339,7 @@ Query：必填 `range=1h|6h|24h|7d`。
 - 丢包不从 `latency == null` 推断，而是来自与 latency 同源的 `sample_count`/`success_count`。
 - 5 分钟桶先累加 `sample_count` 与 `success_count`，再做一次除法；不是各分钟比例的平均值（样本数不等时两者不同）。
 - 仍在累积的当前分钟从内存累加器读取并合入：分钟粒度下当前分钟覆盖同一分钟的持久化表示，5 分钟粒度下与同桶已完成分钟合并一次，latency 按 success count 加权。当前分钟不会为了可查询而写入 SQLite。
+- 读取顺序固定为：先取当前分钟快照，再定 `to`，最后查 SQLite，且 SQLite 查询上界取 `min(to, 快照分钟)`。分钟被 finalize 后、落盘前同时不在 accumulator 也不在 SQLite，先查库会整分钟丢失；快照优先则该分钟由快照负责，落盘发生在快照之后也不会重复计入。`from`、`to`、`timestamps` 仍是正常响应窗口，上界只作用于持久化数据。
 - “削峰”不作为 API 参数。浏览器只裁剪传给 uPlot 的副本，response 和 tooltip 原始值不变。
 - 一次 SQL JOIN 返回指定节点全部 targets 的范围数据，不逐 target 查询。
 
